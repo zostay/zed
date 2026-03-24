@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2 — 2026-03-24
+
+### Changed
+
+- Merge commands now use `--merge` instead of `--auto` for non-interactive use
+- Merge skills will never bypass branch protection rules or rulesets (no
+  `--admin` or similar overrides)
+
 ## 0.1.1 — 2026-03-24
 
 ### Fixed

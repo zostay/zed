@@ -62,10 +62,10 @@ Using the PR data already fetched in Step 2, find all ready-to-merge PRs.
 For **every** ready PR, oldest first:
 
 ```bash
-gh pr merge <number> --auto
+gh pr merge <number> --merge
 ```
 
-Log each merge attempt and its result. If an individual merge fails, log the error and continue with the next PR.
+Log each merge attempt and its result. If an individual merge fails, log the error and continue with the next PR. Do **not** retry with `--admin` or any other flag that bypasses branch protection rules or rulesets.
 
 **Important:** After each successful merge, re-fetch PR data before attempting the next merge:
 

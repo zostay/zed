@@ -54,10 +54,10 @@ Tell the user which PR you are going to merge, including:
 
 ### 4. Merge the PR
 
-Merge the selected PR using the repository's default merge method:
+Merge the selected PR:
 
 ```bash
-gh pr merge <number> --auto
+gh pr merge <number> --merge
 ```
 
-Report the result to the user. If the merge fails, report the error.
+Report the result to the user. If the merge fails due to branch protection rules, rulesets, or any other policy, report the error to the user and **stop**. Do **not** retry with `--admin` or any other flag that bypasses protections.
