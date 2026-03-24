@@ -1,8 +1,79 @@
 # claude-plugin
 
-Personal Claude Code plugin with custom skills, agents, and tools.
+Personal Claude Code plugin with custom skills for Dependabot maintenance and
+other repository automation.
 
-## Structure
+## Prerequisites
+
+- [Claude Code](https://claude.com/claude-code) CLI
+- [GitHub CLI (`gh`)](https://cli.github.com/) — authenticated with access to
+  the target repository
+- Dependabot enabled on the target repository (for alerts and/or security
+  updates)
+
+## Installation
+
+Test locally by pointing Claude Code at the plugin directory:
+
+```bash
+claude --plugin-dir /path/to/claude-plugin
+```
+
+Or install from GitHub via a marketplace:
+
+```bash
+/plugin install claude-plugin
+```
+
+## Skills
+
+All skills are invoked as `/claude-plugin:<skill-name>` from within Claude Code.
+
+### `dependabot-sweep`
+
+Run a full Dependabot maintenance sweep in a single pass. This orchestrates the
+work of the other three skills:
+
+1. Requests rebases for all conflicting Dependabot PRs
+2. Merges all ready-to-merge Dependabot PRs
+3. Fixes up to 10 vulnerability alerts (highest severity first), creating a
+   branch with one commit per package
+4. Updates the project changelog (if one exists)
+5. Pushes the branch and opens a PR with a summary of all actions
+
+```
+/claude-plugin:dependabot-sweep
+```
+
+### `dependabot-fix`
+
+Fix the highest-priority open Dependabot vulnerability alert. Analyzes all open
+alerts, ranks by severity/CVSS/impact, updates the dependency to the patched
+version, and runs tests to verify.
+
+```
+/claude-plugin:dependabot-fix
+```
+
+### `dependabot-unblock`
+
+Unblock stuck Dependabot PRs. Requests rebases for conflicting PRs, then
+investigates the first PR with failing checks and attempts a trivial fix.
+
+```
+/claude-plugin:dependabot-unblock
+```
+
+### `dependabot-merge`
+
+Merge the oldest open Dependabot PR that is ready (no conflicts, all checks
+passing) using the repository's default merge method.
+
+```
+/claude-plugin:dependabot-merge
+```
+
+## Project Structure
 
 ```
 .claude-plugin/
@@ -13,22 +84,9 @@ hooks/              # Event hooks for Claude Code lifecycle events
 scripts/            # Helper scripts used by skills, agents, or hooks
 ```
 
-## Installation
+## Development
 
-Add a marketplace that includes this plugin, or test locally:
-
-```bash
-claude --plugin-dir /path/to/claude-plugin
-```
-
-To install from GitHub via a marketplace, add the marketplace containing this
-plugin and then:
-
-```bash
-/plugin install claude-plugin
-```
-
-## Adding a Skill
+### Adding a Skill
 
 Create a directory under `skills/` with a `SKILL.md` file:
 
@@ -50,7 +108,7 @@ Instructions for Claude when this skill is invoked...
 
 The skill will be available as `/claude-plugin:my-skill`.
 
-## Adding an Agent
+### Adding an Agent
 
 Create a markdown file under `agents/`:
 
@@ -64,7 +122,7 @@ model: sonnet
 Agent system prompt and behavior instructions...
 ```
 
-## Adding Hooks
+### Adding Hooks
 
 Define event hooks in `hooks/hooks.json`:
 
@@ -86,7 +144,7 @@ Define event hooks in `hooks/hooks.json`:
 }
 ```
 
-## Environment Variables
+### Environment Variables
 
 Two variables are available in skills, agents, hooks, and configs:
 
