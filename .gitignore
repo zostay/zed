@@ -1,0 +1,12 @@
+# Editor
+*.swp
+*.swo
+*~
+.session.vim
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Plugin data
+.claude-plugin-data/
