@@ -13,16 +13,17 @@ other repository automation.
 
 ## Installation
 
-Test locally by pointing Claude Code at the plugin directory:
+Install directly from GitHub:
 
 ```bash
-claude --plugin-dir /path/to/claude-plugin
+claude plugin add --from github:zostay/claude-plugin
 ```
 
-Or install from GitHub via a marketplace:
+Or clone and install from a local checkout:
 
 ```bash
-/plugin install claude-plugin
+git clone https://github.com/zostay/claude-plugin.git
+claude plugin add --from ./claude-plugin
 ```
 
 ## Skills
