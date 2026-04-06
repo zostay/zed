@@ -74,7 +74,8 @@ investigates the first PR with failing checks and attempts a trivial fix.
 
 Check out a pull request (the current branch's PR or a named one), read its
 GitHub review comments, evaluate each for validity against the current code,
-apply the fixes that are warranted, and report on what was done.
+apply the fixes that are warranted, commit and push them to the PR branch,
+and report on what was done.
 
 ```
 /zed:pr-review-fix

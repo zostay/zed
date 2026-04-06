@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.5 — 2026-04-06
+
+### Changed
+
+- `pr-review-fix` now commits the applied fixes to the PR branch and pushes
+  them, instead of leaving the changes uncommitted
+
 ## 0.1.4 — 2026-04-06
 
 ### Added

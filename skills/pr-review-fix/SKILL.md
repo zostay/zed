@@ -76,9 +76,17 @@ For each thread classified `fix`, make the change. Group related fixes into cohe
 - If a fix breaks tests, investigate the root cause before moving on
 - Do not expand scope beyond what the comment asked for
 
-Do **not** commit, push, or reply to the comments on GitHub automatically — leave that to the user unless they explicitly ask.
+### 6. Commit and push the fixes
 
-### 6. Report
+If any fixes were applied, commit them to the PR branch and push:
+
+- Stage only the files you changed (do not use `git add -A`)
+- Write a commit message that summarizes the reviewer feedback being addressed
+- Push to the PR's branch with `git push`
+
+Do **not** reply to or resolve the review comments on GitHub automatically — leave that to the user unless they explicitly ask.
+
+### 7. Report
 
 Print a concise report covering:
 
