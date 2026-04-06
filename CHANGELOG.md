@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4 — 2026-04-06
+
+### Added
+
+- `pr-review-fix` skill — check out a PR, read its GitHub review comments,
+  evaluate each for validity, apply the warranted fixes, and report
+
 ## 0.1.3 — 2026-03-24
 
 ### Added

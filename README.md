@@ -70,6 +70,17 @@ investigates the first PR with failing checks and attempts a trivial fix.
 /zed:dependabot-unblock
 ```
 
+### `pr-review-fix`
+
+Check out a pull request (the current branch's PR or a named one), read its
+GitHub review comments, evaluate each for validity against the current code,
+apply the fixes that are warranted, and report on what was done.
+
+```
+/zed:pr-review-fix
+/zed:pr-review-fix 123
+```
+
 ### `dependabot-merge`
 
 Merge the oldest open Dependabot PR that is ready (no conflicts, all checks
