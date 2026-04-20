@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.6 — 2026-04-20
+
+### Changed
+
+- `dependabot-unblock` now checks the project's Claude configuration
+  (`CLAUDE.md`, `.claude/CLAUDE.md`, `AGENTS.md`) for dependency management
+  guidance before acting, so projects can override defaults (e.g., provide a
+  custom rebase script when Dependabot's built-in rebase is too naive)
+
 ## 0.1.5 — 2026-04-06
 
 ### Changed
