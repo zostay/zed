@@ -9,6 +9,16 @@ Unblock stuck Dependabot PRs. For merge conflicts, request a rebase from Dependa
 
 ## Steps
 
+### 0. Check for project-specific dependency management guidance
+
+Before taking any action, check the project's Claude configuration for special dependency management requirements or scripts. Look in:
+
+- `CLAUDE.md` (and any imported files)
+- `.claude/CLAUDE.md`
+- `AGENTS.md`
+
+Look for guidance on dependency updates, rebasing, merging, or Dependabot handling — for example, a project may provide a custom rebase script because Dependabot's built-in rebase is too naive. If such guidance exists, follow it in place of the default behavior in the steps below (e.g., use the project's rebase script instead of `@dependabot rebase`).
+
 ### 1. Fetch open Dependabot PRs
 
 Run the helper script to retrieve all open Dependabot PRs and their merge readiness:
