@@ -21,7 +21,12 @@ Before doing anything:
    - `.claude/CLAUDE.md`
    - `AGENTS.md`
 
-   Look for guidance on dependency updates, rebasing, merging, or Dependabot handling — for example, a project may provide a custom rebase script because Dependabot's built-in rebase is too naive. Record any such guidance; it will override the default behavior in the steps below (e.g., use the project's rebase script instead of `@dependabot rebase`).
+   Look for guidance on dependency updates, rebasing, merging, Dependabot handling, or remediation of common Dependabot PR failures. Record specifically:
+
+   - **Rebase remediation**: a custom rebase command/script the project uses in place of `@dependabot rebase` (e.g., because Dependabot's built-in rebase is too naive for the project's module layout).
+   - **Failure remediation**: guidance describing failure modes that Dependabot PRs commonly hit in this project and a prescribed automatic fix for each — for example, "if tests fail in subproject go.mod files, run script X" or "if a `setup-go` version mismatch shows up in CI, run script Y." A remediation only qualifies as **automatic** if it is a single command/script/comment the project prescribes; open-ended debugging does not count.
+
+   Record any such guidance; it will override the default behavior in the steps below.
 5. Initialize an internal **action log** (an in-memory list). Every action taken in the steps below gets appended here. The log is used for the changelog update and the final summary.
 
 ### 2. Unblock stuck PRs (remote-only)
@@ -59,7 +64,13 @@ gh pr comment <number> --body "@dependabot rebase"
 
 Log each rebase request (PR number, title, URL, and which method was used).
 
-Do **not** investigate failing-checks PRs — that requires checking out branches and open-ended investigation that conflicts with the fix phase. Note them in the log as "skipped (failing checks)" for the summary.
+For PRs in the **failing checks** group, do not perform open-ended investigation. Instead, decide based on the project guidance recorded in Step 1:
+
+1. If Step 1 recorded **failure remediation** guidance, run `gh pr checks <number>` to see what failed and compare against the scenarios the guidance covers. If the failure clearly matches one of the prescribed scenarios, apply the prescribed automatic remediation for each matching PR exactly as the guidance describes (e.g., comment the project's rebase trigger, run the project's script against the PR branch, etc.). Log each remediation (PR number, title, URL, which guidance was applied).
+2. If Step 1 also recorded **rebase remediation** guidance and the failure type is plausibly caused by Dependabot's naive rebase (a common case for projects with multi-module layouts, vendored dependencies, or coupled lockfiles), apply the project's rebase remediation to the PR even though it isn't strictly `CONFLICTING`. Log it the same way as conflicting rebases.
+3. Otherwise — no matching guidance, or the failure looks like a genuine code/test problem unrelated to dependency mechanics — log the PR as "skipped (failing checks)" and move on. Do **not** check out the branch or attempt ad-hoc fixes during the sweep; that belongs to `dependabot-unblock`.
+
+When this step requires running a local script against a PR branch, do the checkout/script/push for each affected PR before continuing to Step 3, and return to the recorded original branch (Step 1.2) before proceeding. Keep a clean working tree between PRs.
 
 ### 3. Merge ready PRs (remote-only)
 

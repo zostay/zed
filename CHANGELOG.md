@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.8 — 2026-05-11
+
+### Changed
+
+- `dependabot-sweep` no longer blindly skips PRs with failing checks. It now
+  consults project-recorded failure-remediation and rebase-remediation guidance
+  and applies the prescribed automatic fix when the failure matches a covered
+  scenario (e.g., multi-module go.mod test failures resolved by the project's
+  rebase script). Failures with no matching guidance are still skipped — the
+  sweep does not perform open-ended debugging
+
 ## 0.1.7 — 2026-05-11
 
 ### Changed
