@@ -16,7 +16,13 @@ Before doing anything:
 1. Run `git status --porcelain`. If the working tree is dirty (any output), tell the user to commit or stash their changes and **stop**.
 2. Record the current branch name: `git rev-parse --abbrev-ref HEAD`. You will return to this branch at the end.
 3. Run `gh auth status` to verify the GitHub CLI is authenticated. If it fails, report the error and **stop**.
-4. Initialize an internal **action log** (an in-memory list). Every action taken in the steps below gets appended here. The log is used for the changelog update and the final summary.
+4. Check the project's Claude configuration for special dependency management guidance. Look in:
+   - `CLAUDE.md` (and any imported files)
+   - `.claude/CLAUDE.md`
+   - `AGENTS.md`
+
+   Look for guidance on dependency updates, rebasing, merging, or Dependabot handling — for example, a project may provide a custom rebase script because Dependabot's built-in rebase is too naive. Record any such guidance; it will override the default behavior in the steps below (e.g., use the project's rebase script instead of `@dependabot rebase`).
+5. Initialize an internal **action log** (an in-memory list). Every action taken in the steps below gets appended here. The log is used for the changelog update and the final summary.
 
 ### 2. Unblock stuck PRs (remote-only)
 
@@ -45,13 +51,13 @@ Categorize every PR into one of four groups:
 3. **Ready to merge** — `mergeable` is `MERGEABLE` AND `checks_pass` is `true`
 4. **Checks unknown** — `checks_pass` is `null` AND `mergeable` is `MERGEABLE` (treat as ready to merge with `--auto`, which lets GitHub enforce branch protection rules)
 
-For **every** conflicting PR, request a rebase:
+For **every** conflicting PR, request a rebase. If Step 1 found project-specific rebase guidance (e.g., a custom rebase script), follow that guidance instead of the default `@dependabot rebase` comment — invoke the project's script or process for each conflicting PR exactly as the project's configuration prescribes. Otherwise, use the default:
 
 ```bash
 gh pr comment <number> --body "@dependabot rebase"
 ```
 
-Log each rebase request (PR number, title, URL).
+Log each rebase request (PR number, title, URL, and which method was used).
 
 Do **not** investigate failing-checks PRs — that requires checking out branches and open-ended investigation that conflicts with the fix phase. Note them in the log as "skipped (failing checks)" for the summary.
 
@@ -75,7 +81,7 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/dependabot-prs.sh"
 
 A merge can cause other PRs to become conflicting. After re-fetching:
 
-- If a PR you were about to merge is now `CONFLICTING`, request a rebase instead (`gh pr comment <number> --body "@dependabot rebase"`) and log it as rebased, not merged.
+- If a PR you were about to merge is now `CONFLICTING`, request a rebase instead — using the project-specific rebase guidance from Step 1 if any was found, otherwise `gh pr comment <number> --body "@dependabot rebase"` — and log it as rebased, not merged.
 - If new conflicts appeared on PRs that were already handled in Step 2, skip them (they were already rebased).
 - Continue merging remaining ready PRs from the updated data.
 

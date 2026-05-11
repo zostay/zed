@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.7 — 2026-05-11
+
+### Changed
+
+- `dependabot-sweep` now checks the project's Claude configuration
+  (`CLAUDE.md`, `.claude/CLAUDE.md`, `AGENTS.md`) for dependency management
+  guidance during pre-flight and applies it when requesting rebases, so
+  projects requiring a custom rebase script are no longer skipped
+
 ## 0.1.6 — 2026-04-20
 
 ### Changed
