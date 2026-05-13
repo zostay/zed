@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.9 — 2026-05-13
+
+### Added
+
+- `send-context` skill — summarize the current Claude Code session's context
+  (goal, current state, decisions, open questions, pointers) and write it to a
+  Markdown handoff file in the current folder or a named destination
+- `recv-context` skill — read a context handoff file written by `send-context`
+  from the current folder or a named source, absorb it into the current
+  session, and delete the file (unless `--keep` is passed) so the handoff is
+  consumed once
+
 ## 0.1.8 — 2026-05-11
 
 ### Changed

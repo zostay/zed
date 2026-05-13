@@ -1,7 +1,7 @@
 # zed
 
-Personal Claude Code plugin with custom skills for Dependabot maintenance and
-other repository automation.
+Personal Claude Code plugin with custom skills for Dependabot maintenance,
+cross-session context handoff, and other repository automation.
 
 ## Prerequisites
 
@@ -89,6 +89,32 @@ passing) using the repository's default merge method.
 
 ```
 /zed:dependabot-merge
+```
+
+### `send-context`
+
+Summarize the current Claude Code session — goal, current state, decisions and
+constraints, open questions, pointers — and write it to a Markdown handoff file
+(`claude-context-handoff.md` by default) so another Claude Code session can
+pick up the work. Pass a destination folder or full path as an argument to
+write somewhere other than the current directory.
+
+```
+/zed:send-context
+/zed:send-context ~/projects/other-repo
+```
+
+### `recv-context`
+
+Read a context handoff file written by `send-context`, absorb its contents into
+the current session, and delete the file so the handoff is consumed once. Pass
+a folder or file path to read from somewhere other than the current directory.
+Add `--keep` to preserve the file after reading.
+
+```
+/zed:recv-context
+/zed:recv-context ~/projects/other-repo
+/zed:recv-context --keep
 ```
 
 ## Project Structure
