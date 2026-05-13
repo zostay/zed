@@ -16,7 +16,7 @@ The skill takes an optional argument: where to find the handoff file.
 - If the argument is a file path (relative or absolute), use it directly.
 - If multiple files matching `claude-context-handoff*.md` exist in the target directory (e.g., timestamped variants from `send-context`), list them with their modification times and ask the user which one to consume. Do not guess.
 
-The user may also pass the flag `--keep` (anywhere in the argument string) to instruct the skill **not** to delete the file after reading. Treat any of `--keep`, `keep`, or `-k` as equivalent.
+The user may also pass the flag `--keep` or `-k` to instruct the skill **not** to delete the file after reading. The flag must appear as a **standalone whitespace-separated token** in the argument string — do not match it as a substring. A path like `~/keep-notes/` or `./my-keep-file.md` does **not** count as the flag.
 
 ## Steps
 
@@ -30,11 +30,22 @@ Read the entire file with the `Read` tool. If it is larger than a few hundred li
 
 ### 3. Sanity-check the format
 
-A well-formed handoff has a header section with a timestamp and originating directory, plus most of: Goal, Current state, Decisions and constraints, Open questions and next steps, Pointers.
+A well-formed handoff begins with a YAML frontmatter block containing **at least** these two fields, with these exact values:
 
-If the file does not look like a `send-context` handoff (no recognizable structure, looks like an unrelated Markdown file), stop and ask the user before proceeding. Do **not** delete a file that wasn't actually a handoff.
+```yaml
+format: claude-context-handoff
+version: 1
+```
 
-If the handoff timestamp is suspiciously old (more than a few days, where applicable), flag this to the user — the state described in it may have drifted.
+This marker is mandatory. It is what distinguishes a handoff from any other Markdown file the receiver might be pointed at by mistake.
+
+**Hard requirement before deletion:** if the file does not contain a valid frontmatter block with `format: claude-context-handoff`, refuse to delete it under any circumstances — even if the user passed an explicit path. Stop, tell the user what file was found and why it was rejected, and let them decide.
+
+If the marker is present but `version` is something other than `1`, the file was written by a newer (or different) `send-context`. Read it anyway on a best-effort basis, but flag the version mismatch in your briefing and ask the user whether deletion is still appropriate.
+
+If the marker is present and the version matches, also sanity-check that the body contains most of: Goal, Current state, Decisions and constraints, Open questions and next steps, Pointers. A handoff missing all of these is suspicious — surface that, but the marker is still authoritative for the deletion decision.
+
+If `generated_at` is suspiciously old (more than a few days, where applicable), flag this to the user — the state described in the file may have drifted.
 
 ### 4. Absorb the content
 
@@ -68,15 +79,17 @@ Keep this briefing tight — a dozen lines or so. The user wrote the handoff; th
 
 ### 7. Delete the file
 
-Unless `--keep` was passed, delete the handoff file:
+Unless `--keep` was passed, **and** the format marker from step 3 validated, delete the handoff file. Always quote the path and use `--` to terminate option processing, so paths containing spaces or beginning with `-` are handled safely:
 
 ```bash
-rm -f <path-to-handoff>
+rm -f -- "<path-to-handoff>"
 ```
 
 Use `rm -f` so a missing file is not an error. Report the deletion in one line.
 
 If `--keep` was passed, skip deletion and tell the user the file was preserved at its path.
+
+If the format marker did not validate in step 3, do **not** delete the file regardless of any `--keep` setting — the receiver has no reason to be confident the file is actually a handoff.
 
 ### 8. Continue
 
