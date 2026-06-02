@@ -43,6 +43,11 @@
 
 * { box-sizing: border-box; }
 
+/* The JS toggles visibility with the `hidden` attribute. Class rules like
+   `.empty-state { display:flex }` are author-origin and override the UA
+   `[hidden]{display:none}`, so make `hidden` authoritative everywhere. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;
@@ -255,6 +260,26 @@ code, .mono { font-family: var(--mono); }
   background: var(--panel-2); border: 1px solid var(--line);
   padding: 1px 6px; border-radius: 4px; color: var(--accent);
 }
+
+/* Markdown tables (run + job summaries) */
+.md-table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 10px 0;
+  font-size: 12.5px;
+}
+.md-table th, .md-table td {
+  border: 1px solid var(--line);
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.md-table th {
+  background: var(--panel-2);
+  color: var(--ink);
+  font-weight: 600;
+}
+.md-table tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.015); }
 
 /* run view */
 .run-view { padding: 22px 28px 60px; max-width: 1240px; }

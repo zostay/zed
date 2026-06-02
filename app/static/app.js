@@ -77,8 +77,11 @@
       var runs = (data && data.runs) || [];
       state.runs = runs;
       renderRunList();
-      if (initial && runs.length && state.selectedId == null) {
-        selectRun(runs[0].id);   // newest first → select default
+      // Auto-select the newest run whenever nothing is selected — not just on the
+      // first load. The app is often opened before any run exists, so the initial
+      // fetch sees zero runs; the first poll that finds one must select it.
+      if (runs.length && state.selectedId == null) {
+        selectRun(runs[0].id);   // newest first → default selection
       } else if (state.selectedId != null && !findRun(state.selectedId) && runs.length) {
         selectRun(runs[0].id);
       }
@@ -554,6 +557,25 @@
         continue;
       }
 
+      // GFM table: a row with pipes followed by a delimiter row (|---|:--:|...)
+      if (line.indexOf("|") !== -1 && i + 1 < lines.length &&
+          /\|/.test(lines[i + 1]) &&
+          /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(lines[i + 1])) {
+        closeList();
+        var header = splitRow(line);
+        var aligns = splitRow(lines[i + 1]).map(function (c) {
+          var l = /^:/.test(c), r = /:$/.test(c);
+          return (l && r) ? "center" : r ? "right" : l ? "left" : "";
+        });
+        i += 2;
+        var rows = [];
+        while (i < lines.length && lines[i].indexOf("|") !== -1 && !/^\s*$/.test(lines[i])) {
+          rows.push(splitRow(lines[i])); i++;
+        }
+        out.push(buildTable(header, aligns, rows));
+        continue;
+      }
+
       // horizontal rule
       if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
         closeList(); out.push("<hr>"); i++; continue;
@@ -604,6 +626,35 @@
     }
     closeList();
     return out.join("");
+  }
+
+  // split a table row into trimmed cells, dropping the optional leading/trailing
+  // pipe and honoring escaped pipes (\|).
+  function splitRow(row) {
+    var s = row.trim().replace(/^\|/, "").replace(/\|$/, "");
+    s = s.replace(/\\\|/g, "\uF8FF");        // protect escaped pipes
+    return s.split("|").map(function (c) {
+      return c.replace(/\uF8FF/g, "|").trim();
+    });
+  }
+
+  function alignAttr(a) { return a ? ' style="text-align:' + a + '"' : ""; }
+
+  function buildTable(header, aligns, rows) {
+    var h = "<thead><tr>";
+    header.forEach(function (c, idx) {
+      h += "<th" + alignAttr(aligns[idx]) + ">" + inline(c) + "</th>";
+    });
+    h += "</tr></thead><tbody>";
+    rows.forEach(function (r) {
+      h += "<tr>";
+      for (var idx = 0; idx < header.length; idx++) {
+        h += "<td" + alignAttr(aligns[idx]) + ">" + inline(r[idx] != null ? r[idx] : "") + "</td>";
+      }
+      h += "</tr>";
+    });
+    h += "</tbody>";
+    return '<table class="md-table">' + h + "</table>";
   }
 
   // inline formatting on already-structural text
