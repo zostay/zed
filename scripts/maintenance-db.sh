@@ -61,6 +61,15 @@ die() {
   exit "${2:-1}"
 }
 
+# Validate that a value is a non-negative integer. Row ids are produced by this
+# script itself, but guarding them keeps a crafted --run/--job value (e.g.
+# --run "1; DROP TABLE runs;--") from being spliced into SQL.
+require_int() {
+  case "$2" in
+    ''|*[!0-9]*) die "$1 must be a non-negative integer (got: '$2')" 2 ;;
+  esac
+}
+
 # Read a file's full contents into a variable, or die if it is unreadable.
 read_file() {
   local path="$1"
@@ -76,6 +85,7 @@ db_exec() {
   sqlite3 "$DB" <<SQL
 .output /dev/null
 PRAGMA busy_timeout=10000;
+PRAGMA foreign_keys=ON;
 .output stdout
 $(cat)
 SQL
@@ -172,6 +182,7 @@ cmd_set_stage() {
   done
   [ -n "$run" ]   || die "set-stage: --run is required"
   [ -n "$stage" ] || die "set-stage: --stage is required"
+  require_int --run "$run"
 
   db_exec <<SQL
 UPDATE runs SET stage='$(mtnc_sql_escape "$stage")' WHERE id=$run;
@@ -192,6 +203,7 @@ cmd_add_job() {
   [ -n "$run" ]  || die "add-job: --run is required"
   [ -n "$path" ] || die "add-job: --path is required"
   [ -n "$name" ] || die "add-job: --name is required"
+  require_int --run "$run"
 
   local path_e name_e skill_v
   path_e="$(mtnc_sql_escape "$path")"
@@ -220,6 +232,7 @@ cmd_start_job() {
     esac
   done
   [ -n "$job" ] || die "start-job: --job is required"
+  require_int --job "$job"
 
   local now
   now="$(mtnc_now)"
@@ -242,6 +255,7 @@ cmd_finish_job() {
   done
   [ -n "$job" ]    || die "finish-job: --job is required"
   [ -n "$status" ] || die "finish-job: --status is required"
+  require_int --job "$job"
   if [ -n "$summary_file" ]; then
     summary="$(read_file "$summary_file")"
     have_summary=1
@@ -275,6 +289,8 @@ cmd_log() {
   done
   [ -n "$run" ]          || die "log: --run is required"
   [ "$have_message" -eq 1 ] || die "log: --message is required"
+  require_int --run "$run"
+  [ -n "$job" ] && require_int --job "$job"
 
   local now job_v
   now="$(mtnc_now)"
@@ -303,6 +319,7 @@ cmd_finish_run() {
   done
   [ -n "$run" ]    || die "finish-run: --run is required"
   [ -n "$status" ] || die "finish-run: --status is required"
+  require_int --run "$run"
   if [ -n "$summary_file" ]; then
     summary="$(read_file "$summary_file")"
     have_summary=1

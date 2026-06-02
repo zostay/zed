@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -80,15 +80,14 @@ class DB:
 
 
 def _uri_path(abspath):
-    """Percent-encode a filesystem path for use in a sqlite file: URI."""
-    # SQLite URIs use URL encoding; reserved chars that matter here: ? # %
-    out = []
-    for ch in abspath:
-        if ch in "?#%":
-            out.append("%%%02X" % ord(ch))
-        else:
-            out.append(ch)
-    return "".join(out)
+    """Percent-encode a filesystem path for use in a sqlite file: URI.
+
+    SQLite file: URIs use URL encoding. Encode everything that isn't an
+    unreserved character, keeping path separators intact — this covers spaces
+    and other special characters (e.g. paths under
+    ``~/Library/Application Support/...``), not just ``? # %``.
+    """
+    return quote(abspath, safe="/")
 
 
 def _counts(jobs):
@@ -220,6 +219,14 @@ class Handler(BaseHTTPRequestHandler):
     # -- dispatch ----------------------------------------------------------- #
 
     def do_HEAD(self):
+        # The SSE route is an infinite stream; delegating a HEAD to do_GET would
+        # block forever (hanging HEAD-based health checks/proxies). Reject it.
+        if RE_STREAM.match(urlparse(self.path).path):
+            self.send_response(405)
+            self.send_header("Allow", "GET")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.do_GET()
 
     def do_GET(self):

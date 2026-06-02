@@ -126,6 +126,17 @@ cmd_start() {
     esac
   done
 
+  # Validate the port before launching: a non-numeric or out-of-range value
+  # makes server.py exit immediately, which would otherwise surface only as a
+  # confusing "timed out waiting for monitor.port" later.
+  case "$start_port" in
+    ''|*[!0-9]*) echo "Error: --port must be an integer (got: '$start_port')." >&2; exit 2 ;;
+  esac
+  if [ "$start_port" -lt 1 ] || [ "$start_port" -gt 65535 ]; then
+    echo "Error: --port must be in 1..65535 (got: $start_port)." >&2
+    exit 2
+  fi
+
   # Decide whether to open a browser at all.
   local do_open=true
   if [ "$headless" = true ] || [ "$no_open" = true ]; then

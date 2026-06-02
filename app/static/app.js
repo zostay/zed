@@ -674,7 +674,10 @@
     // links [text](url) — only http(s)/mailto/relative, escaped url
     s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (_, txt, url) {
       if (!/^(https?:|mailto:|\/|#)/i.test(url)) return txt;
-      return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + txt + '</a>';
+      // escHtml() (applied above) does not escape quotes; encode them so a
+      // crafted url can't break out of the href attribute (XSS).
+      var safeUrl = url.replace(/"/g, "%22").replace(/'/g, "%27");
+      return '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' + txt + '</a>';
     });
     // restore code spans
     s = s.replace(/ CODE(\d+) /g, function (_, n) {

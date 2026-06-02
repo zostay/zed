@@ -37,7 +37,7 @@ Subcommands:
   add-root <path>    Add a search root.
   remove-root <path> Remove a search root.
   add-block <path>   Add a blocklist entry.
-  remove-block <path>Remove a blocklist entry.
+  remove-block <path> Remove a blocklist entry.
 EOF
 }
 
