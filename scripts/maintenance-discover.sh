@@ -103,7 +103,7 @@ while IFS= read -r root; do
     [ -n "$project" ] || continue
     printf '%s\t%s\n' "$project" "$skill_md" >>"$results_file"
   done < <(
-    find "$root" -maxdepth 6 \
+    find "$root" -maxdepth 12 \
       \( -name node_modules -o -name .git -o -name vendor \) -prune -o \
       -type f -name SKILL.md -path "*/skills/${skill_name}/SKILL.md" -print 2>/dev/null
   )
