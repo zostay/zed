@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.0 — 2026-06-01
+
+### Added
+
+- `maintenance` skill — run a maintenance task across all configured projects in
+  one pass. Discovers every project that defines a `maintenance-<tag>` skill,
+  dispatches a subagent per project to run it (serial by default and with
+  `--now`; parallel with `--fast`), and records the whole sweep to a local
+  SQLite database. Supports `--headless` to skip the web app
+- `maintenance-config.sh` — manages `config.json` (search roots + blocklist) used
+  to locate participating projects
+- `maintenance-discover.sh` — discovers projects defining a `maintenance-<tag>`
+  skill under the configured search roots, applying the blocklist, and emits JSONL
+- `maintenance-db.sh` — observability writer CLI that records runs, per-project
+  jobs, and events to a WAL-mode SQLite database (`schema.sql`) for safe
+  concurrent writes from parallel subagents
+- `maintenance-monitor.sh` — lifecycle controller (start/stop/status/url/restart)
+  for the observability web app
+- `maintenance-common.sh` — shared library resolving the persistent data dir and
+  common helpers, sourced by the other maintenance scripts
+- Observability web app (`app/server.py` + `app/static/`) — a single-file
+  Python 3 standard-library HTTP/SSE server and vanilla-JS UI that renders runs,
+  a per-run stage stepper, live per-project job status (pending / running /
+  success / failure / skipped) with red/green health indicators, and rendered
+  Markdown summaries. Reads the database read-only; no `pip`, npm, or build step.
+  Requires `python3` and `sqlite3`
+
 ## 0.1.9 — 2026-05-13
 
 ### Added

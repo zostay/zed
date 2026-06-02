@@ -1,7 +1,8 @@
 # zed
 
 Personal Claude Code plugin with custom skills for Dependabot maintenance,
-cross-session context handoff, and other repository automation.
+system-wide cross-project maintenance, cross-session context handoff, and other
+repository automation.
 
 ## Prerequisites
 
@@ -10,6 +11,9 @@ cross-session context handoff, and other repository automation.
   the target repository
 - Dependabot enabled on the target repository (for alerts and/or security
   updates)
+- For the `maintenance` skill's observability app: `python3` and `sqlite3` (both
+  ubiquitous on macOS/Linux; the web app uses only the Python 3 standard
+  library, no `pip` installs)
 
 ## Installation
 
@@ -50,6 +54,55 @@ work of the other three skills:
 ```
 /zed:dependabot-sweep
 ```
+
+### `maintenance`
+
+Run a maintenance task across **all** your configured projects in one pass.
+This skill is an orchestrator: it discovers every project that opts in by
+defining a `maintenance-<tag>` skill, dispatches a subagent per project to run
+that skill, and records the whole sweep to a local SQLite database that a small
+web app renders live so you can watch progress and results across all your
+repositories at a glance.
+
+```
+/zed:maintenance <tag> [--now] [--fast] [--headless]
+```
+
+- `<tag>` (required) — discover and run the `maintenance-<tag>` skill in each
+  participating project (e.g. `/zed:maintenance dependabot` runs each project's
+  `maintenance-dependabot` skill).
+- `--now` — explicitly select the methodical, serial execution path. Claude Code
+  has no user-facing batch primitive for subagents, so the **default** is the
+  serial path; `--now` states that intent explicitly.
+- `--fast` — dispatch the per-project subagents in parallel (faster, more tokens).
+- `--headless` — do not start or open the observability web app.
+
+**Configuration.** Search roots and a blocklist live in a `config.json` managed
+by `scripts/maintenance-config.sh` (defaults to `{ "searchRoots": ["~/projects"],
+"blocklist": [] }`). Add a search root with
+`maintenance-config.sh add-root <path>` and exclude a project with
+`maintenance-config.sh add-block <path-or-name>`.
+
+**Observability app.** Unless `--headless`, the skill starts a single-file
+Python 3 HTTP server (`app/server.py`, default port 7373, probing upward if
+busy) that serves a vanilla-JS UI from `app/static/`. The UI shows a sidebar of
+runs, a per-run stage stepper, live per-project job cards (pending / running /
+success / failure / skipped) with red/green health indicators, and rendered
+Markdown summaries — updated live via Server-Sent Events with a polling
+fallback. It opens the database **read-only** (WAL mode lets readers never block
+the subagent writers) and uses only the Python 3 standard library — no `pip`,
+no npm, no build step, no external CDN. Control it directly with:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" start    # start + open browser
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" status
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" stop
+```
+
+All runtime state (the SQLite database, config, and monitor pid/port/log) lives
+in `${CLAUDE_PLUGIN_DATA}/maintenance` (or
+`${XDG_DATA_HOME:-$HOME/.local/share}/zed-maintenance`), so history persists
+across runs and plugin updates.
 
 ### `dependabot-fix`
 
@@ -127,6 +180,9 @@ skills/             # Custom skills (invoked via /zed:skill-name)
 agents/             # Custom agent definitions
 hooks/              # Event hooks for Claude Code lifecycle events
 scripts/            # Helper scripts used by skills, agents, or hooks
+app/                # Python-stdlib observability web app for the maintenance skill
+  server.py         # Single-file HTTP/SSE server (Python 3 stdlib only)
+  static/           # Vanilla-JS UI (index.html, app.js, styles.css)
 ```
 
 ## Development

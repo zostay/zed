@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>maintenance · observability</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230b0e0c'/%3E%3Ccircle cx='8' cy='8' r='3' fill='%234ade80'/%3E%3C/svg%3E">
+</head>
+<body>
+  <div class="app">
+    <!-- Masthead -->
+    <header class="masthead">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-text">
+          <span class="brand-name">MAINTENANCE</span>
+          <span class="brand-sub">observability deck</span>
+        </span>
+      </div>
+      <div class="masthead-right">
+        <div class="conn" id="conn" data-state="init">
+          <span class="conn-dot"></span>
+          <span class="conn-label">connecting</span>
+        </div>
+        <time class="clock" id="clock">--:--:--</time>
+      </div>
+    </header>
+
+    <!-- Sidebar: runs -->
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <span class="sidebar-title">RUNS</span>
+        <span class="sidebar-count" id="runs-count">0</span>
+      </div>
+      <ul class="run-list" id="run-list"></ul>
+      <div class="sidebar-empty" id="runs-empty" hidden>
+        <p class="empty-line">No runs in the log.</p>
+      </div>
+    </aside>
+
+    <!-- Main detail -->
+    <main class="detail" id="detail">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-glyph" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+        <h2>No maintenance runs yet</h2>
+        <p>Start one with <code>/zed:maintenance &lt;tag&gt;</code> and live activity will stream in here.</p>
+      </div>
+
+      <div class="run-view" id="run-view" hidden>
+        <!-- Run header -->
+        <section class="run-header">
+          <div class="run-id-block">
+            <span class="run-tag" id="rv-tag">tag</span>
+            <span class="run-meta" id="rv-meta">run #—</span>
+          </div>
+          <div class="run-status-block">
+            <span class="status-pill" id="rv-status" data-status="running">running</span>
+            <span class="run-time" id="rv-time"></span>
+          </div>
+        </section>
+
+        <!-- Stage stepper -->
+        <section class="stepper" id="stepper" aria-label="run stage"></section>
+
+        <!-- Counts -->
+        <section class="counts" id="counts"></section>
+
+        <!-- Two columns: jobs + summary/log -->
+        <div class="run-body">
+          <section class="jobs-pane">
+            <div class="pane-head">
+              <span class="pane-title">PROJECTS</span>
+              <span class="pane-hint" id="jobs-hint"></span>
+            </div>
+            <div class="jobs" id="jobs"></div>
+          </section>
+
+          <section class="side-pane">
+            <div class="pane-head">
+              <span class="pane-title">RUN SUMMARY</span>
+            </div>
+            <div class="summary md" id="summary">
+              <p class="muted">No summary yet — it appears when the run finishes.</p>
+            </div>
+
+            <div class="pane-head" style="margin-top:22px">
+              <span class="pane-title">ACTIVITY</span>
+              <span class="pane-hint" id="events-hint"></span>
+            </div>
+            <ol class="events" id="events"></ol>
+          </section>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
