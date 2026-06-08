@@ -90,8 +90,10 @@ is_blocked() {
 
 # Read the integer `priority:` from a SKILL.md's YAML front matter. Scans only the
 # leading `---`…`---` block, takes the first `priority:` key, strips a trailing
-# comment and surrounding double quotes, and validates it as an optionally-signed
-# integer. Anything missing or unparseable yields the default priority of 0.
+# comment, surrounding single/double quotes, and surrounding whitespace, then
+# validates it as an optionally-signed integer. So `priority: '-100'`,
+# `priority: " -100 "`, and `priority: -100` all parse to -100. Anything missing
+# or unparseable yields the default priority of 0.
 read_priority() {
   local skill_md="$1" val
   val="$(awk '
@@ -100,7 +102,8 @@ read_priority() {
     infm && /^[[:space:]]*priority[[:space:]]*:/ {
       sub(/^[[:space:]]*priority[[:space:]]*:[[:space:]]*/, "")
       sub(/[[:space:]]*#.*$/, "")
-      gsub(/"/, "")
+      gsub(/["'\'']/, "")
+      sub(/^[[:space:]]+/, "")
       sub(/[[:space:]]+$/, "")
       print
       exit
@@ -147,7 +150,8 @@ while IFS= read -r root; do
   )
 done < <(bash "${SCRIPT_DIR}/maintenance-config.sh" roots 2>/dev/null || true)
 
-# Dedupe by project_path (keep first skill_path seen), apply blocklist, read each
+# Dedupe by project_path (after `sort -u`, the lexicographically-first skill_path
+# for each project_path wins — not discovery order), apply blocklist, read each
 # project's priority, sort by (priority asc, project_path), and emit JSONL. The
 # intermediate line is "priority<TAB>project_path<TAB>skill_path"; `sort -k1,1n`
 # orders numerically by priority and `-k2,2` breaks ties by path deterministically.
@@ -169,8 +173,8 @@ output="$(
       --arg pn "$name" \
       --arg sn "$skill_name" \
       --arg sp "$skill_md" \
-      --argjson pr "$priority" \
-      '{project_path: $pp, project_name: $pn, skill_name: $sn, skill_path: $sp, priority: $pr}'
+      --arg pr "$priority" \
+      '{project_path: $pp, project_name: $pn, skill_name: $sn, skill_path: $sp, priority: ($pr|tonumber)}'
   done
 )"
 
