@@ -14,8 +14,15 @@
 # to be skipped if its absolute path equals an entry, is inside a blocklisted dir, or
 # its basename matches an entry.
 #
-# Output: JSONL, one object per line, sorted by project_path:
-#   {"project_path","project_name","skill_name","skill_path"}
+# Each discovered skill may declare an integer `priority:` in its YAML front
+# matter to control execution order: lower runs earlier, higher runs later, and
+# the default (no field, or an unparseable value) is 0. Ties break by
+# project_path so the order stays deterministic. Example uses: a project that
+# needs up-front user interaction sets a negative priority to run first; one that
+# redeploys centrally-shared apps sets a positive priority to run last.
+#
+# Output: JSONL, one object per line, sorted by (priority asc, project_path):
+#   {"project_path","project_name","skill_name","skill_path","priority"}
 # If no projects are found, prints an informational line to stderr and exits 0 with
 # no stdout. Invalid tag -> usage to stderr, exit 2.
 
@@ -81,6 +88,34 @@ is_blocked() {
   return 1
 }
 
+# Read the integer `priority:` from a SKILL.md's YAML front matter. Scans only the
+# leading `---`…`---` block, takes the first `priority:` key, strips a trailing
+# comment, surrounding single/double quotes, and surrounding whitespace, then
+# validates it as an optionally-signed integer. So `priority: '-100'`,
+# `priority: " -100 "`, and `priority: -100` all parse to -100. Anything missing
+# or unparseable yields the default priority of 0.
+read_priority() {
+  local skill_md="$1" val
+  val="$(awk '
+    NR==1 && $0 ~ /^---[[:space:]]*$/ { infm=1; next }
+    infm && $0 ~ /^---[[:space:]]*$/ { exit }
+    infm && /^[[:space:]]*priority[[:space:]]*:/ {
+      sub(/^[[:space:]]*priority[[:space:]]*:[[:space:]]*/, "")
+      sub(/[[:space:]]*#.*$/, "")
+      gsub(/["'\'']/, "")
+      sub(/^[[:space:]]+/, "")
+      sub(/[[:space:]]+$/, "")
+      print
+      exit
+    }
+  ' "$skill_md" 2>/dev/null)"
+  if printf '%s' "$val" | grep -Eq '^-?[0-9]+$'; then
+    printf '%s' "$val"
+  else
+    printf '0'
+  fi
+}
+
 # Collect discovered project paths keyed to their skill path.
 # We store "project_path<TAB>skill_path" lines, then dedupe by project_path.
 results_file="$(mktemp)"
@@ -115,22 +150,31 @@ while IFS= read -r root; do
   )
 done < <(bash "${SCRIPT_DIR}/maintenance-config.sh" roots 2>/dev/null || true)
 
-# Dedupe by project_path (keep first skill_path seen), apply blocklist, sort, emit JSONL.
+# Dedupe by project_path (after `sort -u`, the lexicographically-first skill_path
+# for each project_path wins — not discovery order), apply blocklist, read each
+# project's priority, sort by (priority asc, project_path), and emit JSONL. The
+# intermediate line is "priority<TAB>project_path<TAB>skill_path"; `sort -k1,1n`
+# orders numerically by priority and `-k2,2` breaks ties by path deterministically.
 emitted=0
 output="$(
-  sort -u "$results_file" | awk -F'\t' '!seen[$1]++' | sort -t$'\t' -k1,1 | \
+  sort -u "$results_file" | awk -F'\t' '!seen[$1]++' | \
   while IFS=$'\t' read -r project skill_md; do
     [ -n "$project" ] || continue
     if is_blocked "$project"; then
       continue
     fi
+    printf '%s\t%s\t%s\n' "$(read_priority "$skill_md")" "$project" "$skill_md"
+  done | sort -t$'\t' -k1,1n -k2,2 | \
+  while IFS=$'\t' read -r priority project skill_md; do
+    [ -n "$project" ] || continue
     name="$(basename "$project")"
     jq -nc \
       --arg pp "$project" \
       --arg pn "$name" \
       --arg sn "$skill_name" \
       --arg sp "$skill_md" \
-      '{project_path: $pp, project_name: $pn, skill_name: $sn, skill_path: $sp}'
+      --arg pr "$priority" \
+      '{project_path: $pp, project_name: $pn, skill_name: $sn, skill_path: $sp, priority: ($pr|tonumber)}'
   done
 )"
 
