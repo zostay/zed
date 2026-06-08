@@ -164,11 +164,14 @@
   function runHealth(run) {
     var c = run.counts || {};
     if (run.status === "running" || c.running) return "running";
+    // A completed run is fully resolved — every followup was closed, so the run
+    // graduated from needs_followup to completed. It reads OK even though its job
+    // rows keep their followup status counts. Terminal status wins over counts.
+    if (run.status === "completed") return "ok";
     // Failures outrank followup: a needs_followup run that also had failures must
     // still show the fail signal in the sidebar, not be masked as followup.
     if (run.status === "failed" || c.failure) return "fail";
     if (run.status === "needs_followup" || c.followup) return "followup";
-    if (run.status === "completed") return "ok";
     if (run.status === "cancelled") return "idle";
     return c.success ? "ok" : "idle";
   }

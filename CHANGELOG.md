@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1 — 2026-06-08
+
+### Fixed
+
+- Observability app: a run whose followups were all resolved (status
+  `completed`) still showed **followup** health in the Runs sidebar, because the
+  sidebar ranked the lingering followup job count above the run's terminal
+  status. The sidebar now reads **OK** once a run completes, matching the
+  in-page status. Failures on a still-open `needs_followup` run continue to
+  outrank followup.
+
 ## 0.3.0 — 2026-06-08
 
 ### Added
