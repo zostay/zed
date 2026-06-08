@@ -44,7 +44,8 @@ CONTENT_TYPES = {
     ".map": "application/json; charset=utf-8",
 }
 
-JOB_STATUSES = ("pending", "running", "success", "failure", "skipped")
+JOB_STATUSES = ("pending", "running", "success", "followup", "failure", "skipped")
+FOLLOWUP_STATUSES = ("open", "done", "wontdo")
 
 # Routing patterns
 RE_RUN = re.compile(r"^/api/runs/(\d+)$")
@@ -135,8 +136,55 @@ def fetch_runs(db):
         conn.close()
 
 
+def _followup_counts(followups):
+    counts = {s: 0 for s in FOLLOWUP_STATUSES}
+    for f in followups:
+        st = f.get("status")
+        if st in counts:
+            counts[st] += 1
+    counts["total"] = len(followups)
+    counts["closed"] = counts["done"] + counts["wontdo"]
+    return counts
+
+
+def fetch_followups(conn, run_id):
+    """Followup tickets for a run, each with its comment timeline + last_comment.
+
+    Tolerates a database created before the followups tables existed (older
+    schema): returns an empty list rather than raising.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT * FROM followups WHERE run_id = ? ORDER BY id", (run_id,)
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    fups = [dict(r) for r in rows]
+    if not fups:
+        return fups
+    try:
+        crows = conn.execute(
+            "SELECT fc.followup_id AS fid, fc.ts, fc.action, fc.comment "
+            "FROM followup_comments fc JOIN followups f ON f.id = fc.followup_id "
+            "WHERE f.run_id = ? ORDER BY fc.id",
+            (run_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        crows = []
+    by_f = {}
+    for c in crows:
+        by_f.setdefault(c["fid"], []).append(
+            {"ts": c["ts"], "action": c["action"], "comment": c["comment"]}
+        )
+    for f in fups:
+        cs = by_f.get(f["id"], [])
+        f["comments"] = cs
+        f["last_comment"] = cs[-1] if cs else None
+    return fups
+
+
 def fetch_run_detail(db, run_id):
-    """Full run row + ordered jobs + counts. Returns None if run missing/error."""
+    """Full run row + ordered jobs + counts + followups. None if run missing."""
     try:
         conn = db.connect()
     except sqlite3.Error:
@@ -149,7 +197,14 @@ def fetch_run_detail(db, run_id):
             "SELECT * FROM jobs WHERE run_id = ? ORDER BY id", (run_id,)
         ).fetchall()
         jobs = [dict(j) for j in jobs]
-        return {"run": dict(run), "jobs": jobs, "counts": _counts(jobs)}
+        followups = fetch_followups(conn, run_id)
+        return {
+            "run": dict(run),
+            "jobs": jobs,
+            "counts": _counts(jobs),
+            "followups": followups,
+            "followup_counts": _followup_counts(followups),
+        }
     except sqlite3.Error:
         return None
     finally:
@@ -322,6 +377,8 @@ class Handler(BaseHTTPRequestHandler):
                     payload["run"] = detail["run"]
                     payload["jobs"] = detail["jobs"]
                     payload["counts"] = detail["counts"]
+                    payload["followups"] = detail["followups"]
+                    payload["followup_counts"] = detail["followup_counts"]
 
             if events:
                 changed = True
@@ -416,6 +473,12 @@ def _snapshot_sig(detail):
         parts.append("%s:%s:%s:%s" % (
             j.get("id"), j.get("status"), j.get("finished_at"),
             (j.get("summary") or "")[:64]))
+    # Include followup tickets so closing/commenting one streams to the client.
+    for f in detail.get("followups", []):
+        lc = f.get("last_comment") or {}
+        parts.append("f%s:%s:%s:%s" % (
+            f.get("id"), f.get("status"), f.get("updated_at"),
+            (lc.get("comment") or "")[:48]))
     return "|".join("" if p is None else str(p) for p in parts)
 
 

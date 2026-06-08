@@ -223,7 +223,7 @@ subagent does the project work and logs its own progress events.
    updates while it works. The subagent should NOT touch the run row or call
    `finish-run`; the orchestrator owns those.
 3. After the subagent returns, write its summary to a temp file and finish the
-   job with the right status (`success`, `failure`, or `skipped`):
+   job with the right status (`success`, `followup`, `failure`, or `skipped`):
    ```bash
    SUMMARY_TMP=$(mktemp)
    printf '%s\n' "<subagent's Markdown summary>" > "$SUMMARY_TMP"
@@ -231,9 +231,32 @@ subagent does the project work and logs its own progress events.
      finish-job --job "$JOB_ID" --status success --summary-file "$SUMMARY_TMP"
    rm -f "$SUMMARY_TMP"
    ```
-   On failure pass `--status failure` and `--error "<short reason>"`; if the
-   project decided there was nothing to do, `--status skipped`. Log a closing
-   event for the job and append the result to your action log.
+   Choose the status:
+   - `success` — the project's maintenance completed cleanly with nothing left
+     for a human to do.
+   - **`followup`** — the project at least **partially** succeeded but left work
+     that needs a human (a manual step, a decision, something to verify). Use this
+     for anything you would otherwise put in the run's "needs attention" section.
+   - `failure` — the project's maintenance could not be completed; also pass
+     `--error "<short reason>"`. A hard failure that a human must chase up should
+     **also** get a followup ticket (next sub-step) so it is tracked.
+   - `skipped` — there was nothing to do.
+
+   Log a closing event for the job and append the result to your action log.
+4. **Open followup tickets for anything needing a human.** For each distinct
+   outstanding item this project left behind (i.e. each thing you'd list under
+   "needs attention"), open a ticket and capture its number:
+   ```bash
+   TICKET=$("${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+     add-followup --run "$RUN_ID" --job "$JOB_ID" --project "<project_name>" \
+       --title "<one-line what's needed>" [--detail "<more context>"])
+   ```
+   `add-followup` prints the sequential **ticket number** (and logs a live `warn`
+   event so it appears in the activity feed). Keep the ticket numbers in your
+   action log — you will list them in the run summary. Open tickets for `followup`
+   jobs and for any `failure` job a human must resolve; a clean `success`/`skipped`
+   job gets none. (The user later resolves each ticket with
+   `/zed:maint-followup <number> done|nope|update`.)
 
 **Serial (default / `--now`):** dispatch one subagent, wait for it to return,
 finish its job, then move to the next — in the deterministic discovery order.
@@ -255,20 +278,44 @@ the remaining projects. One project's failure must not abort the others.
 ```
 
 Build a Markdown roll-up from your action log: per-project results (success /
-failure / skipped with one-line notes), totals, and a "needs attention" section
-listing any failures. Write it to a temp file and finish the run; `finish-run`
-sets the stage to `done` implicitly:
+followup / failure / skipped with one-line notes), totals, and a **"Needs
+attention"** section. That section must list each open followup ticket **by its
+number**, e.g.:
+
+```markdown
+## Needs attention
+- **#7** qubling.cloud — rotate the API token in prod (manual)
+- **#8** openscripture.today — confirm the import looks right
+
+Resolve each with `/zed:maint-followup <number> done|nope|update [comment]`.
+When the last ticket is closed, this run flips from **Needs Followup** to
+**Completed**.
+```
+
+Write it to a temp file and finish the run; `finish-run` sets the stage to `done`
+implicitly. **Choose the run status from whether any followup tickets are open:**
 
 ```bash
 RUN_SUMMARY_TMP=$(mktemp)
 # ... write the Markdown roll-up to "$RUN_SUMMARY_TMP" ...
+# If you opened any followup tickets this run, use needs_followup; else completed.
+RUN_STATUS=completed
+if [ -n "$("${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" list-followups --run "$RUN_ID" --status open)" ]; then
+  RUN_STATUS=needs_followup
+fi
 "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
-  finish-run --run "$RUN_ID" --status completed --summary-file "$RUN_SUMMARY_TMP"
+  finish-run --run "$RUN_ID" --status "$RUN_STATUS" --summary-file "$RUN_SUMMARY_TMP"
 rm -f "$RUN_SUMMARY_TMP"
 ```
 
-Use `--status failed` only if the orchestration itself broke (individual project
-failures still make a `completed` run — they are reported in the summary).
+- Use **`needs_followup`** whenever the run leaves any open followup ticket. The
+  run is finished sweeping but awaits human action; it graduates to `completed`
+  on its own when the last ticket is resolved (the orchestrator does **not** need
+  to revisit it).
+- Use **`completed`** when there are no open tickets.
+- Use **`failed`** only if the orchestration itself broke (individual project
+  failures do not by themselves fail the run — they are reported in the summary,
+  and any that need chasing have their own followup tickets).
 
 ### 7. Report & observe
 
@@ -284,6 +331,40 @@ Tell the user they can:
 - stop the app anytime with `maintenance-monitor.sh stop`, and
 - start it again later with `maintenance-monitor.sh start` to revisit this run
   and all past runs (the database persists across runs and plugin updates).
+
+## Followups
+
+A sweep rarely leaves everything in a finished state — some projects partially
+succeed but need a human to finish the job (a manual deploy step, a decision, a
+verification). Rather than burying these in prose, the run records them as
+numbered **followup tickets** and surfaces a distinct status for them.
+
+Statuses involved (all already understood by the DB and the observability app):
+
+- **Job status `followup`** — sits between `success` and `failure`: the project
+  at least partially succeeded but needs human attention. Set it in Step 5.
+- **Run status `needs_followup`** ("Needs Followup" in the app) — the run is done
+  sweeping but has at least one open ticket. Set it in Step 6.
+- A ticket's own lifecycle is `open → done | wontdo`.
+
+How it flows:
+
+1. As the orchestrator finishes each job (Step 5), it sets `followup` status for
+   partial successes and opens one `add-followup` ticket per outstanding item
+   (also for failures a human must chase). `add-followup` assigns the sequential
+   ticket number and logs a live event.
+2. At summary time (Step 6) the run is finished `needs_followup` if any ticket is
+   open, and the **Needs attention** section lists the tickets by number.
+3. The user resolves each ticket from any session with
+   `/zed:maint-followup <number> done|nope|update [comment]` (the **maint-followup**
+   skill). `update` comments without closing; `done` closes it completed; `nope`
+   closes it as won't-do. Each call appends to the ticket's comment timeline.
+4. When the **last** open ticket of a `needs_followup` run is closed, the DB flips
+   that run to `completed` automatically — the app shows the status change live.
+   The orchestrator never has to revisit a finished run to do this.
+
+Inspect tickets directly with `maintenance-db.sh list-followups [--run R]
+[--status open]` and `maintenance-db.sh get-followup --id N`.
 
 ## Robustness
 

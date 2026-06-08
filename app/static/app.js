@@ -18,9 +18,13 @@
     { id: "summarizing",    label: "summarizing",    tag: "05" },
     { id: "done",           label: "done",           tag: "06" }
   ];
-  var COUNT_KEYS = ["total", "pending", "running", "success", "failure", "skipped"];
+  var COUNT_KEYS = ["total", "pending", "running", "success", "followup", "failure", "skipped"];
+  // Terminal = the stream can close. 'needs_followup' is deliberately NOT terminal:
+  // the run is done sweeping but has open tickets, so we keep streaming to reflect
+  // tickets being resolved live until the run graduates to 'completed'.
   var TERMINAL = { completed: 1, failed: 1, cancelled: 1 };
   var LEVEL_GLYPH = { info: "›", warn: "▲", error: "✕", success: "✓" };
+  var TICKET_STATUS_LABEL = { open: "open", done: "done", wontdo: "won't do" };
 
   // ---- state --------------------------------------------------------------
   var state = {
@@ -49,6 +53,10 @@
     rvTime: byId("rv-time"),
     stepper: byId("stepper"),
     counts: byId("counts"),
+    followupsSection: byId("followups-section"),
+    followupsHint: byId("followups-hint"),
+    followupsBody: byId("followups-body"),
+    followupsFoot: byId("followups-foot"),
     jobs: byId("jobs"),
     jobsHint: byId("jobs-hint"),
     summary: byId("summary"),
@@ -128,6 +136,7 @@
       mini.className = "ri-mini";
       var c = run.counts || {};
       mini.appendChild(miniStat("ok", c.success));
+      if (c.followup) mini.appendChild(miniStat("followup", c.followup));
       mini.appendChild(miniStat("fail", c.failure));
       if (c.running) mini.appendChild(miniStat("run", c.running));
       bottom.appendChild(when);
@@ -155,13 +164,17 @@
   function runHealth(run) {
     var c = run.counts || {};
     if (run.status === "running" || c.running) return "running";
+    // Failures outrank followup: a needs_followup run that also had failures must
+    // still show the fail signal in the sidebar, not be masked as followup.
     if (run.status === "failed" || c.failure) return "fail";
+    if (run.status === "needs_followup" || c.followup) return "followup";
     if (run.status === "completed") return "ok";
     if (run.status === "cancelled") return "idle";
     return c.success ? "ok" : "idle";
   }
   function healthLabel(health, run) {
     if (health === "running") return "live";
+    if (health === "followup") return "followup";
     if (health === "fail") return "fail";
     if (health === "ok") return "ok";
     return run.status || "idle";
@@ -220,7 +233,10 @@
       if (state.selectedId !== id) return;
       var payload;
       try { payload = JSON.parse(ev.data); } catch (e) { return; }
-      if (payload.run) applyDetail({ run: payload.run, jobs: payload.jobs, counts: payload.counts });
+      if (payload.run) applyDetail({
+        run: payload.run, jobs: payload.jobs, counts: payload.counts,
+        followups: payload.followups, followup_counts: payload.followup_counts
+      });
       if (payload.events && payload.events.length) applyEvents(payload.events);
     };
     es.onerror = function () {
@@ -289,11 +305,17 @@
       (run.mode ? "  ·  " + run.mode : "") +
       (run.options ? "  ·  " + compactOptions(run.options) : "");
     el.rvStatus.dataset.status = run.status;
-    el.rvStatus.textContent = run.status;
+    el.rvStatus.textContent = statusLabel(run.status);
     el.rvTime.textContent = timeRange(run.started_at, run.finished_at);
 
     renderStepper(run.stage, run.status);
     renderCounts(detail.counts || {}, prev && prev.counts);
+    // The SSE payload carries followups only when something changed; fall back to
+    // the previous set so a jobs-only update doesn't blank the tickets table.
+    var followups = detail.followups != null ? detail.followups
+      : (prev && prev.followups) || [];
+    detail.followups = followups;
+    renderFollowups(followups);
     renderJobs(detail.jobs || []);
     renderSummary(run.summary);
 
@@ -334,10 +356,16 @@
       el.stepper.appendChild(d);
     });
   }
+  function statusLabel(status) {
+    if (status === "needs_followup") return "needs followup";
+    return status || "";
+  }
+
   function renderStepper(stage, status) {
     var idx = stageIndex(stage);
-    // A finished run lights all stages as done.
-    var finished = TERMINAL[status];
+    // A finished run lights all stages as done. 'needs_followup' isn't terminal
+    // (tickets remain) but its sweep is done — stage 'done' covers both.
+    var finished = TERMINAL[status] || stage === "done";
     var current = finished ? STAGES.length - 1 : idx;
     var steps = el.stepper.children;
     for (var i = 0; i < steps.length; i++) {
@@ -455,7 +483,8 @@
         detail.appendChild(er);
       }
       if (hasSummary) {
-        var expanded = state.expanded[job.id] || job.status === "failure";
+        var expanded = state.expanded[job.id] ||
+          job.status === "failure" || job.status === "followup";
         var sum = document.createElement("div");
         sum.className = "job-summary md";
         sum.innerHTML = renderMarkdown(job.summary);
@@ -484,6 +513,52 @@
       return;
     }
     el.summary.innerHTML = renderMarkdown(md);
+  }
+
+  // -- followup tickets -----------------------------------------------------
+  function renderFollowups(followups) {
+    followups = followups || [];
+    if (!followups.length) {
+      el.followupsSection.hidden = true;
+      el.followupsBody.innerHTML = "";
+      return;
+    }
+    el.followupsSection.hidden = false;
+
+    var open = 0, closed = 0;
+    var rows = "";
+    followups.forEach(function (f) {
+      var st = f.status || "open";
+      if (st === "open") open++; else closed++;
+      var lc = f.last_comment;
+      var latest = "";
+      if (lc) {
+        var verb = lc.action && lc.action !== "opened" ? lc.action + ": " : "";
+        latest = esc(verb) + esc(lc.comment || "");
+      }
+      var closedRow = st !== "open" ? " is-closed" : "";
+      rows += '<tr class="tk-row' + closedRow + '">' +
+        '<td class="tk-num">#' + esc(f.id) + '</td>' +
+        '<td class="tk-proj">' + esc(f.project_name || "—") + '</td>' +
+        '<td class="tk-title">' + esc(f.title || "") +
+          (f.detail ? '<span class="tk-detail">' + esc(f.detail) + '</span>' : '') + '</td>' +
+        '<td class="tk-stat"><span class="tk-status" data-s="' + esc(st) + '">' +
+          esc(TICKET_STATUS_LABEL[st] || st) + '</span></td>' +
+        '<td class="tk-latest">' + (latest || '<span class="muted">—</span>') + '</td>' +
+        '</tr>';
+    });
+    el.followupsBody.innerHTML = rows;
+
+    el.followupsHint.textContent =
+      open + " open" + (closed ? "  ·  " + closed + " closed" : "");
+    if (open) {
+      el.followupsFoot.innerHTML =
+        'Resolve a ticket with <code>/zed:maint-followup &lt;#&gt; done|nope|update [comment]</code>' +
+        ' — when the last open ticket closes, this run flips to <strong>completed</strong>.';
+    } else {
+      el.followupsFoot.innerHTML =
+        'All followups resolved. This run is <strong>completed</strong>.';
+    }
   }
 
   // =========================================================================

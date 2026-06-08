@@ -83,12 +83,30 @@ by `scripts/maintenance-config.sh` (defaults to `{ "searchRoots": ["~/projects"]
 `maintenance-config.sh add-root <path>` and exclude a project with
 `maintenance-config.sh add-block <path-or-name>`.
 
+**Followups.** A sweep often leaves work that needs a human (a manual deploy
+step, a decision, something to verify). Those are not buried in prose — a project
+that partially succeeds gets the job status **`followup`** (between `success` and
+`failure`), and the run records one numbered **followup ticket** per outstanding
+item. The run then finishes at status **Needs Followup** instead of Completed.
+Resolve a ticket from any session with the `maint-followup` skill:
+
+```bash
+/zed:maint-followup <ticket-number> <update|done|nope> [comment]
+```
+
+`update` adds a progress comment, `done` closes it completed, `nope` closes it as
+won't-do; omit the comment and the skill summarizes from the session in one
+sentence. When the last open ticket of a run is resolved, that run flips from
+**Needs Followup** to **Completed** automatically. Inspect tickets with
+`maintenance-db.sh list-followups` / `get-followup`.
+
 **Observability app.** Unless `--headless`, the skill starts a single-file
 Python 3 HTTP server (`app/server.py`, default port 7373, probing upward if
 busy) that serves a vanilla-JS UI from `app/static/`. The UI shows a sidebar of
 runs, a per-run stage stepper, live per-project job cards (pending / running /
-success / failure / skipped) with red/green health indicators, and rendered
-Markdown summaries — updated live via Server-Sent Events with a polling
+success / followup / failure / skipped) with health indicators, a **followups
+ticket table** (number, project, what's needed, status, latest update), and
+rendered Markdown summaries — updated live via Server-Sent Events with a polling
 fallback. It opens the database **read-only** (WAL mode lets readers never block
 the subagent writers) and uses only the Python 3 standard library — no `pip`,
 no npm, no build step, no external CDN. Control it directly with:
@@ -103,6 +121,19 @@ All runtime state (the SQLite database, config, and monitor pid/port/log) lives
 in `${CLAUDE_PLUGIN_DATA}/maintenance` (or
 `${XDG_DATA_HOME:-$HOME/.local/share}/zed-maintenance`), so history persists
 across runs and plugin updates.
+
+### `maint-followup`
+
+Record progress on a followup ticket raised by a `maintenance` run. Comments on,
+completes, or declines a single ticket; closing the last open ticket of a run
+flips that run from **Needs Followup** to **Completed**.
+
+```
+/zed:maint-followup <ticket-number> <update|done|nope> [comment]
+```
+
+With no `comment`, the skill writes a one-sentence summary of what happened toward
+the ticket from the current session's context.
 
 ### `dependabot-fix`
 
