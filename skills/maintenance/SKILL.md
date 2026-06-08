@@ -46,13 +46,20 @@ Do not pretend a batch API exists. Pick serial (default / `--now`) or parallel
 
 All scripts resolve their data directory the same way (via
 `scripts/maintenance-common.sh`) and write to a single SQLite database, so the
-web app and the orchestrator always agree on state. Invoke them as:
+web app and the orchestrator always agree on state.
+
+Invoke each script **directly by its path** (it is executable and carries a
+`#!/usr/bin/env bash` shebang) — do **not** prefix the call with `bash`. A bare
+`bash` token has to be resolved against the caller's `PATH`, which in a stripped
+subshell may omit Homebrew's `bash` and fail with `command not found: bash`,
+stalling the sweep. Direct execution lets the kernel pick the interpreter and
+the scripts self-heal `PATH` for their own helpers. Invoke them as:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" ...
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" ...
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-discover.sh" <tag>
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" ...
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" ...
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" ...
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-discover.sh" <tag>
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" ...
 ```
 
 Resolve the absolute path to the DB script once and keep it; you will hand it to
@@ -73,9 +80,9 @@ scripts print bare integers on stdout for this purpose.
 Ensure the config exists, then read the search roots and blocklist:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" init
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" roots
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" blocklist
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" init
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" roots
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" blocklist
 ```
 
 `config.json` defaults to `{ "searchRoots": ["~/projects"], "blocklist": [] }`.
@@ -83,7 +90,7 @@ If `roots` prints only the default `~/projects` and that may not match this
 user's layout, mention that they can add a search root with:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" add-root <path>
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" add-root <path>
 ```
 
 (and remove with `remove-root <path>`; blocklist entries via `add-block`/`remove-block`).
@@ -94,13 +101,13 @@ Create the database (idempotent) and open a run. Choose the mode string from the
 flags: `fast` for `--fast`, `now` for `--now`, otherwise `serial`.
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" init
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" init
 
-RUN_ID=$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+RUN_ID=$("${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
   start-run --tag "<tag>" --mode "<serial|fast|now>" \
   --options '{"now":false,"fast":false,"headless":false}')
 
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" set-stage --run "$RUN_ID" --stage reading-config
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" set-stage --run "$RUN_ID" --stage reading-config
 ```
 
 `start-run` prints the new `run_id` on stdout — capture it into `RUN_ID`. Put
@@ -111,14 +118,14 @@ the actual flag values into `--options` JSON.
 Unless `--headless`, start the observability web app and surface its URL:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" start
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" start
 ```
 
 This prints `http://127.0.0.1:<port>` and opens a browser. Log the URL as a run
 event so it appears in the run history:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
   log --run "$RUN_ID" --level info --message "Observability app: http://127.0.0.1:<port>"
 ```
 
@@ -127,7 +134,7 @@ fails (e.g. `python3` missing, port unavailable), log a `warn` event and
 continue — the sweep still runs and is fully recorded to the DB:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
   log --run "$RUN_ID" --level warn --message "Could not start observability app; continuing without it."
 ```
 
@@ -138,8 +145,8 @@ can start it later (and revisit history) with the same command:
 ### 4. Discover participating projects
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" set-stage --run "$RUN_ID" --stage discovering
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-discover.sh" <tag>
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" set-stage --run "$RUN_ID" --stage discovering
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-discover.sh" <tag>
 ```
 
 `maintenance-discover.sh` searches the configured roots for projects that define
@@ -154,7 +161,7 @@ prints **JSONL**, one object per line, sorted by `project_path`:
 For each line, register a job and capture its `job_id`:
 
 ```bash
-JOB_ID=$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+JOB_ID=$("${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
   add-job --run "$RUN_ID" \
   --path "<project_path>" --name "<project_name>" --skill "<skill_name>")
 ```
@@ -163,7 +170,7 @@ Keep an ordered list of `(JOB_ID, project_path, project_name, skill_name)`. Log
 how many projects were found:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
   log --run "$RUN_ID" --level info --message "Discovered N project(s) defining maintenance-<tag>."
 ```
 
@@ -171,7 +178,7 @@ If discovery printed nothing (no participating projects), finish the run and
 stop here:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
   finish-run --run "$RUN_ID" --status completed \
   --summary "No projects define a \`maintenance-<tag>\` skill under the configured search roots."
 ```
@@ -181,7 +188,7 @@ Then report that to the user (with the monitor URL if it was started) and stop.
 ### 5. Execute (dispatch a subagent per project)
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" set-stage --run "$RUN_ID" --stage executing
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" set-stage --run "$RUN_ID" --stage executing
 ```
 
 For each job, you (the orchestrator) own the job lifecycle in the DB, and the
@@ -191,8 +198,8 @@ subagent does the project work and logs its own progress events.
 
 1. Marks the job running before dispatch:
    ```bash
-   bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" start-job --job "$JOB_ID"
-   bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+   "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" start-job --job "$JOB_ID"
+   "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
      log --run "$RUN_ID" --job "$JOB_ID" --level info --message "Starting maintenance-<tag> in <project_name>."
    ```
 2. Dispatches a subagent (via the Task/Agent tool). The subagent's task is to:
@@ -210,7 +217,7 @@ subagent does the project work and logs its own progress events.
 
    Instruct the subagent to log progress with:
    ```bash
-   bash "<DB_SCRIPT>" log --run <RUN_ID> --job <JOB_ID> --level info --message "<what it's doing>"
+   "<DB_SCRIPT>" log --run <RUN_ID> --job <JOB_ID> --level info --message "<what it's doing>"
    ```
    (using `--level warn`/`error`/`success` as appropriate) so the live view
    updates while it works. The subagent should NOT touch the run row or call
@@ -220,7 +227,7 @@ subagent does the project work and logs its own progress events.
    ```bash
    SUMMARY_TMP=$(mktemp)
    printf '%s\n' "<subagent's Markdown summary>" > "$SUMMARY_TMP"
-   bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+   "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
      finish-job --job "$JOB_ID" --status success --summary-file "$SUMMARY_TMP"
    rm -f "$SUMMARY_TMP"
    ```
@@ -244,7 +251,7 @@ the remaining projects. One project's failure must not abort the others.
 ### 6. Summarize
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" set-stage --run "$RUN_ID" --stage summarizing
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" set-stage --run "$RUN_ID" --stage summarizing
 ```
 
 Build a Markdown roll-up from your action log: per-project results (success /
@@ -255,7 +262,7 @@ sets the stage to `done` implicitly:
 ```bash
 RUN_SUMMARY_TMP=$(mktemp)
 # ... write the Markdown roll-up to "$RUN_SUMMARY_TMP" ...
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
   finish-run --run "$RUN_ID" --status completed --summary-file "$RUN_SUMMARY_TMP"
 rm -f "$RUN_SUMMARY_TMP"
 ```
@@ -269,7 +276,7 @@ Print the roll-up summary to the user, along with the monitor URL (if the app is
 running) so they can review live progress and history:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" url   # prints URL if running
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" url   # prints URL if running
 ```
 
 Tell the user they can:
