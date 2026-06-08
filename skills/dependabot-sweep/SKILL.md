@@ -1,6 +1,6 @@
 ---
 name: dependabot-sweep
-description: Run a full Dependabot maintenance sweep — unblock stuck PRs, merge ready PRs, fix vulnerability alerts, update changelog, and open a PR.
+description: Run a full Dependabot maintenance sweep — unblock stuck PRs, merge ready PRs, fix vulnerability alerts, update changelog, open a PR, and merge it once checks are green.
 ---
 
 # Dependabot Sweep
@@ -202,9 +202,48 @@ gh pr create --title "chore(deps): dependabot sweep YYYY-MM-DD" --body "<structu
 
 The PR body should list all actions taken, organized by category (rebases requested, PRs merged, vulnerabilities fixed, vulnerabilities skipped). Use the action log to populate this.
 
+Record the PR number (capture it from the `gh pr create` output, or read it with `gh pr view <branch> --json number`). You will need it in Step 7.
+
 Report the PR URL to the user.
 
-### 7. Return and report
+### 7. Wait for checks and merge the sweep PR
+
+This step runs **only if Step 6 created a PR**. If no PR was created, skip to Step 8.
+
+Wait for the sweep PR's status checks to finish. `gh pr checks --watch` blocks until all checks complete, but can hang if a required check never reports, so put a hard timeout around it. Use `gtimeout` when it is installed, and fall back to plain `gh` when it is not (do **not** let a missing `gtimeout` crash the skill):
+
+```bash
+if command -v gtimeout >/dev/null 2>&1; then
+  gtimeout 30m gh pr checks <number> --watch
+else
+  gh pr checks <number> --watch
+fi
+```
+
+Choose a timeout appropriate for the project's CI (30m is a reasonable default). Note the exit codes:
+
+- `gtimeout` exits **124** if the timeout fires before checks finish — treat this as not-green (case 3 below).
+- Otherwise the exit code is whatever `gh pr checks` returned.
+
+In the fallback (no `gtimeout`) path, do not wait indefinitely — if checks have not finished after a reasonable interval, treat the PR as not-green (case 3) and leave it for the developer.
+
+Handle the outcome:
+
+1. **No checks reported** — the PR has no CI / status checks (`gh pr checks` reports "no checks reported on the ..." and exits). There are no tests to wait for; proceed to merge.
+2. **All checks pass** — the command exits 0. Proceed to merge.
+3. **Checks failed or timed out** — the command exits non-zero (a failing check, or `gtimeout` exit 124). Do **not** merge. Run `gh pr checks <number>` to capture which checks failed or are still pending, log it, and leave the PR open for the developer to address. Skip to Step 8.
+
+To merge (cases 1 and 2), use the same merge method as Step 3:
+
+```bash
+gh pr merge <number> --merge
+```
+
+Log the merge result. If the merge fails — for example, branch protection requires a human review or additional approvals — log the error and leave the PR open. Do **not** retry with `--admin` or any flag that bypasses branch protection rules or rulesets.
+
+Record the outcome of this step (merged, left open due to failing checks, or merge failed) for the final report.
+
+### 8. Return and report
 
 Return to the original branch:
 
@@ -221,6 +260,7 @@ Print a final summary covering:
 - Vulnerabilities skipped (test failures)
 - Changelog updated (yes/no)
 - PR URL (if one was created)
+- **Sweep PR status**: merged, or left open because checks failed (list the failing checks) or the merge could not complete (give the reason) — so the developer knows it still needs attention
 - Remaining work (anything that still needs attention)
 
 If **nothing was done at all** across all steps, report: "No Dependabot maintenance needed."
