@@ -21,8 +21,13 @@
 # needs up-front user interaction sets a negative priority to run first; one that
 # redeploys centrally-shared apps sets a positive priority to run last.
 #
+# A skill may also set `requiresAuthorization: true` in its front matter to mark
+# its maintenance as privileged (e.g. a production deployment): the orchestrator
+# must not run it unattended without an explicit, out-of-band grant created via
+# maintenance-authorize.sh. This is surfaced as a boolean in the output.
+#
 # Output: JSONL, one object per line, sorted by (priority asc, project_path):
-#   {"project_path","project_name","skill_name","skill_path","priority"}
+#   {"project_path","project_name","skill_name","skill_path","priority","requires_authorization"}
 # If no projects are found, prints an informational line to stderr and exits 0 with
 # no stdout. Invalid tag -> usage to stderr, exit 2.
 
@@ -116,6 +121,32 @@ read_priority() {
   fi
 }
 
+# Read the boolean `requiresAuthorization:` from a SKILL.md's YAML front matter.
+# Scans only the leading `---`…`---` block. Prints the JSON literal `true` when the
+# value is a truthy token (true/yes/on/1, case-insensitive), otherwise `false`.
+# Missing or unparseable -> `false`. A project sets this when its maintenance does
+# something privileged (e.g. a production deployment) that must not run unattended
+# without an explicit, out-of-band grant (see maintenance-authorize.sh).
+read_requires_authorization() {
+  local skill_md="$1" val
+  val="$(awk '
+    NR==1 && $0 ~ /^---[[:space:]]*$/ { infm=1; next }
+    infm && $0 ~ /^---[[:space:]]*$/ { exit }
+    infm && /^[[:space:]]*requiresAuthorization[[:space:]]*:/ {
+      sub(/^[[:space:]]*requiresAuthorization[[:space:]]*:[[:space:]]*/, "")
+      sub(/[[:space:]]*#.*$/, "")
+      gsub(/"/, "")
+      sub(/[[:space:]]+$/, "")
+      print tolower($0)
+      exit
+    }
+  ' "$skill_md" 2>/dev/null)"
+  case "$val" in
+    true|yes|on|1) printf 'true' ;;
+    *)             printf 'false' ;;
+  esac
+}
+
 # Collect discovered project paths keyed to their skill path.
 # We store "project_path<TAB>skill_path" lines, then dedupe by project_path.
 results_file="$(mktemp)"
@@ -174,7 +205,8 @@ output="$(
       --arg sn "$skill_name" \
       --arg sp "$skill_md" \
       --arg pr "$priority" \
-      '{project_path: $pp, project_name: $pn, skill_name: $sn, skill_path: $sp, priority: ($pr|tonumber)}'
+      --argjson ra "$(read_requires_authorization "$skill_md")" \
+      '{project_path: $pp, project_name: $pn, skill_name: $sn, skill_path: $sp, priority: ($pr|tonumber), requires_authorization: $ra}'
   done
 )"
 

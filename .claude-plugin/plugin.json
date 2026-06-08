@@ -8,5 +8,6 @@
   "homepage": "https://github.com/zostay/zed",
   "repository": "https://github.com/zostay/zed",
   "license": "MIT",
-  "keywords": ["claude", "plugin", "skills", "agents", "tools"]
+  "keywords": ["claude", "plugin", "skills", "agents", "tools"],
+  "hooks": "./hooks/hooks.json"
 }
