@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.1 — 2026-06-08
+
+### Changed
+
+- `dependabot-sweep` now waits for its sweep PR's checks to pass and merges the
+  PR automatically (new Step 7). It watches checks with `gh pr checks --watch`
+  under a `gtimeout` hard timeout (falling back to plain `gh` when `gtimeout`
+  is absent), merges with `--merge` when checks pass or none are reported, and
+  leaves the PR open and reported when checks fail or time out — never
+  bypassing branch protection
+
+### Fixed
+
+- Maintenance scripts (`maintenance-{db,config,discover,monitor}.sh`) now
+  self-heal `PATH` by appending the standard tool dirs (including Homebrew) so
+  `dirname`/`sqlite3`/`jq`/`find`/`python3` resolve under a minimal
+  environment. The `maintenance` orchestrator now invokes the scripts directly
+  via their shebang instead of prefixing a bare `bash`, so job registration no
+  longer fails when Homebrew's bash is off `PATH`
+
 ## 0.2.0 — 2026-06-01
 
 ### Added
