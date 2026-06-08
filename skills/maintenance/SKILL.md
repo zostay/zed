@@ -151,12 +151,17 @@ can start it later (and revisit history) with the same command:
 
 `maintenance-discover.sh` searches the configured roots for projects that define
 a `maintenance-<tag>` skill (at `<project>/.claude/skills/maintenance-<tag>/SKILL.md`
-or `<project>/skills/maintenance-<tag>/SKILL.md`), applies the blocklist, and
-prints **JSONL**, one object per line, sorted by `project_path`:
+or `<project>/skills/maintenance-<tag>/SKILL.md`), applies the blocklist, reads
+each skill's execution `priority` (see **Ordering** below), and prints **JSONL**,
+one object per line, sorted by `(priority ascending, project_path)`:
 
 ```json
-{"project_path":"...","project_name":"...","skill_name":"maintenance-<tag>","skill_path":"..."}
+{"project_path":"...","project_name":"...","skill_name":"maintenance-<tag>","skill_path":"...","priority":0}
 ```
+
+The orchestrator must preserve this emitted order: register jobs and (for serial
+runs) dispatch subagents in the exact sequence the lines arrive, so the priority
+ordering is honored end to end.
 
 For each line, register a job and capture its `job_id`:
 
@@ -236,13 +241,33 @@ subagent does the project work and logs its own progress events.
    event for the job and append the result to your action log.
 
 **Serial (default / `--now`):** dispatch one subagent, wait for it to return,
-finish its job, then move to the next — in the deterministic discovery order.
+finish its job, then move to the next — in the discovery order (priority
+ascending, then path). This is the path that honors per-project `priority`: a
+project that needs up-front user interaction runs before the rest, and one that
+redeploys centrally-shared apps runs after them.
 
-**Parallel (`--fast`):** call `start-job` for the batch, then dispatch multiple
-Task subagents **in a single turn** so they run concurrently; finish each job as
-its subagent returns. Concurrent DB writes from the subagents are safe by design
-(the DB uses WAL mode + `busy_timeout`), so **no extra coordination is needed** —
-just give each subagent its own `job_id`.
+**Parallel (`--fast`):** run **priority groups** in order, parallel *within* each
+group. Partition the jobs by their `priority` value (the field discovery emitted)
+into ascending groups — e.g. all `-100`s, then all `0`s, then all `100`s, and
+any other values as their own groups in between. Then, **one group at a time**:
+
+1. `start-job` for every job in the group.
+2. Dispatch a Task subagent for each job in that group **in a single turn** so
+   the whole group runs concurrently.
+3. Wait for the entire group to finish and `finish-job` each one **before**
+   starting the next group.
+
+This keeps `--fast`'s concurrency while still honoring `priority`: a `-100`
+project (e.g. one needing up-front user interaction) completes before any `0`
+project starts, and a `100` project (e.g. one redeploying centrally-shared apps)
+only starts after every lower group is done. Projects sharing a priority have no
+ordering guarantee relative to each other — that is the point of putting them in
+the same group. A single-group sweep (everything at the default `0`) is just one
+parallel batch, exactly as before.
+
+Concurrent DB writes from the subagents are safe by design (the DB uses WAL mode
++ `busy_timeout`), so **no extra coordination is needed** — just give each
+subagent its own `job_id`.
 
 If a subagent crashes or returns nothing usable, mark that job
 `--status failure --error "<reason>"`, log an `error` event, and keep going with
@@ -284,6 +309,47 @@ Tell the user they can:
 - stop the app anytime with `maintenance-monitor.sh stop`, and
 - start it again later with `maintenance-monitor.sh start` to revisit this run
   and all past runs (the database persists across runs and plugin updates).
+
+## Ordering
+
+By default every participating project runs in the middle of the pack, ordered
+alphabetically by path. A project can override where it falls by declaring an
+integer `priority` in the front matter of its own `maintenance-<tag>` skill:
+
+```yaml
+---
+name: maintenance-dependabot
+description: ...
+priority: -100
+---
+```
+
+Semantics:
+
+- **Lower runs earlier, higher runs later.** The default is `0`.
+- Use a **negative** priority for a project that must run **first** — e.g. one
+  whose maintenance needs up-front user interaction, so you deal with it before
+  walking away from the sweep.
+- Use a **positive** priority for a project that must run **last** — e.g. one
+  that redeploys centrally-shared applications which earlier projects may have
+  just updated, so it picks up their changes.
+- Ties (same priority, including the common case of everything at `0`) break by
+  `project_path`, keeping the order deterministic across runs.
+
+The numbers are only relative ranks, not slots — pick values with room to insert
+later (`-100`, `100`) rather than `-1`/`1`. `maintenance-discover.sh` reads the
+`priority`, sorts on it, and emits projects in execution order. Both execution
+paths honor it:
+
+- **Serial (default / `--now`)** runs projects strictly in the emitted order, so
+  every priority is fully ordered relative to every other.
+- **Parallel (`--fast`)** runs projects in **priority groups**: all projects at a
+  given priority run concurrently as one batch, and each group completes before
+  the next-higher group begins (see Step 5). So priorities are ordered relative
+  to each other, but projects sharing a priority are not ordered among
+  themselves. If a project must run strictly before or after *every* other —
+  including others at the same rank — give it its own distinct priority, or use
+  the serial path.
 
 ## Robustness
 
