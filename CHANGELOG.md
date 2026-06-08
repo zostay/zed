@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `maintenance` now tracks work that needs a human as numbered **followup
+  tickets**, with a new job status `followup` (between `success` and `failure`)
+  and a run status `needs_followup` ("Needs Followup"). A project that partially
+  succeeds is finished `followup` and the orchestrator opens one ticket per
+  outstanding item; the run finishes `needs_followup` while any ticket is open.
+  The observability app shows the new statuses and a followups ticket table, and
+  streams ticket changes live. A new **`maint-followup`** skill
+  (`/zed:maint-followup <ticket-number> <update|done|nope> [comment]`) records
+  progress on a ticket — `update` comments, `done` closes it completed, `nope`
+  closes it won't-do, and an omitted comment is summarized from session context.
+  Closing the last open ticket of a run flips it from `needs_followup` to
+  `completed` automatically. New `maintenance-db.sh` subcommands back this:
+  `add-followup`, `update-followup`, `list-followups`, `get-followup`, plus
+  `followups`/`followup_comments` tables in the schema
+
 ## 0.2.1 — 2026-06-08
 
 ### Changed

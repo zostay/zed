@@ -68,6 +68,29 @@
         <!-- Counts -->
         <section class="counts" id="counts"></section>
 
+        <!-- Followup tickets -->
+        <section class="followups" id="followups-section" hidden>
+          <div class="pane-head">
+            <span class="pane-title">FOLLOWUPS</span>
+            <span class="pane-hint" id="followups-hint"></span>
+          </div>
+          <div class="followups-wrap">
+            <table class="followups-table">
+              <thead>
+                <tr>
+                  <th class="tk-num">#</th>
+                  <th>Project</th>
+                  <th>Needs followup</th>
+                  <th class="tk-stat">Status</th>
+                  <th>Latest update</th>
+                </tr>
+              </thead>
+              <tbody id="followups-body"></tbody>
+            </table>
+          </div>
+          <p class="followups-foot" id="followups-foot"></p>
+        </section>
+
         <!-- Two columns: jobs + summary/log -->
         <div class="run-body">
           <section class="jobs-pane">
