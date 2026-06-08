@@ -21,6 +21,12 @@
 
 set -euo pipefail
 
+# Guarantee the standard tool directories are reachable even when this script is
+# launched from a stripped-down environment (e.g. a subshell whose PATH omits
+# Homebrew). A minimal PATH can hide bash/dirname/sqlite3/jq/find/python3 and
+# stall the whole sweep. Append so any ordering the caller set still wins.
+export PATH="${PATH:+$PATH:}/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
+
 source "$(dirname "${BASH_SOURCE[0]}")/maintenance-common.sh"
 
 mtnc_require jq
