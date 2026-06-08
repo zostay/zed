@@ -19,6 +19,19 @@
   `add-followup`, `update-followup`, `list-followups`, `get-followup`, plus
   `followups`/`followup_comments` tables in the schema
 
+### Fixed
+
+- Observability app: the status-counts strip was pinned to six columns, so the
+  new `followup` dial pushed `skipped` onto a lonely second row. It now lays out
+  all seven status dials on one row, with cells that shrink gracefully and labels
+  that never wrap.
+
+### Changed
+
+- Observability app: bumped the type size across the whole UI (~17%, base
+  16.5px) for legibility. All `font-size`s now route through a `--fs-*` type
+  scale in `:root`, so the whole interface can be resized from one place.
+
 ## 0.2.1 — 2026-06-08
 
 ### Changed
