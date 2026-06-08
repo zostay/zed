@@ -122,11 +122,13 @@ read_priority() {
 }
 
 # Read the boolean `requiresAuthorization:` from a SKILL.md's YAML front matter.
-# Scans only the leading `---`…`---` block. Prints the JSON literal `true` when the
-# value is a truthy token (true/yes/on/1, case-insensitive), otherwise `false`.
-# Missing or unparseable -> `false`. A project sets this when its maintenance does
-# something privileged (e.g. a production deployment) that must not run unattended
-# without an explicit, out-of-band grant (see maintenance-authorize.sh).
+# Scans only the leading `---`…`---` block. Strips a trailing comment, surrounding
+# single/double quotes, and surrounding whitespace (consistent with read_priority),
+# then prints the JSON literal `true` when the value is a truthy token
+# (true/yes/on/1, case-insensitive) — so `'true'` and `" true "` also count —
+# otherwise `false`. Missing or unparseable -> `false`. A project sets this when
+# its maintenance does something privileged (e.g. a production deployment) that
+# must not run unattended without an explicit grant (see maintenance-authorize.sh).
 read_requires_authorization() {
   local skill_md="$1" val
   val="$(awk '
@@ -135,7 +137,8 @@ read_requires_authorization() {
     infm && /^[[:space:]]*requiresAuthorization[[:space:]]*:/ {
       sub(/^[[:space:]]*requiresAuthorization[[:space:]]*:[[:space:]]*/, "")
       sub(/[[:space:]]*#.*$/, "")
-      gsub(/"/, "")
+      gsub(/["'\'']/, "")
+      sub(/^[[:space:]]+/, "")
       sub(/[[:space:]]+$/, "")
       print tolower($0)
       exit

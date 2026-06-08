@@ -77,6 +77,9 @@ ensure_grants_dir() {
   local d
   d="$(grants_dir)"
   mkdir -p "$d"
+  # Grants are a security control; keep the directory private to the owner so
+  # other users on a shared host can't read or tamper with grant files.
+  chmod 700 "$d" 2>/dev/null || true
   printf '%s\n' "$d"
 }
 
@@ -109,12 +112,17 @@ parse_ttl() {
   return 1
 }
 
-# Is the grant file at $1 currently valid (exists and not past its expiry)?
-# A null expires_epoch means "never expires". Returns 0 if valid, 1 otherwise.
+# Is the grant file at $1 currently valid (exists, parseable, and not past its
+# expiry)? A genuinely null expires_epoch means "never expires". A missing,
+# unreadable, or corrupt/malformed grant file is treated as INVALID — it must
+# never be able to bypass the expiry check and authorize a privileged task.
+# Returns 0 if valid, 1 otherwise.
 grant_is_valid() {
   local file="$1" exp now
   [ -f "$file" ] || return 1
-  exp="$(jq -r '.expires_epoch // "null"' "$file" 2>/dev/null || printf 'null')"
+  # Reject anything that is not well-formed JSON before trusting its contents.
+  jq -e . "$file" >/dev/null 2>&1 || return 1
+  exp="$(jq -r '.expires_epoch // "null"' "$file" 2>/dev/null)"
   [ "$exp" = "null" ] && return 0
   printf '%s' "$exp" | grep -Eq '^[0-9]+$' || return 1
   now="$(date +%s)"
@@ -124,13 +132,19 @@ grant_is_valid() {
 # Parse --flag value pairs into globals: ARG_TAG ARG_PROJECT ARG_TTL ARG_NOTE
 # ARG_REPEAT. Unknown flags -> usage, exit 2.
 ARG_TAG=""; ARG_PROJECT=""; ARG_TTL=""; ARG_NOTE=""; ARG_REPEAT=0
+# Require that a value-taking flag actually has a value. Called as `need_val "$@"`
+# so $1 is the flag and $2 (if present) its value; errors with usage/exit 2 when
+# the value is missing — instead of letting `shift 2` blow up under `set -e`.
+need_val() {
+  [ "$#" -ge 2 ] || { echo "Error: $1 requires a value." >&2; usage; exit 2; }
+}
 parse_flags() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --tag)     ARG_TAG="${2:-}"; shift 2 ;;
-      --project) ARG_PROJECT="${2:-}"; shift 2 ;;
-      --ttl)     ARG_TTL="${2:-}"; shift 2 ;;
-      --note)    ARG_NOTE="${2:-}"; shift 2 ;;
+      --tag)     need_val "$@"; ARG_TAG="$2"; shift 2 ;;
+      --project) need_val "$@"; ARG_PROJECT="$2"; shift 2 ;;
+      --ttl)     need_val "$@"; ARG_TTL="$2"; shift 2 ;;
+      --note)    need_val "$@"; ARG_NOTE="$2"; shift 2 ;;
       --repeat)  ARG_REPEAT=1; shift ;;
       *) echo "Error: unknown flag '$1'." >&2; usage; exit 2 ;;
     esac
@@ -175,6 +189,9 @@ cmd_grant() {
       expires_at:(if $expires_at=="" then null else $expires_at end),
       expires_epoch:$expires_epoch, one_time:$one_time,
       note:(if $note=="" then null else $note end)}' >"$tmp"
+  # Force owner-only perms before publishing: the grant authorizes privileged
+  # tasks, so it must not be world/group readable regardless of the umask.
+  chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$file"
   echo "Granted authorization for '${ARG_PROJECT}' (tag '${ARG_TAG}'): expires ${exp_iso:-never}, $([ "$one_time" = true ] && echo one-time || echo reusable)." >&2
   printf '%s\n' "$file"
@@ -190,14 +207,15 @@ cmd_check() {
     echo "No valid grant for '${ARG_PROJECT}' (tag '${ARG_TAG}')." >&2
     return 1
   fi
-  # No tag: accept a valid grant for this project under any tag.
-  local d glob f
+  # No tag: accept a valid grant for this project under any tag. Use nullglob
+  # with a fully-quoted directory so a data-dir path containing spaces is safe.
+  local d f
   d="$(grants_dir)"
-  glob="${d}/*__$(sanitize "$ARG_PROJECT").json"
-  for f in $glob; do
-    [ -e "$f" ] || continue
-    if grant_is_valid "$f"; then cat "$f"; return 0; fi
+  shopt -s nullglob
+  for f in "$d"/*__"$(sanitize "$ARG_PROJECT")".json; do
+    if grant_is_valid "$f"; then cat "$f"; shopt -u nullglob; return 0; fi
   done
+  shopt -u nullglob
   echo "No valid grant for '${ARG_PROJECT}' (any tag)." >&2
   return 1
 }
@@ -242,7 +260,10 @@ cmd_list() {
   for f in "$d"/*.json; do
     any=1
     if grant_is_valid "$f"; then status="valid"; else status="expired"; fi
-    jq -c --arg status "$status" '{tag, project, expires_at, one_time, status:$status}' "$f"
+    # Grant files are user-writable state; skip a corrupt one with a warning
+    # rather than letting jq's failure abort the listing under `set -e`.
+    jq -c --arg status "$status" '{tag, project, expires_at, one_time, status:$status}' "$f" 2>/dev/null \
+      || echo "warning: skipping unreadable/corrupt grant file: $f" >&2
   done
   shopt -u nullglob
   [ "$any" -eq 1 ] || echo "No grants." >&2

@@ -467,7 +467,8 @@ The control flow:
    `--repeat` for a grant reusable until it expires, `list`/`revoke` to inspect
    and rescind, and `consume` to spend a one-time grant.
 2. **The orchestrator checks the grant before it dispatches** a
-   `requires_authorization` project (Step 5, authorization gate). No valid grant
+   `requires_authorization` project — the authorization gate is the **first
+   per-job sub-step** of the Execute stage (Step 5, sub-step 1). No valid grant
    → the project is **skipped** and reported as awaiting authorization, with the
    exact `grant` command to run; the rest of the sweep is unaffected. A valid
    grant → it runs, and the grant is **consumed** on success so it cannot
