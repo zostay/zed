@@ -15,6 +15,21 @@
   the next-higher group begins. Use a negative priority for a project that needs
   up-front user interaction, and a positive one for a project that redeploys
   centrally-shared apps after earlier projects update them
+- `maintenance` can now gate privileged tasks (e.g. production deployments)
+  behind an explicit, out-of-band authorization grant so they run during an
+  unattended/auto-accept sweep without silently running every time. A project
+  opts in with `requiresAuthorization: true` in its `maintenance-<tag>` front
+  matter (surfaced by `maintenance-discover.sh` as `requires_authorization`).
+  New `scripts/maintenance-authorize.sh` manages time-boxed, one-time grants
+  (`grant`/`check`/`consume`/`revoke`/`list`), stored under `<data-dir>/grants/`.
+  The orchestrator checks for a valid grant before dispatching such a project —
+  skipping and reporting it (with the command to authorize) when absent, and
+  consuming the grant on success — so the gate holds even where plugin hooks do
+  not reach subagent tool calls. A new `PreToolUse` hook
+  (`hooks/maintenance-authz.sh`, registered in `hooks/hooks.json`) is
+  defense-in-depth: it returns an `allow` decision for a granted project so the
+  privileged command runs without a prompt in an auto-accept/`dontAsk` session,
+  and never denies (it only lifts the block when authorization is present)
 
 ## 0.2.1 — 2026-06-08
 

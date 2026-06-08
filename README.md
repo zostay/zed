@@ -83,6 +83,33 @@ by `scripts/maintenance-config.sh` (defaults to `{ "searchRoots": ["~/projects"]
 `maintenance-config.sh add-root <path>` and exclude a project with
 `maintenance-config.sh add-block <path-or-name>`.
 
+**Ordering.** A project's `maintenance-<tag>` skill can set an integer
+`priority` in its front matter to control where it runs: lower runs earlier,
+higher later, default `0`, ties broken by path. On the serial path projects run
+in strict order; with `--fast` they run in priority **groups** (each group
+concurrent, groups in order). Use a negative priority for a project that needs
+up-front interaction (runs first) and a positive one for a project that
+redeploys centrally-shared apps (runs last).
+
+**Authorization.** A project that does something privileged (e.g. a production
+deployment) sets `requiresAuthorization: true` in its `maintenance-<tag>` front
+matter so it never runs unattended without an explicit, out-of-band grant. Ahead
+of the sweep you authorize it deliberately:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" \
+  grant --tag weekly --project qubling.cloud --ttl 2h     # one-time, expires in 2h
+```
+
+The orchestrator checks for a valid grant before dispatching such a project (no
+grant → skipped and reported with the command to authorize it; valid grant →
+runs, then the grant is consumed). A `PreToolUse` hook
+(`hooks/maintenance-authz.sh`) is defense-in-depth: it returns an `allow`
+decision for a granted project so the privileged command runs without a prompt
+even in an auto-accept/`dontAsk` session, and stays silent (never denies)
+otherwise. Manage grants with `maintenance-authorize.sh list` / `revoke` /
+`consume`. Grants live under `<data-dir>/grants/`.
+
 **Observability app.** Unless `--headless`, the skill starts a single-file
 Python 3 HTTP server (`app/server.py`, default port 7373, probing upward if
 busy) that serves a vanilla-JS UI from `app/static/`. The UI shows a sidebar of
