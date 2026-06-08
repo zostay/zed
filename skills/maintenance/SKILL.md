@@ -300,7 +300,7 @@ RUN_SUMMARY_TMP=$(mktemp)
 # ... write the Markdown roll-up to "$RUN_SUMMARY_TMP" ...
 # If you opened any followup tickets this run, use needs_followup; else completed.
 RUN_STATUS=completed
-if [ -n "$(\"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh\" list-followups --run \"$RUN_ID\" --status open)" ]; then
+if [ -n "$("${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" list-followups --run "$RUN_ID" --status open)" ]; then
   RUN_STATUS=needs_followup
 fi
 "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
