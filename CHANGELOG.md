@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `maintenance` now honors a per-project execution order. A project's
+  `maintenance-<tag>` skill can declare an integer `priority` in its front
+  matter — lower runs earlier, higher runs later, default `0`, ties broken by
+  path. `maintenance-discover.sh` reads it, sorts discovery output by
+  `(priority, project_path)`, and includes `priority` in each JSONL record. The
+  serial path (default / `--now`) runs projects strictly in that order; the
+  parallel path (`--fast`) runs them in **priority groups** — all projects at a
+  given priority run concurrently as one batch, and each group completes before
+  the next-higher group begins. Use a negative priority for a project that needs
+  up-front user interaction, and a positive one for a project that redeploys
+  centrally-shared apps after earlier projects update them
+
 ## 0.3.1 — 2026-06-08
 
 ### Fixed
