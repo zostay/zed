@@ -35,7 +35,149 @@ Then pull the latest commits for that branch so review comments line up with cur
 git pull --ff-only
 ```
 
-### 3. Fetch review comments
+### 3. Establish the review
+
+Before fixing anything, make sure the PR actually has a review to act on. The
+skill sources feedback in priority order: **use existing feedback if any exists**,
+otherwise **watch for a pending Copilot review**, otherwise **generate one
+ourselves as a last resort**.
+
+#### 3a. Inventory the current review state
+
+Gather every feedback surface, plus the PR **timeline** — the timeline is the
+reliable signal for a Copilot review that is *requested or in progress*:
+
+```bash
+me=$(gh api user --jq .login)
+
+# Reviews, inline review comments, and top-level issue comments
+gh pr view <number> --json reviews
+gh api "repos/{owner}/{repo}/pulls/<number>/comments" --paginate
+gh api "repos/{owner}/{repo}/issues/<number>/comments" --paginate
+
+# Timeline — needed to detect an in-flight Copilot review (see below)
+gh api "repos/{owner}/{repo}/issues/<number>/timeline" --paginate
+```
+
+Match Copilot case-insensitively with `test("copilot")` on **every** surface —
+its login differs per surface: `Copilot` in the timeline `review_requested` /
+`reviewed` events, but `copilot-pull-request-reviewer` as a review or comment
+author.
+
+**Has Copilot already posted?** Check both a review summary *and* inline review
+comments — Copilot often posts inline comments only:
+
+```bash
+gh pr view <number> --json reviews \
+  --jq '[.reviews[] | select(.author.login | ascii_downcase | test("copilot"))] | length'
+gh api "repos/{owner}/{repo}/pulls/<number>/comments" \
+  --jq '[.[] | select(.user.login | ascii_downcase | test("copilot"))] | length'
+```
+
+**Is a Copilot review requested or in progress but not yet posted?** Do **not**
+rely on `reviewRequests` from `gh pr view`: GitHub drops a bot reviewer from that
+list the moment it *starts* working, so an actively-running Copilot review shows
+an **empty** `reviewRequests` (this is the trap that makes naive detection report
+"no Copilot" and wrongly fall through to generating a review). Read the timeline
+instead — a `copilot_work_started` event, or a `review_requested` event naming
+Copilot, means a Copilot review is on its way:
+
+```bash
+gh api "repos/{owner}/{repo}/issues/<number>/timeline" --paginate --jq '
+  [ .[]
+    | select(
+        .event == "copilot_work_started"
+        or (.event == "review_requested"
+            and ((.requested_reviewer.login // "") | ascii_downcase | test("copilot")))
+      )
+  ] | length'
+```
+
+From this, determine:
+
+- **Does any actionable feedback already exist?** — a Copilot review or Copilot
+  inline comments; unresolved inline review comments from any human; **or any
+  top-level issue comment from someone other than the current user** (`$me`).
+  Steps 4–5 act on all three, so all three count as existing feedback here.
+- **Is a Copilot review pending?** — the timeline shows it requested/in-progress
+  (above) **and** Copilot has not yet posted a review or inline comments.
+
+#### 3b. Decide how to source the review
+
+- **Actionable feedback already exists** → proceed straight to Step 4 and use it.
+- **A Copilot review is pending** (requested/in-progress, nothing posted yet) →
+  **watch** for it (3b-watch below).
+- **No Copilot pending/present and no other feedback** → **generate a review
+  ourselves** (3c). Do **not** request Copilot in this case.
+
+**3b-watch — wait for a pending Copilot review.** Poll until Copilot posts
+**either a review summary or inline review comments** (checking reviews alone
+misses an inline-only review). Sleep ~30s between checks, bounded to ~15 minutes
+of wall-clock total. Track the elapsed time in the loop itself so the bound holds
+even if a single call hangs, and wrap each network call in `gtimeout` when
+available as an extra guard — falling back to bare `gh` when it is absent (never
+let a missing `gtimeout` crash the skill):
+
+```bash
+deadline=$(( $(date +%s) + 15*60 ))
+run() { if command -v gtimeout >/dev/null 2>&1; then gtimeout 30 "$@"; else "$@"; fi; }
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  reviews=$(run gh pr view <number> --json reviews \
+    --jq '[.reviews[] | select(.author.login | ascii_downcase | test("copilot"))] | length')
+  inline=$(run gh api "repos/{owner}/{repo}/pulls/<number>/comments" \
+    --jq '[.[] | select(.user.login | ascii_downcase | test("copilot"))] | length')
+  if [ "${reviews:-0}" -gt 0 ] || [ "${inline:-0}" -gt 0 ]; then break; fi
+  sleep 30
+done
+```
+
+Stop the moment Copilot posts, then proceed to Step 4. If the ~15-minute bound
+elapses with nothing from Copilot, **ask the user** how to proceed — wait longer,
+generate a review now (3c), or proceed without one. Do **not** loop indefinitely.
+
+#### 3c. Generate a fallback review
+
+Run the review from a **fresh context** that bases its judgment **solely on the
+code changes and the PR's own description, which it discovers itself**. Prefer a
+**different agent/model system** over Claude when one is available — codex and the
+copilot CLI are independent models and give a genuine second opinion; the Claude
+subagent is the last resort. Select the first available tool:
+
+1. `command -v codex` → run codex non-interactively: `codex exec "<review-prompt>"`,
+   capturing stdout.
+2. else `command -v copilot` → run the copilot CLI in non-interactive/print mode
+   (confirm the exact flag with `copilot --help`; representative form
+   `copilot -p "<review-prompt>"`), capturing stdout.
+3. else → dispatch a **Claude Code subagent** (Task/Agent tool, `general-purpose`)
+   in a fresh context that performs the review and returns the review text.
+
+Give every path the **same review prompt**, instructing the reviewer to discover
+its inputs on its own and review based **only** on them:
+
+- The code changes — `gh pr diff <number>` (or `git diff <baseRef>...HEAD`).
+- The PR's claims — `gh pr view <number> --json title,body`.
+
+Ask for concrete, file/line-anchored findings on correctness, security, clarity,
+and consistency — not praise. The codex/copilot CLIs run in the checked-out repo
+cwd, so they already have the diff locally; tell the Claude subagent the PR
+number and repo so it can fetch both itself.
+
+**Post the generated review as a PR comment**, with a short header naming the
+tool that produced it:
+
+```bash
+tmp=$(mktemp)
+printf '## Automated review (%s)\n\n%s\n' "<tool>" "<review-text>" >| "$tmp"
+gh pr comment <number> --body-file "$tmp"
+rm -f "$tmp"
+```
+
+**Hold the generated review text in this session** and carry it forward into
+Step 5. Step 4 skips comments authored by the current `gh` user, and the review
+you just posted *is* authored by that user — so it will not be re-fetched and
+must be passed forward explicitly. Record which tool produced it for the report.
+
+### 4. Fetch review comments
 
 Retrieve both review-level summaries and inline review comments:
 
@@ -55,9 +197,9 @@ gh api "repos/{owner}/{repo}/issues/<number>/comments" --paginate
 
 For each inline comment capture: author, file path, line, the diff hunk, the comment body, the comment id, whether it is part of a resolved thread, and any in_reply_to chain. Group replies into threads.
 
-Skip comments authored by the current user (`gh api user`) and skip threads that are already marked resolved/outdated unless the user asks otherwise.
+Skip comments authored by the current user (`gh api user`) and skip threads that are already marked resolved/outdated unless the user asks otherwise. **Exception:** if Step 3 generated a review, treat its findings as input here even though that comment is authored by the current user.
 
-### 4. Evaluate each comment
+### 5. Evaluate each comment
 
 For every unresolved comment thread, read the referenced file at the cited lines to see the current code (it may have changed since the comment was written). Then judge the comment on:
 
@@ -68,7 +210,9 @@ For every unresolved comment thread, read the referenced file at the cited lines
 
 Classify each thread as one of: `fix`, `reject` (with reason), `already-addressed`, `out-of-scope`, or `needs-user-input` (ambiguous / requires a judgment call the user should make).
 
-### 5. Apply the fixes
+A review generated in Step 3 arrives as a single prose body rather than threaded inline comments. Split it into discrete findings and evaluate each one against the same criteria.
+
+### 6. Apply the fixes
 
 For each thread classified `fix`, make the change. Group related fixes into coherent edits rather than touching the same file repeatedly. After edits:
 
@@ -76,7 +220,7 @@ For each thread classified `fix`, make the change. Group related fixes into cohe
 - If a fix breaks tests, investigate the root cause before moving on
 - Do not expand scope beyond what the comment asked for
 
-### 6. Commit and push the fixes
+### 7. Commit and push the fixes
 
 If any fixes were applied, commit them to the PR branch and push:
 
@@ -86,10 +230,11 @@ If any fixes were applied, commit them to the PR branch and push:
 
 Do **not** reply to or resolve the review comments on GitHub automatically — leave that to the user unless they explicitly ask.
 
-### 7. Report
+### 8. Report
 
 Print a concise report covering:
 
+- The review source: existing Copilot review, a Copilot review that was watched for, or a review generated by `<tool>` (codex / copilot CLI / Claude subagent)
 - The PR (number, title, url) and the branch checked out
 - A table or list of every comment thread evaluated, with: author, location (`file:line`), classification, and a one-line rationale
 - For `fix` items, what was changed (file paths + brief description)

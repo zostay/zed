@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.0 — 2026-06-09
+
+### Added
+
+- `pr-review-fix` now establishes a review *before* it starts fixing, instead of
+  assuming one already exists. It inventories the PR's reviews, inline comments,
+  top-level comments, and timeline, then sources feedback in priority order:
+  - **Use existing feedback** when any actionable feedback is already present — a
+    Copilot review or inline comments, unresolved human review comments, or a
+    top-level comment from anyone other than the current user.
+  - **Watch for a pending Copilot review** — detected from the PR **timeline**
+    (`copilot_work_started` / a `review_requested` naming Copilot), not from
+    `reviewRequests` (which GitHub clears the moment the bot starts working, so an
+    in-flight review would otherwise read as "no Copilot"). Poll for a Copilot
+    review summary *or* inline comments (~30s between checks, bounded to ~15
+    minutes by a wall-clock deadline, each network call wrapped in `gtimeout` when
+    available) and use the review when it lands. On timeout the skill asks the
+    user whether to wait longer, generate a review, or proceed without one — it
+    never loops indefinitely.
+  - **Generate a review as a last resort** — only when no Copilot review is
+    requested/pending/present and no other feedback exists. The review runs from
+    a fresh context based solely on the code changes and the PR description (which
+    the reviewer discovers itself), preferring an independent model: the **codex**
+    CLI, then the **copilot** CLI, then a **Claude Code subagent**. The result is
+    posted as a PR comment and carried forward into the fix phase.
+
+### Changed
+
+- `pr-review-fix`: a generated review is evaluated as discrete findings split out
+  of its prose body, and the report now names the review source. The
+  skip-self-authored-comments rule gains an exception so the freshly generated
+  review (authored by the current `gh` user) is still acted upon.
+
 ## 0.4.1 — 2026-06-08
 
 ### Fixed

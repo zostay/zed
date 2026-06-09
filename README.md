@@ -183,10 +183,13 @@ investigates the first PR with failing checks and attempts a trivial fix.
 
 ### `pr-review-fix`
 
-Check out a pull request (the current branch's PR or a named one), read its
-GitHub review comments, evaluate each for validity against the current code,
-apply the fixes that are warranted, commit and push them to the PR branch,
-and report on what was done.
+Check out a pull request (the current branch's PR or a named one) and make sure
+it has a review to act on first: use existing feedback if any exists, wait for a
+pending Copilot review to land, or — only as a last resort — generate one (via
+the codex CLI, the copilot CLI, or a Claude Code subagent, in that order) and
+post it as a PR comment. Then read the review comments, evaluate each for
+validity against the current code, apply the fixes that are warranted, commit and
+push them to the PR branch, and report on what was done.
 
 ```
 /zed:pr-review-fix
