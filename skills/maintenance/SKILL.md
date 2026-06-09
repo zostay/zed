@@ -66,17 +66,17 @@ evaluated. Prepend this bootstrap to **every** Bash command that runs a helper
 script (it is harmless when `PATH` is already fine — it only prepends):
 
 ```bash
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"
 ```
 
 So each invocation looks like:
 
 ```bash
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" ...
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" ...
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-discover.sh" <tag>
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" ...
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" ...
+export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" ...
+export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" ...
+export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-discover.sh" <tag>
+export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" ...
+export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" ...
 ```
 
 Each Bash tool call is a fresh shell, so the export does not persist between
@@ -277,7 +277,7 @@ subagent does the project work and logs its own progress events.
    subagent runs in the same kind of stripped subshell and must apply it too,
    see **Bootstrap `PATH`** above):
    ```bash
-   export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; "<DB_SCRIPT>" log --run <RUN_ID> --job <JOB_ID> --level info --message "<what it's doing>"
+   export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "<DB_SCRIPT>" log --run <RUN_ID> --job <JOB_ID> --level info --message "<what it's doing>"
    ```
    (using `--level warn`/`error`/`success` as appropriate) so the live view
    updates while it works. Tell the subagent to prepend that same `PATH` export

@@ -12,7 +12,7 @@
   (e.g. an empty `JOB_ID`). The previous "invoke by path" mitigation did not
   address this (the failure is `env` resolving the *interpreter*, not the kernel
   resolving the *script*). The SKILL.md now prescribes prepending a `PATH`
-  bootstrap (`export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"`) to every
+  bootstrap (`export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"`) to every
   helper-script call and passing the same instruction into each dispatched
   subagent. `dependabot-prs.sh` and `dependabot-alerts.sh` gained the same
   in-body `PATH` append the `maintenance-*` scripts already had
