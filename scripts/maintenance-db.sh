@@ -101,6 +101,20 @@ read_file() {
   cat -- "$path"
 }
 
+# Warn (to stderr, non-fatally) when a summary that is supposed to record what
+# happened is blank or whitespace-only. A blank summary almost always means the
+# caller's redirect silently produced nothing — e.g. `printf ... > "$(mktemp)"`
+# under zsh `noclobber`, where `>` refuses to overwrite the file mktemp already
+# created. Surfacing it here makes that bug obvious instead of recording an
+# empty summary and reporting success. Non-fatal: the row is still written, but
+# the operator sees the warning.
+warn_if_blank_summary() {
+  local label="$1" text="$2"
+  if [ -z "${text//[$' \t\r\n']/}" ]; then
+    printf 'Warning: %s summary is empty or whitespace-only; recording it anyway.\n' "$label" >&2
+  fi
+}
+
 # Run sqlite3 against the database with busy_timeout, feeding the SQL on stdin.
 # Usage: db_exec <<SQL ... SQL   (the caller supplies the statements)
 # The busy_timeout PRAGMA emits its numeric result, so it is run with output
@@ -284,6 +298,7 @@ cmd_finish_job() {
     summary="$(read_file "$summary_file")"
     have_summary=1
   fi
+  [ "$have_summary" -eq 1 ] && warn_if_blank_summary "job #$job" "$summary"
 
   local now sets
   now="$(mtnc_now)"
@@ -348,6 +363,7 @@ cmd_finish_run() {
     summary="$(read_file "$summary_file")"
     have_summary=1
   fi
+  [ "$have_summary" -eq 1 ] && warn_if_blank_summary "run #$run" "$summary"
 
   local now sets
   now="$(mtnc_now)"

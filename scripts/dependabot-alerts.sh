@@ -6,6 +6,12 @@
 
 set -euo pipefail
 
+# Guarantee the standard tool directories are reachable even when this script is
+# launched from a stripped-down environment (e.g. a sandboxed subshell whose PATH
+# omits Homebrew). A minimal PATH can hide gh/jq and stall the sweep. Append so
+# any ordering the caller set still wins.
+export PATH="${PATH:+$PATH:}/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
+
 # Check that gh CLI is available
 if ! command -v gh &>/dev/null; then
   echo "Error: gh CLI is not installed or not in PATH." >&2

@@ -48,20 +48,44 @@ All scripts resolve their data directory the same way (via
 `scripts/maintenance-common.sh`) and write to a single SQLite database, so the
 web app and the orchestrator always agree on state.
 
-Invoke each script **directly by its path** (it is executable and carries a
-`#!/usr/bin/env bash` shebang) — do **not** prefix the call with `bash`. A bare
-`bash` token has to be resolved against the caller's `PATH`, which in a stripped
-subshell may omit Homebrew's `bash` and fail with `command not found: bash`,
-stalling the sweep. Direct execution lets the kernel pick the interpreter and
-the scripts self-heal `PATH` for their own helpers. Invoke them as:
+#### Bootstrap `PATH` before every script call (do not skip this)
+
+The scripts carry a `#!/usr/bin/env bash` shebang. When you run one, the kernel
+launches `/usr/bin/env`, which then resolves `bash` **from `PATH`**. In a
+sandboxed subshell whose `PATH` omits Homebrew (`/opt/homebrew/bin`), `env`
+cannot find `bash` and the script dies before its first line with
+`env: bash: No such file or directory` (exit 127) — so the script's own
+internal `PATH` self-heal never gets to run, and a captured command
+substitution (e.g. `JOB_ID=$(... add-job ...)`) silently yields an **empty
+string** with the error buried on stderr. Invoking the script "by its path"
+does **not** avoid this: the failure is `env` resolving the *interpreter*, not
+the kernel resolving the *script*.
+
+The fix is to ensure a usable `PATH` **in the caller** before the shebang is
+evaluated. Prepend this bootstrap to **every** Bash command that runs a helper
+script (it is harmless when `PATH` is already fine — it only prepends):
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" ...
-"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" ...
-"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-discover.sh" <tag>
-"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" ...
-"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" ...
+export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"
 ```
+
+So each invocation looks like:
+
+```bash
+export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" ...
+export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" ...
+export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-discover.sh" <tag>
+export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" ...
+export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" ...
+```
+
+Each Bash tool call is a fresh shell, so the export does not persist between
+calls — include it in every one. Still invoke scripts **by their path** (do not
+prefix with a bare `bash`, which has the same unresolved-`bash` problem). When
+you dispatch a subagent (Step 5), **include this same `PATH` bootstrap
+instruction in its prompt** so its own script and tool calls do not hit the
+identical failure. The examples below omit the prefix for brevity — apply it
+regardless.
 
 Resolve the absolute path to the DB script once and keep it; you will hand it to
 each subagent so it can log its own progress:
@@ -249,18 +273,25 @@ subagent does the project work and logs its own progress events.
      `${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh`),
    - the `run_id` (`$RUN_ID`).
 
-   Instruct the subagent to log progress with:
+   Instruct the subagent to log progress with (note the `PATH` bootstrap — the
+   subagent runs in the same kind of stripped subshell and must apply it too,
+   see **Bootstrap `PATH`** above):
    ```bash
-   "<DB_SCRIPT>" log --run <RUN_ID> --job <JOB_ID> --level info --message "<what it's doing>"
+   export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "<DB_SCRIPT>" log --run <RUN_ID> --job <JOB_ID> --level info --message "<what it's doing>"
    ```
    (using `--level warn`/`error`/`success` as appropriate) so the live view
-   updates while it works. The subagent should NOT touch the run row or call
+   updates while it works. Tell the subagent to prepend that same `PATH` export
+   to **all** of its Bash commands (its project's `maintenance-<tag>` work runs
+   helper scripts too). The subagent should NOT touch the run row or call
    `finish-run`; the orchestrator owns those.
 4. After the subagent returns, write its summary to a temp file and finish the
    job with the right status (`success`, `followup`, `failure`, or `skipped`):
    ```bash
    SUMMARY_TMP=$(mktemp)
-   printf '%s\n' "<subagent's Markdown summary>" > "$SUMMARY_TMP"
+   # Use `>|` (force-clobber), not `>`: `mktemp` pre-creates the file, and under
+   # zsh `noclobber` a plain `>` refuses to overwrite an existing file and writes
+   # nothing — silently recording an empty summary. `>|` overwrites regardless.
+   printf '%s\n' "<subagent's Markdown summary>" >| "$SUMMARY_TMP"
    "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
      finish-job --job "$JOB_ID" --status success --summary-file "$SUMMARY_TMP"
    rm -f "$SUMMARY_TMP"
@@ -362,7 +393,9 @@ implicitly. **Choose the run status from whether any followup tickets are open:*
 
 ```bash
 RUN_SUMMARY_TMP=$(mktemp)
-# ... write the Markdown roll-up to "$RUN_SUMMARY_TMP" ...
+# Write the Markdown roll-up to "$RUN_SUMMARY_TMP" using `>|` (force-clobber),
+# e.g.  printf '%s\n' "$ROLLUP" >| "$RUN_SUMMARY_TMP"  — never a plain `>`, which
+# `mktemp` + zsh `noclobber` turns into a silent no-op (empty summary).
 # If you opened any followup tickets this run, use needs_followup; else completed.
 RUN_STATUS=completed
 if [ -n "$("${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" list-followups --run "$RUN_ID" --status open)" ]; then
