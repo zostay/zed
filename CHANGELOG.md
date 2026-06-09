@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.4.1 — 2026-06-08
+
+### Fixed
+
+- `maintenance`: corrected the `PATH`/shebang guidance that broke a sweep
+  outright. The helper scripts carry a `#!/usr/bin/env bash` shebang, so in a
+  sandboxed subshell whose `PATH` omits Homebrew, `env` cannot resolve `bash`
+  and the script dies with `env: bash: No such file or directory` **before** its
+  own in-body `PATH` self-heal can run — silently yielding empty captured output
+  (e.g. an empty `JOB_ID`). The previous "invoke by path" mitigation did not
+  address this (the failure is `env` resolving the *interpreter*, not the kernel
+  resolving the *script*). The SKILL.md now prescribes prepending a `PATH`
+  bootstrap (`export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"`) to every
+  helper-script call and passing the same instruction into each dispatched
+  subagent. `dependabot-prs.sh` and `dependabot-alerts.sh` gained the same
+  in-body `PATH` append the `maintenance-*` scripts already had
+- `maintenance`: the SKILL.md summary-file examples now use `>|` (force-clobber)
+  instead of `>`. `mktemp` pre-creates the file, so under zsh `noclobber` a plain
+  `>` refused to overwrite it and silently wrote an **empty** summary
+- `maintenance-db.sh`: `finish-job` and `finish-run` now warn to stderr when a
+  `--summary-file` is empty or whitespace-only (recording it anyway), surfacing
+  the noclobber-empty-summary bug above immediately instead of after the fact
+- `dependabot-sweep`: `checks_pass` no longer reports false negatives on skipped
+  jobs. The check evaluation in `dependabot-prs.sh` previously required every
+  check to be `status == "COMPLETED"` with conclusion `SUCCESS`/`NEUTRAL`, so an
+  intentionally **skipped** job (e.g. an `if:`-gated "Build Summary") made a
+  genuinely-ready PR look blocked — and a passing `StatusContext` (which has no
+  `status` field) was misread the same way. It now passes only when every check
+  concluded acceptably (`SUCCESS`/`NEUTRAL`/`SKIPPED`), normalizing across
+  CheckRun (`.conclusion`) and StatusContext (`.state`) nodes; a real failure or
+  a not-yet-finished check still keeps the PR out of "ready"
+- `maintenance-discover.sh`: discovery now dedupes by git `origin` remote. When
+  two local checkouts map to the same remote, only the first (in priority/path
+  order) is emitted and a warning is printed for the other, so the sweep no
+  longer runs two redundant, racing passes against the same GitHub repo.
+  Projects with no remote are unaffected
+
 ## 0.4.0 — 2026-06-08
 
 ### Added

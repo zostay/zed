@@ -7,10 +7,20 @@
 #   number, title, branch, mergeable, checks_pass, review_decision, url
 #
 # checks_pass is true/false when status check info is available, or null when
-# the token lacks checks:read permission (statusCheckRollup inaccessible).
+# the token lacks checks:read permission (statusCheckRollup inaccessible). It is
+# true only when every check concluded acceptably (SUCCESS/NEUTRAL/SKIPPED), so
+# intentionally skipped/neutral checks (e.g. a "Build Summary" job gated by `if:`)
+# do NOT make a genuinely-ready PR look blocked; it is false when a check actually
+# failed or has not finished yet.
 #
 
 set -euo pipefail
+
+# Guarantee the standard tool directories are reachable even when this script is
+# launched from a stripped-down environment (e.g. a sandboxed subshell whose PATH
+# omits Homebrew). A minimal PATH can hide gh/jq and stall the sweep. Append so
+# any ordering the caller set still wins.
+export PATH="${PATH:+$PATH:}/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
 
 # Check that gh CLI is available
 if ! command -v gh &>/dev/null; then
@@ -63,7 +73,19 @@ if [ "$has_checks" = true ]; then
       if (.statusCheckRollup | length) == 0 then
         true
       else
-        [.statusCheckRollup[] | .status == "COMPLETED" and (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL")] | all
+        # True only when every check has concluded acceptably: SUCCESS, NEUTRAL,
+        # or intentionally SKIPPED. Skipped/neutral are intentional no-ops and must
+        # NOT count as failures (the old `status=="COMPLETED" and conclusion in
+        # {SUCCESS,NEUTRAL}` test made an `if:`-gated "Build Summary" job mark a
+        # genuinely-ready PR as blocked). A real failure (FAILURE/TIMED_OUT/…) or a
+        # check that has not finished yet keeps the PR out of "ready" — pending is
+        # re-evaluated on the next fetch rather than merged early. statusCheckRollup
+        # mixes CheckRun nodes (.conclusion) and StatusContext nodes (.state);
+        # normalize across both.
+        [ .statusCheckRollup[]
+          | ((.conclusion // .state) // "") | ascii_upcase
+          | . == "SUCCESS" or . == "NEUTRAL" or . == "SKIPPED"
+        ] | all
       end
     ),
     review_decision: .reviewDecision,

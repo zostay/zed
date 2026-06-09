@@ -14,6 +14,11 @@
 # to be skipped if its absolute path equals an entry, is inside a blocklisted dir, or
 # its basename matches an entry.
 #
+# Results are also deduped by git `origin` remote: when two local checkouts map to
+# the same remote, only the first (in priority/path order) is emitted and a warning
+# is printed to stderr for the other, so the sweep does not run two redundant,
+# racing passes against the same GitHub repo. Projects with no remote are unaffected.
+#
 # Each discovered skill may declare an integer `priority:` in its YAML front
 # matter to control execution order: lower runs earlier, higher runs later, and
 # the default (no field, or an unparseable value) is 0. Ties break by
@@ -150,10 +155,33 @@ read_requires_authorization() {
   esac
 }
 
+# Normalize a project's `origin` git remote URL to a canonical
+# "host/owner/repo" key, so two local checkouts of the *same* GitHub repo
+# collapse to one regardless of remote form — SSH (`git@github.com:o/r.git`),
+# `ssh://git@github.com/o/r`, or `https://github.com/o/r`. Lowercases and strips
+# the scheme, any credentials, a trailing `.git`, and a trailing slash. Echoes
+# nothing when the path has no git remote (or git is unavailable), so such
+# projects never dedupe against each other.
+normalize_remote() {
+  local path="$1" url
+  url="$(git -C "$path" remote get-url origin 2>/dev/null || true)"
+  [ -n "$url" ] || return 0
+  url="${url%.git}"
+  url="${url%/}"
+  case "$url" in
+    *://*) url="${url#*://}"; url="${url#*@}" ;;                  # https:// or ssh:// (drop scheme + user@)
+    *@*:*) url="${url#*@}";   url="${url%%:*}/${url#*:}" ;;       # git@host:owner/repo -> host/owner/repo
+  esac
+  printf '%s' "$url" | tr '[:upper:]' '[:lower:]'
+}
+
 # Collect discovered project paths keyed to their skill path.
 # We store "project_path<TAB>skill_path" lines, then dedupe by project_path.
 results_file="$(mktemp)"
-trap 'rm -f "$results_file"' EXIT
+# Tracks "<normalized_remote><TAB><project_path>" for the first checkout seen of
+# each remote, so later checkouts of the same remote can be deduped (Problem 5).
+seen_remotes="$(mktemp)"
+trap 'rm -f "$results_file" "$seen_remotes"' EXIT
 
 # For each configured root, search for matching SKILL.md files in both layouts.
 while IFS= read -r root; do
@@ -201,6 +229,20 @@ output="$(
   done | sort -t$'\t' -k1,1n -k2,2 | \
   while IFS=$'\t' read -r priority project skill_md; do
     [ -n "$project" ] || continue
+    # Dedupe by git remote: if an earlier-emitted checkout already maps to this
+    # project's `origin` remote, skip this one and warn (it would otherwise run a
+    # redundant, racing sweep against the same GitHub repo). Projects without a
+    # remote are never deduped. The first checkout in (priority, path) order wins.
+    remote="$(normalize_remote "$project")"
+    if [ -n "$remote" ]; then
+      prior="$(awk -F'\t' -v r="$remote" '$1==r{print $2; exit}' "$seen_remotes")"
+      if [ -n "$prior" ]; then
+        printf 'Warning: %s shares git remote (%s) with already-selected %s; skipping duplicate checkout.\n' \
+          "$project" "$remote" "$prior" >&2
+        continue
+      fi
+      printf '%s\t%s\n' "$remote" "$project" >>"$seen_remotes"
+    fi
     name="$(basename "$project")"
     jq -nc \
       --arg pp "$project" \

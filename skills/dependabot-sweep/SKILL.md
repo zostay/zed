@@ -45,7 +45,7 @@ Parse the JSONL output. Each line is a JSON object with these fields:
 - `title` — PR title
 - `branch` — head branch name
 - `mergeable` — merge state: `MERGEABLE`, `CONFLICTING`, or `UNKNOWN`
-- `checks_pass` — boolean or null; true if all status checks succeeded, false if any failed, null if check info is unavailable (token lacks `checks:read` permission)
+- `checks_pass` — boolean or null; `true` only when every check concluded acceptably — `SUCCESS`, `NEUTRAL`, or intentionally `SKIPPED` (so an `if:`-gated job like "Build Summary" no longer makes a genuinely-ready PR look blocked); `false` when a check actually **failed** or has not finished yet; `null` if check info is unavailable (token lacks `checks:read` permission)
 - `review_decision` — review decision (may be empty if no reviews required)
 - `url` — PR URL
 
