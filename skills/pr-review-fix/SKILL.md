@@ -44,63 +44,96 @@ ourselves as a last resort**.
 
 #### 3a. Inventory the current review state
 
-Gather pending reviewer requests alongside the existing reviews and comments:
+Gather every feedback surface, plus the PR **timeline** — the timeline is the
+reliable signal for a Copilot review that is *requested or in progress*:
 
 ```bash
-# Pending reviewer requests — is Copilot tagged but not yet posted?
-gh pr view <number> --json reviewRequests,reviews
+me=$(gh api user --jq .login)
 
-# Inline review comments + top-level issue comments
+# Reviews, inline review comments, and top-level issue comments
+gh pr view <number> --json reviews
 gh api "repos/{owner}/{repo}/pulls/<number>/comments" --paginate
 gh api "repos/{owner}/{repo}/issues/<number>/comments" --paginate
+
+# Timeline — needed to detect an in-flight Copilot review (see below)
+gh api "repos/{owner}/{repo}/issues/<number>/timeline" --paginate
 ```
 
-Match Copilot case-insensitively on the reviewer/author login against `copilot`
-(the login is typically `copilot-pull-request-reviewer[bot]`):
+Match Copilot case-insensitively with `test("copilot")` on **every** surface —
+its login differs per surface: `Copilot` in the timeline `review_requested` /
+`reviewed` events, but `copilot-pull-request-reviewer` as a review or comment
+author.
+
+**Has Copilot already posted?** Check both a review summary *and* inline review
+comments — Copilot often posts inline comments only:
 
 ```bash
-# Has Copilot already posted a review?
 gh pr view <number> --json reviews \
   --jq '[.reviews[] | select(.author.login | ascii_downcase | test("copilot"))] | length'
-# Is Copilot a still-pending requested reviewer?
-gh pr view <number> --json reviewRequests \
-  --jq '[.reviewRequests[] | select((.login // .name // "") | ascii_downcase | test("copilot"))] | length'
+gh api "repos/{owner}/{repo}/pulls/<number>/comments" \
+  --jq '[.[] | select(.user.login | ascii_downcase | test("copilot"))] | length'
 ```
 
-From this, determine two things:
+**Is a Copilot review requested or in progress but not yet posted?** Do **not**
+rely on `reviewRequests` from `gh pr view`: GitHub drops a bot reviewer from that
+list the moment it *starts* working, so an actively-running Copilot review shows
+an **empty** `reviewRequests` (this is the trap that makes naive detection report
+"no Copilot" and wrongly fall through to generating a review). Read the timeline
+instead — a `copilot_work_started` event, or a `review_requested` event naming
+Copilot, means a Copilot review is on its way:
 
-- **Does any actionable review feedback already exist?** — a review or review
-  comments from Copilot, or unresolved review comments from any human reviewer
-  (i.e. not authored by the current `gh` user).
-- **Is Copilot requested but pending?** — Copilot appears in `reviewRequests`
-  but has not yet posted a review or comments.
+```bash
+gh api "repos/{owner}/{repo}/issues/<number>/timeline" --paginate --jq '
+  [ .[]
+    | select(
+        .event == "copilot_work_started"
+        or (.event == "review_requested"
+            and ((.requested_reviewer.login // "") | ascii_downcase | test("copilot")))
+      )
+  ] | length'
+```
+
+From this, determine:
+
+- **Does any actionable feedback already exist?** — a Copilot review or Copilot
+  inline comments; unresolved inline review comments from any human; **or any
+  top-level issue comment from someone other than the current user** (`$me`).
+  Steps 4–5 act on all three, so all three count as existing feedback here.
+- **Is a Copilot review pending?** — the timeline shows it requested/in-progress
+  (above) **and** Copilot has not yet posted a review or inline comments.
 
 #### 3b. Decide how to source the review
 
 - **Actionable feedback already exists** → proceed straight to Step 4 and use it.
-- **Copilot is requested but pending** → **watch** for it (3b-watch below).
-- **No Copilot requested/pending/present and no other feedback** → **generate a
-  review ourselves** (3c). Do **not** request Copilot in this case — go straight
-  to generating one.
+- **A Copilot review is pending** (requested/in-progress, nothing posted yet) →
+  **watch** for it (3b-watch below).
+- **No Copilot pending/present and no other feedback** → **generate a review
+  ourselves** (3c). Do **not** request Copilot in this case.
 
-**3b-watch — wait for a pending Copilot review.** Poll for a Copilot review or
-Copilot review comments, sleeping ~30s between checks, bounded to ~15 minutes
-total. Wrap each network call in `gtimeout` when it is installed so no single
-call hangs, and fall back to bare `gh` when `gtimeout` is absent (do **not** let
-a missing `gtimeout` crash the skill):
+**3b-watch — wait for a pending Copilot review.** Poll until Copilot posts
+**either a review summary or inline review comments** (checking reviews alone
+misses an inline-only review). Sleep ~30s between checks, bounded to ~15 minutes
+of wall-clock total. Track the elapsed time in the loop itself so the bound holds
+even if a single call hangs, and wrap each network call in `gtimeout` when
+available as an extra guard — falling back to bare `gh` when it is absent (never
+let a missing `gtimeout` crash the skill):
 
 ```bash
-if command -v gtimeout >/dev/null 2>&1; then
-  gtimeout 30 gh pr view <number> --json reviews --jq '...copilot filter...'
-else
-  gh pr view <number> --json reviews --jq '...copilot filter...'
-fi
+deadline=$(( $(date +%s) + 15*60 ))
+run() { if command -v gtimeout >/dev/null 2>&1; then gtimeout 30 "$@"; else "$@"; fi; }
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  reviews=$(run gh pr view <number> --json reviews \
+    --jq '[.reviews[] | select(.author.login | ascii_downcase | test("copilot"))] | length')
+  inline=$(run gh api "repos/{owner}/{repo}/pulls/<number>/comments" \
+    --jq '[.[] | select(.user.login | ascii_downcase | test("copilot"))] | length')
+  if [ "${reviews:-0}" -gt 0 ] || [ "${inline:-0}" -gt 0 ]; then break; fi
+  sleep 30
+done
 ```
 
-Stop polling the moment Copilot posts, then proceed to Step 4. If the ~15-minute
-bound elapses with nothing from Copilot, **ask the user** how to proceed —
-options: wait longer, generate a review now (3c), or proceed without one. Do
-**not** loop indefinitely.
+Stop the moment Copilot posts, then proceed to Step 4. If the ~15-minute bound
+elapses with nothing from Copilot, **ask the user** how to proceed — wait longer,
+generate a review now (3c), or proceed without one. Do **not** loop indefinitely.
 
 #### 3c. Generate a fallback review
 
