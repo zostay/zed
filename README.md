@@ -93,22 +93,25 @@ redeploys centrally-shared apps (runs last).
 
 **Authorization.** A project that does something privileged (e.g. a production
 deployment) sets `requiresAuthorization: true` in its `maintenance-<tag>` front
-matter so it never runs unattended without an explicit, out-of-band grant. Ahead
-of the sweep you authorize it deliberately:
+matter. When the sweep reaches the execute stage it asks you **once**, up front,
+to confirm those projects (default: authorize all) and then creates the grants
+for you — so a typed `/zed:maintenance weekly` needs just one answer and the
+deploys run. Decline a project and it is skipped. For **unattended** runs (a
+scheduled sweep with no one to ask), authorize ahead of time instead:
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" \
-  grant --tag weekly --project qubling.cloud --ttl 2h     # one-time, expires in 2h
+  grant --tag weekly --project qubling.cloud --repeat --ttl 8h   # reusable until it expires
 ```
 
 The orchestrator checks for a valid grant before dispatching such a project (no
-grant → skipped and reported with the command to authorize it; valid grant →
-runs, then the grant is consumed). A `PreToolUse` hook
-(`hooks/maintenance-authz.sh`) is defense-in-depth: it returns an `allow`
-decision for a granted project so the privileged command runs without a prompt
-even in an auto-accept/`dontAsk` session, and stays silent (never denies)
-otherwise. Manage grants with `maintenance-authorize.sh list` / `revoke` /
-`consume`. Grants live under `<data-dir>/grants/`.
+grant → skipped; valid grant → runs, then the grant is consumed if it is one-time
+— a `--repeat` grant persists until it expires). A
+`PreToolUse` hook (`hooks/maintenance-authz.sh`) returns an `allow` decision for a
+granted project so the privileged command runs without the auto-accept classifier
+prompting or denying it, and stays silent (never denies) otherwise. Manage grants
+with `maintenance-authorize.sh list` / `revoke` / `consume`. Grants live under
+`<data-dir>/grants/`.
 
 **Followups.** A sweep often leaves work that needs a human (a manual deploy
 step, a decision, something to verify). Those are not buried in prose — a project
