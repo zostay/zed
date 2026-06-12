@@ -105,7 +105,8 @@ scheduled sweep with no one to ask), authorize ahead of time instead:
 ```
 
 The orchestrator checks for a valid grant before dispatching such a project (no
-grant → skipped; valid grant → runs, then a one-time grant is consumed). A
+grant → skipped; valid grant → runs, then the grant is consumed if it is one-time
+— a `--repeat` grant persists until it expires). A
 `PreToolUse` hook (`hooks/maintenance-authz.sh`) returns an `allow` decision for a
 granted project so the privileged command runs without the auto-accept classifier
 prompting or denying it, and stays silent (never denies) otherwise. Manage grants

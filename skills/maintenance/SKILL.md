@@ -274,11 +274,12 @@ subagent does the project work and logs its own progress events.
    - If **no valid grant** (`AUTHORIZED=0`): the user declined this project at the
      up-front prompt (or this is an unattended run with no pre-created grant). Do
      **not** dispatch. Finish the job `--status skipped` and log a `warn` event
-     noting it was not authorized for this run:
+     that names the grant condition (so an unattended skip is diagnosable without
+     re-reading the docs):
      ```bash
      "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
        log --run "$RUN_ID" --job "$JOB_ID" --level warn \
-       --message "Skipped: not authorized for this run."
+       --message "Skipped: requires authorization but no valid grant for this run (declined at the prompt, or an unattended run with no pre-created grant)."
      ```
      Then move on to the next job. (This gate runs in the orchestrator session, so
      it holds regardless of whether the PreToolUse hook fires inside subagents.)
