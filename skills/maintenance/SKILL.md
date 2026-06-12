@@ -223,15 +223,46 @@ Then report that to the user (with the monitor URL if it was started) and stop.
 "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" set-stage --run "$RUN_ID" --stage executing
 ```
 
+**Before the per-job loop — authorize privileged projects once, up front.**
+Collect every discovered job whose `requires_authorization` is `true`. If there
+are none, skip straight to the loop. Otherwise this is the **only** authorization
+step the user does — answer it once right after starting the sweep, then
+everything (privileged deploys included) runs to completion without further
+prompting:
+
+- **Interactive session (you can ask the user a question):** ask **once**, with a
+  single AskUserQuestion that lists those projects and confirms authorizing them
+  for *this run*. Default/recommended is **authorize all** — everything in a
+  `maintenance-<tag>` is there on purpose — while letting the user deselect any to
+  hold back. For each project the user confirms, create the grant yourself:
+  ```bash
+  "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" \
+    grant --tag "<tag>" --project "<project_name>"
+  ```
+  This is exactly the grant the user used to have to create by hand before the
+  sweep; creating it here, after one confirmation, is the whole point. The default
+  TTL comfortably covers a sweep, and the grant is one-time — consumed when the
+  job succeeds (sub-step 6). Projects the user declines get no grant and are
+  skipped by the gate below.
+
+- **Unattended session (a scheduled/cron run with no human to ask):** do **not**
+  prompt. Rely on grants created ahead of time — e.g. a `--repeat` grant for a
+  recurring scheduled sweep:
+  ```bash
+  "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" \
+    grant --tag "<tag>" --project "<project_name>" --repeat --ttl 8h
+  ```
+  A privileged project without a grant is skipped and reported (see the gate).
+
 For each job, you (the orchestrator) own the job lifecycle in the DB, and the
 subagent does the project work and logs its own progress events.
 
 **Per job, the orchestrator:**
 
 1. **Authorization gate (only if the job's `requires_authorization` is `true`).**
-   These projects do something privileged (e.g. a production deployment) and must
-   **not** run unattended without an explicit, out-of-band grant. Before dispatch,
-   check for a valid grant for this project:
+   The up-front authorization step (before this loop) has already created a grant
+   for each privileged project the user confirmed; this gate enforces it. Before
+   dispatch, check for a valid grant for this project:
    ```bash
    if "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" \
         check --tag "<tag>" --project "<project_name>" >/dev/null 2>&1; then
@@ -240,14 +271,14 @@ subagent does the project work and logs its own progress events.
      AUTHORIZED=0
    fi
    ```
-   - If **no valid grant** (`AUTHORIZED=0`): do **not** dispatch. Finish the job
-     `--status skipped`, log a `warn` event explaining it is awaiting
-     authorization, and record in your action log the exact command the user can
-     run to authorize it before re-running the sweep:
+   - If **no valid grant** (`AUTHORIZED=0`): the user declined this project at the
+     up-front prompt (or this is an unattended run with no pre-created grant). Do
+     **not** dispatch. Finish the job `--status skipped` and log a `warn` event
+     noting it was not authorized for this run:
      ```bash
      "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
        log --run "$RUN_ID" --job "$JOB_ID" --level warn \
-       --message "Skipped: requires authorization. Grant with: maintenance-authorize.sh grant --tag <tag> --project <project_name> [--ttl 2h], then re-run."
+       --message "Skipped: not authorized for this run."
      ```
      Then move on to the next job. (This gate runs in the orchestrator session, so
      it holds regardless of whether the PreToolUse hook fires inside subagents.)
@@ -475,9 +506,9 @@ paths honor it:
 
 Some maintenance is privileged — a production deployment, say — and must **not**
 run unattended (or in an auto-accept / `dontAsk` session) just because the sweep
-reached it. A project opts into a deliberate, out-of-band authorization gate by
-declaring `requiresAuthorization: true` in the front matter of its own
-`maintenance-<tag>` skill:
+reached it — it should take a deliberate "yes". A project opts into that
+authorization gate by declaring `requiresAuthorization: true` in the front matter
+of its own `maintenance-<tag>` skill:
 
 ```yaml
 ---
@@ -490,31 +521,34 @@ requiresAuthorization: true
 
 The control flow:
 
-1. **You authorize, ahead of the sweep**, with an explicit command — a
-   deliberate act, separate from running the sweep:
+1. **The sweep asks you once, up front, and grants for you.** When the run reaches
+   the Execute stage the orchestrator collects the privileged projects and — in an
+   interactive session — asks a single question listing them (default: authorize
+   all). For each one you confirm it creates the grant itself (Step 5, before the
+   per-job loop). You do **not** pre-run anything: answer the one prompt and the
+   sweep carries the deploys through; decline a project and it is simply skipped.
+2. **Unattended runs use a pre-created grant.** A scheduled/cron sweep has no one
+   to ask, so authorize ahead of time with an explicit command — a `--repeat`
+   grant is handy for a recurring schedule:
    ```bash
    "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" \
-     grant --tag weekly --project qubling.cloud --ttl 2h
+     grant --tag weekly --project qubling.cloud --repeat --ttl 8h
    ```
-   This writes a time-boxed, one-time grant under `<data-dir>/grants/`. Use
-   `--repeat` for a grant reusable until it expires, `list`/`revoke` to inspect
-   and rescind, and `consume` to spend a one-time grant.
-2. **The orchestrator checks the grant before it dispatches** a
-   `requires_authorization` project — the authorization gate is the **first
-   per-job sub-step** of the Execute stage (Step 5, sub-step 1). No valid grant
-   → the project is **skipped** and reported as awaiting authorization, with the
-   exact `grant` command to run; the rest of the sweep is unaffected. A valid
-   grant → it runs, and the grant is **consumed** on success so it cannot
-   silently authorize a later sweep.
-3. **A `PreToolUse` hook (`hooks/maintenance-authz.sh`, registered in
-   `hooks/hooks.json`) is defense-in-depth.** For a project with a valid grant,
-   it returns `permissionDecision: allow` so the privileged command runs without
-   a prompt even in an unattended/`dontAsk` session; with no grant it stays
-   silent and defers to normal permission handling (prompt interactively, or
-   auto-deny unattended). The hook **never denies** — it only lifts the block
-   when you have explicitly authorized — so it cannot break ordinary commands.
-   It keys the grant to the command's project by the cwd basename, so run
-   privileged steps from the project root.
+   Grants live under `<data-dir>/grants/`. `list`/`revoke` inspect and rescind;
+   `consume` spends a one-time grant.
+3. **The per-job gate enforces it.** Before dispatching a `requires_authorization`
+   project the orchestrator checks for a valid grant (Step 5, sub-step 1). No
+   grant → the project is **skipped** and reported; the rest of the sweep is
+   unaffected. A valid grant → it runs, and a one-time grant is **consumed** on
+   success so it cannot carry over to a later sweep.
+4. **A `PreToolUse` hook (`hooks/maintenance-authz.sh`, registered in
+   `hooks/hooks.json`) makes the privileged commands actually run.** For a project
+   with a valid grant it returns `permissionDecision: allow`, so the privileged
+   Bash commands run without the auto-accept classifier prompting or denying them;
+   with no grant it stays silent and defers to normal permission handling. The
+   hook **never denies** — it only lifts the block when a grant exists — so it
+   cannot break ordinary commands. It keys the grant to the command's project by
+   the cwd basename, so run privileged steps from the project root.
 
 Because the orchestrator gate runs in the top-level session, the authorization
 requirement holds **even if** the running Claude Code does not apply plugin hooks

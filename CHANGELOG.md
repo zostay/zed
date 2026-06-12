@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.0 — 2026-06-12
+
+### Changed
+
+- `maintenance`: authorizing privileged (`requiresAuthorization: true`) projects
+  is now **interactive and automatic** instead of a manual pre-step. When the
+  sweep reaches the execute stage it collects the privileged projects and, in an
+  interactive session, asks **once** up front to confirm them (default: authorize
+  all), then creates the grants itself before dispatching. A typed
+  `/zed:maintenance weekly` now needs a single answer and then runs everything —
+  deploys included — to completion; you no longer run
+  `maintenance-authorize.sh grant …` by hand for each project before every sweep.
+  Declining a project simply skips it. **Unattended** (scheduled/cron) runs, which
+  have no one to ask, still authorize ahead of time with an explicit grant — a
+  `--repeat` grant is convenient for a recurring schedule. The per-job gate, the
+  one-time-grant consume-on-success, and the `PreToolUse` allow hook (what lets
+  privileged commands run under auto-accept without prompting or being denied) are
+  all unchanged underneath; only the user-facing step moved from a buried pre-run
+  command to a single in-session prompt.
+
 ## 0.5.0 — 2026-06-09
 
 ### Added
