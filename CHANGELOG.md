@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.1 — 2026-06-12
+
+### Fixed
+
+- Plugin load no longer errors with "Duplicate hooks file detected". The manifest
+  (`.claude-plugin/plugin.json`) declared `"hooks": "./hooks/hooks.json"`, but the
+  standard `hooks/hooks.json` is loaded automatically — naming it again in the
+  manifest loaded it twice. Removed the redundant `hooks` key; the `PreToolUse`
+  authorization hook still loads via the standard path. (`manifest.hooks` should
+  only reference *additional* hook files, not the standard one.)
+
 ## 0.6.0 — 2026-06-12
 
 ### Changed

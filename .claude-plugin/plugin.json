@@ -1,6 +1,6 @@
 {
   "name": "zed",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Personal Claude Code plugin with custom skills, agents, and tools.",
   "author": {
     "name": "zostay"
@@ -8,6 +8,5 @@
   "homepage": "https://github.com/zostay/zed",
   "repository": "https://github.com/zostay/zed",
   "license": "MIT",
-  "keywords": ["claude", "plugin", "skills", "agents", "tools"],
-  "hooks": "./hooks/hooks.json"
+  "keywords": ["claude", "plugin", "skills", "agents", "tools"]
 }
