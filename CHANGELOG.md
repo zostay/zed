@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.2 — 2026-06-17
+
+### Changed
+
+- `pr-review-fix`: strengthened the guidance that a review must always be
+  established before fixing. When a PR has no existing feedback and no pending
+  Copilot review, generating one (codex → copilot CLI → Claude subagent) is now an
+  explicit, non-skippable invariant rather than soft "last resort" framing. Added a
+  hard invariant at the top of Step 3, made the 3b "no feedback" branch a required
+  action (not a stopping point), reworded 3c from "fallback" to "the review," and
+  surfaced the promise in the skill `description`. Fixes the skill stopping with
+  "no review found" instead of producing one.
+
 ## 0.6.1 — 2026-06-12
 
 ### Fixed

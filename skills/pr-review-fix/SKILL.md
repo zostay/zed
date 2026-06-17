@@ -1,6 +1,6 @@
 ---
 name: pr-review-fix
-description: Check out a PR, read its GitHub review comments, evaluate each for validity, fix the good recommendations, and report on what was done.
+description: Check out a PR, read its GitHub review comments, evaluate each for validity, fix the good recommendations, and report on what was done. If the PR has no review and none is pending, always generate one (codex, copilot CLI, or a Claude subagent) and post it before fixing.
 ---
 
 # PR Review Fix
@@ -37,10 +37,22 @@ git pull --ff-only
 
 ### 3. Establish the review
 
+**Invariant — this skill never proceeds without a review to act on.** Every run of
+this skill must end with Steps 4–8 operating on a concrete review. There are
+exactly three ways to obtain one, and one of them *always* applies:
+
+1. **Use existing feedback** if any exists.
+2. Otherwise **watch for a pending Copilot review** if one is requested/in-progress.
+3. Otherwise **generate one yourself** — this is mandatory, not optional.
+
+You may **never** stop, skip ahead, or report "no review found" because a PR has
+no feedback yet. "No existing review and nothing pending" is not a dead end — it is
+the explicit trigger to generate a review in 3c. Do **not** ask the user whether to
+generate one in this case; just generate it. The only place a question is allowed
+is the ~15-minute watch timeout in 3b-watch.
+
 Before fixing anything, make sure the PR actually has a review to act on. The
-skill sources feedback in priority order: **use existing feedback if any exists**,
-otherwise **watch for a pending Copilot review**, otherwise **generate one
-ourselves as a last resort**.
+skill sources feedback in the priority order above.
 
 #### 3a. Inventory the current review state
 
@@ -104,11 +116,16 @@ From this, determine:
 
 #### 3b. Decide how to source the review
 
+Exactly one of these three branches applies — pick the first that matches and act:
+
 - **Actionable feedback already exists** → proceed straight to Step 4 and use it.
 - **A Copilot review is pending** (requested/in-progress, nothing posted yet) →
   **watch** for it (3b-watch below).
-- **No Copilot pending/present and no other feedback** → **generate a review
-  ourselves** (3c). Do **not** request Copilot in this case.
+- **No Copilot pending/present and no other feedback** → you have reached the
+  generate trigger. **Go to 3c now and generate a review.** This branch is not
+  optional and is not a stopping point: do **not** end the skill here, do **not**
+  ask the user whether to generate, and do **not** request Copilot. Generating the
+  review yourself is the required action.
 
 **3b-watch — wait for a pending Copilot review.** Poll until Copilot posts
 **either a review summary or inline review comments** (checking reviews alone
@@ -135,13 +152,17 @@ Stop the moment Copilot posts, then proceed to Step 4. If the ~15-minute bound
 elapses with nothing from Copilot, **ask the user** how to proceed — wait longer,
 generate a review now (3c), or proceed without one. Do **not** loop indefinitely.
 
-#### 3c. Generate a fallback review
+#### 3c. Generate the review
+
+You are here because no review exists and none is pending. **Generating a review
+now is required** — produce one and post it; never finish the skill without it.
 
 Run the review from a **fresh context** that bases its judgment **solely on the
 code changes and the PR's own description, which it discovers itself**. Prefer a
 **different agent/model system** over Claude when one is available — codex and the
 copilot CLI are independent models and give a genuine second opinion; the Claude
-subagent is the last resort. Select the first available tool:
+subagent is the always-available fallback so that this step can never fail to
+produce a review. Select the first available tool:
 
 1. `command -v codex` → run codex non-interactively: `codex exec "<review-prompt>"`,
    capturing stdout.
