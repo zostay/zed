@@ -150,7 +150,10 @@ done
 
 Stop the moment Copilot posts, then proceed to Step 4. If the ~15-minute bound
 elapses with nothing from Copilot, **ask the user** how to proceed — wait longer,
-generate a review now (3c), or proceed without one. Do **not** loop indefinitely.
+or generate a review now (3c). Do **not** loop indefinitely, and do **not**
+proceed without a review: the Step 3 invariant still holds, so "skip the review"
+is not on the table here — if the user does not want to keep waiting, fall through
+to generating one in 3c.
 
 #### 3c. Generate the review
 
