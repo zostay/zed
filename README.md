@@ -83,6 +83,28 @@ by `scripts/maintenance-config.sh` (defaults to `{ "searchRoots": ["~/projects"]
 `maintenance-config.sh add-root <path>` and exclude a project with
 `maintenance-config.sh add-block <path-or-name>`.
 
+**Per-project frontmatter flags.** Each project controls how it participates in a
+sweep through optional keys in its own `maintenance-<tag>` skill's YAML front
+matter (alongside the standard `name`/`description` every skill carries):
+
+| Flag | Type | Default | Effect |
+| ---- | ---- | ------- | ------ |
+| `priority` | integer | `0` | Where the project runs in the sweep — lower runs earlier, higher later, ties broken by path. See **Ordering**. |
+| `requiresAuthorization` | boolean | `false` | Marks the project as privileged (e.g. a production deploy): it runs only with an explicit grant and never unattended without one. See **Authorization**. |
+
+Both are read from the leading `---`…`---` block only; signed and quoted forms
+(`priority: '-100'`) parse fine, and anything missing or unparseable falls back to
+the default. Example:
+
+```yaml
+---
+name: maintenance-weekly
+description: Weekly dependency sweep and redeploy.
+priority: 100               # run last, after other projects have pushed updates
+requiresAuthorization: true # privileged: needs a deliberate yes before deploying
+---
+```
+
 **Ordering.** A project's `maintenance-<tag>` skill can set an integer
 `priority` in its front matter to control where it runs: lower runs earlier,
 higher later, default `0`, ties broken by path. On the serial path projects run
