@@ -48,7 +48,7 @@ All scripts resolve their data directory the same way (via
 `scripts/maintenance-common.sh`) and write to a single SQLite database, so the
 web app and the orchestrator always agree on state.
 
-#### Bootstrap `PATH` before every script call (do not skip this)
+#### Bootstrap `PATH` before every helper-script call (do not skip this)
 
 The scripts carry a `#!/usr/bin/env bash` shebang. When you run one, the kernel
 launches `/usr/bin/env`, which then resolves `bash` **from `PATH`**. In a
@@ -62,8 +62,8 @@ does **not** avoid this: the failure is `env` resolving the *interpreter*, not
 the kernel resolving the *script*.
 
 The fix is to ensure a usable `PATH` **in the caller** before the shebang is
-evaluated. Prepend this bootstrap to **every** Bash command that runs a helper
-script (it is harmless when `PATH` is already fine — it only prepends):
+evaluated. Prepend this bootstrap to every Bash command **that runs a helper
+script** (it is harmless when `PATH` is already fine — it only prepends):
 
 ```bash
 export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"
@@ -90,8 +90,8 @@ do not hit the identical failure.
 
 The `PATH` bootstrap is **only** for helper-script (`maintenance-*.sh`)
 invocations — they need `bash` resolved for their `#!/usr/bin/env bash` shebang.
-**Do not** prepend it to an allowlisted command such as `gh pr merge`,
-`gh pr close`, or any other `gh pr …` call. Run those **bare**.
+**Do not** prepend it to any command that has its own allow rule (e.g.
+`gh pr merge`, `gh pr close`, other `gh pr …` calls). Run those **bare**.
 
 Why this matters: the `export …; <cmd>` prefix makes the command **compound**,
 and Claude Code's permission engine matches a rule against **each subcommand
@@ -106,8 +106,9 @@ A `gh` binary launched directly by the Bash tool does **not** hit the
 `env: bash` problem (it is not a script with a shebang to resolve), and runs in
 a profile-sourced shell that already has a usable `PATH` — so it needs no
 bootstrap. Reserve the prefix for helper scripts; everything that has its own
-allow rule runs bare. The non-`gh` examples below omit the prefix for brevity —
-apply it to helper-script calls regardless.
+allow rule runs bare. The examples below omit the prefix for brevity — apply it
+to helper-script (`maintenance-*.sh`) calls regardless; leave allowlisted
+commands bare.
 
 Resolve the absolute path to the DB script once and keep it; you will hand it to
 each subagent so it can log its own progress:
