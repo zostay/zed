@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.3 — 2026-06-24
+
+### Fixed
+
+- `maintenance`: stop wrapping allowlisted commands in a compound `export PATH …;`
+  prefix. Claude Code matches permission rules against each subcommand of a
+  compound command independently, so `export …; gh pr merge …` failed to match
+  `Bash(gh pr merge:*)`, fell through to the auto-mode classifier, and was
+  auto-denied under unattended sweeps — producing spurious "merge ready PR"
+  followups. The `PATH` bootstrap is now scoped to helper-script
+  (`maintenance-*.sh`) invocations only (which need it to resolve their
+  `#!/usr/bin/env bash` shebang); `gh pr merge`/`gh pr close` and other
+  allowlisted commands run **bare** so they match their allow rules. Updated the
+  "Bootstrap `PATH`" section and the Step 5 subagent-dispatch instructions
+  accordingly. (#15)
+
 ## 0.6.2 — 2026-06-17
 
 ### Changed

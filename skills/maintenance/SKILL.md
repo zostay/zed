@@ -48,7 +48,7 @@ All scripts resolve their data directory the same way (via
 `scripts/maintenance-common.sh`) and write to a single SQLite database, so the
 web app and the orchestrator always agree on state.
 
-#### Bootstrap `PATH` before every script call (do not skip this)
+#### Bootstrap `PATH` before every helper-script call (do not skip this)
 
 The scripts carry a `#!/usr/bin/env bash` shebang. When you run one, the kernel
 launches `/usr/bin/env`, which then resolves `bash` **from `PATH`**. In a
@@ -62,14 +62,14 @@ does **not** avoid this: the failure is `env` resolving the *interpreter*, not
 the kernel resolving the *script*.
 
 The fix is to ensure a usable `PATH` **in the caller** before the shebang is
-evaluated. Prepend this bootstrap to **every** Bash command that runs a helper
-script (it is harmless when `PATH` is already fine — it only prepends):
+evaluated. Prepend this bootstrap to every Bash command **that runs a helper
+script** (it is harmless when `PATH` is already fine — it only prepends):
 
 ```bash
 export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"
 ```
 
-So each invocation looks like:
+So each **helper-script** invocation looks like:
 
 ```bash
 export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-config.sh" ...
@@ -80,12 +80,35 @@ export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "${CLAUDE_PLUGIN_
 ```
 
 Each Bash tool call is a fresh shell, so the export does not persist between
-calls — include it in every one. Still invoke scripts **by their path** (do not
-prefix with a bare `bash`, which has the same unresolved-`bash` problem). When
-you dispatch a subagent (Step 5), **include this same `PATH` bootstrap
-instruction in its prompt** so its own script and tool calls do not hit the
-identical failure. The examples below omit the prefix for brevity — apply it
-regardless.
+calls — include it in every **helper-script** call. Still invoke scripts **by
+their path** (do not prefix with a bare `bash`, which has the same
+unresolved-`bash` problem). When you dispatch a subagent (Step 5), **include
+this same `PATH` bootstrap instruction in its prompt** so its own script calls
+do not hit the identical failure.
+
+#### Never prefix an allowlisted command (run `gh pr merge`/`gh pr close` bare)
+
+The `PATH` bootstrap is **only** for helper-script (`maintenance-*.sh`)
+invocations — they need `bash` resolved for their `#!/usr/bin/env bash` shebang.
+**Do not** prepend it to any command that has its own allow rule (e.g.
+`gh pr merge`, `gh pr close`, other `gh pr …` calls). Run those **bare**.
+
+Why this matters: the `export …; <cmd>` prefix makes the command **compound**,
+and Claude Code's permission engine matches a rule against **each subcommand
+independently** (it splits on `;`, `&&`, `|`, …). So `export …; gh pr merge …`
+no longer matches the allow rule `Bash(gh pr merge:*)` — the un-allowlisted
+`export` segment defeats it, the command falls through to the auto-mode
+classifier, and under an unattended sweep (`defaultMode: auto`) it is
+**auto-denied**. Bare `gh pr merge …` matches the allow rule directly and runs.
+This is the confirmed cause of spurious "merge ready PR" followups in past runs.
+
+A `gh` binary launched directly by the Bash tool does **not** hit the
+`env: bash` problem (it is not a script with a shebang to resolve), and runs in
+a profile-sourced shell that already has a usable `PATH` — so it needs no
+bootstrap. Reserve the prefix for helper scripts; everything that has its own
+allow rule runs bare. The examples below omit the prefix for brevity — apply it
+to helper-script (`maintenance-*.sh`) calls regardless; leave allowlisted
+commands bare.
 
 Resolve the absolute path to the DB script once and keep it; you will hand it to
 each subagent so it can log its own progress:
@@ -306,16 +329,19 @@ subagent does the project work and logs its own progress events.
    - the `run_id` (`$RUN_ID`).
 
    Instruct the subagent to log progress with (note the `PATH` bootstrap — the
-   subagent runs in the same kind of stripped subshell and must apply it too,
-   see **Bootstrap `PATH`** above):
+   subagent runs in the same kind of stripped subshell and must apply it to
+   helper-script calls, see **Bootstrap `PATH`** above):
    ```bash
    export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "<DB_SCRIPT>" log --run <RUN_ID> --job <JOB_ID> --level info --message "<what it's doing>"
    ```
    (using `--level warn`/`error`/`success` as appropriate) so the live view
    updates while it works. Tell the subagent to prepend that same `PATH` export
-   to **all** of its Bash commands (its project's `maintenance-<tag>` work runs
-   helper scripts too). The subagent should NOT touch the run row or call
-   `finish-run`; the orchestrator owns those.
+   to its **helper-script** (`maintenance-*.sh`) calls (its project's
+   `maintenance-<tag>` work runs helper scripts too) — but to run allowlisted
+   commands such as `gh pr merge`/`gh pr close` **bare**, never with the prefix,
+   so they match their allow rules instead of being auto-denied (see **Never
+   prefix an allowlisted command** above). The subagent should NOT touch the run
+   row or call `finish-run`; the orchestrator owns those.
 4. After the subagent returns, write its summary to a temp file and finish the
    job with the right status (`success`, `followup`, `failure`, or `skipped`):
    ```bash
