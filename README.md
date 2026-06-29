@@ -97,9 +97,8 @@ matter (alongside the standard `name`/`description` every skill carries):
 | Flag | Type | Default | Effect |
 | ---- | ---- | ------- | ------ |
 | `priority` | integer | `0` | Where the project runs in the sweep — lower runs earlier, higher later, ties broken by path. See **Ordering**. |
-| `requiresAuthorization` | boolean | `false` | Marks the project as privileged (e.g. a production deploy): it runs only with an explicit grant and never unattended without one. See **Authorization**. |
 
-Both are read from the leading `---`…`---` block only; signed and quoted forms
+It is read from the leading `---`…`---` block only; signed and quoted forms
 (`priority: '-100'`) parse fine, and anything missing or unparseable falls back to
 the default. Example:
 
@@ -108,7 +107,6 @@ the default. Example:
 name: maintenance-weekly
 description: Weekly dependency sweep and redeploy.
 priority: 100               # run last, after other projects have pushed updates
-requiresAuthorization: true # privileged: needs a deliberate yes before deploying
 ---
 ```
 
@@ -120,27 +118,30 @@ concurrent, groups in order). Use a negative priority for a project that needs
 up-front interaction (runs first) and a positive one for a project that
 redeploys centrally-shared apps (runs last).
 
-**Authorization.** A project that does something privileged (e.g. a production
-deployment) sets `requiresAuthorization: true` in its `maintenance-<tag>` front
-matter. When the sweep reaches the execute stage it asks you **once**, up front,
-to confirm those projects (default: authorize all) and then creates the grants
-for you — so a typed `/zed:maintenance weekly` needs just one answer and the
-deploys run. Decline a project and it is skipped. For **unattended** runs (a
-scheduled sweep with no one to ask), authorize ahead of time instead:
+**Authorization.** The model is **"assume elevated permission for the whole
+sweep"**: you authorize **once, up front, for the entire run** rather than per
+project (a deliberate trade-off — less granular containment for a far simpler,
+more robust model). Most commands need nothing: bare `gh pr merge`/`gh pr close`
+match their own allow rules and run in any session. The whole-sweep grant exists
+for the remaining case — an un-allowlisted privileged command like a project's
+`make deploy` — which would otherwise be prompted for or auto-denied. When the
+sweep reaches the execute stage it asks you **once** whether to authorize this
+run for privileged commands (default: yes) and creates a single whole-sweep grant;
+a typed `/zed:maintenance weekly` needs just one answer. For **unattended** runs
+(a scheduled sweep with no one to ask), authorize ahead of time instead:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" \
-  grant --tag weekly --project qubling.cloud --repeat --ttl 8h   # reusable until it expires
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" grant --tag weekly --ttl 12h
 ```
 
-The orchestrator checks for a valid grant before dispatching such a project (no
-grant → skipped; valid grant → runs, then the grant is consumed if it is one-time
-— a `--repeat` grant persists until it expires). A
-`PreToolUse` hook (`hooks/maintenance-authz.sh`) returns an `allow` decision for a
-granted project so the privileged command runs without the auto-accept classifier
-prompting or denying it, and stays silent (never denies) otherwise. Manage grants
-with `maintenance-authorize.sh list` / `revoke` / `consume`. Grants live under
-`<data-dir>/grants/`.
+While a valid whole-sweep grant exists, a `PreToolUse` hook
+(`hooks/maintenance-authz.sh`) returns an `allow` decision for Bash calls so an
+un-allowlisted privileged command runs without the auto-accept classifier
+prompting or denying it; with no grant it stays silent (never denies). The run
+**revokes its grant when it finishes**, so authorization never carries into a
+later sweep (the generous default TTL is only a backstop). Manage grants with
+`maintenance-authorize.sh list` / `revoke`. Grants live under `<data-dir>/grants/`,
+one per tag.
 
 **Followups.** A sweep often leaves work that needs a human (a manual deploy
 step, a decision, something to verify). Those are not buried in prose — a project

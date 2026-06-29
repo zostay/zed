@@ -200,12 +200,11 @@ can start it later (and revisit history) with the same command:
 `maintenance-discover.sh` searches the configured roots for projects that define
 a `maintenance-<tag>` skill (at `<project>/.claude/skills/maintenance-<tag>/SKILL.md`
 or `<project>/skills/maintenance-<tag>/SKILL.md`), applies the blocklist, reads
-each skill's execution `priority` (see **Ordering** below) and its
-`requires_authorization` flag (see **Authorization** below), and prints **JSONL**,
+each skill's execution `priority` (see **Ordering** below), and prints **JSONL**,
 one object per line, sorted by `(priority ascending, project_path)`:
 
 ```json
-{"project_path":"...","project_name":"...","skill_name":"maintenance-<tag>","skill_path":"...","priority":0,"requires_authorization":false}
+{"project_path":"...","project_name":"...","skill_name":"maintenance-<tag>","skill_path":"...","priority":0}
 ```
 
 The orchestrator must preserve this emitted order: register jobs and (for serial
@@ -221,8 +220,7 @@ JOB_ID=$("${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
 ```
 
 Keep an ordered list of `(JOB_ID, project_path, project_name, skill_name,
-priority, requires_authorization)` — you need `requires_authorization` for the
-authorization gate in Step 5. Log how many projects were found:
+priority)`. Log how many projects were found:
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
@@ -246,76 +244,58 @@ Then report that to the user (with the monitor URL if it was started) and stop.
 "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" set-stage --run "$RUN_ID" --stage executing
 ```
 
-**Before the per-job loop — authorize privileged projects once, up front.**
-Collect every discovered job whose `requires_authorization` is `true`. If there
-are none, skip straight to the loop. Otherwise this is the **only** authorization
-step the user does — answer it once right after starting the sweep, then
-everything (privileged deploys included) runs to completion without further
-prompting:
+**Before the per-job loop — authorize the whole sweep once, up front.** The model
+is "assume elevated permission for the whole run": you authorize **once**, for the
+entire sweep, rather than per project. This single grant lets privileged commands
+(a project's `make deploy`, a rollout) run unblocked anywhere in the run. Bare
+`gh pr merge`/`gh pr close` already match their own allow rules and don't need it,
+but ordinary Dependabot sweeps don't run anything privileged at all — so most runs
+never exercise the grant. Create it anyway: it's harmless when unused and it's the
+one deliberate "yes" that carries any deploy through.
 
 - **Interactive session (you can ask the user a question):** ask **once**, with a
-  single AskUserQuestion that lists those projects and confirms authorizing them
-  for *this run*. Default/recommended is **authorize all** — everything in a
-  `maintenance-<tag>` is there on purpose — while letting the user deselect any to
-  hold back. For each project the user confirms, create the grant yourself:
+  single AskUserQuestion, whether to authorize this `<tag>` sweep to run privileged
+  commands (deploys, rollouts) for the whole run. Default/recommended is
+  **authorize**. If the user authorizes, create the whole-sweep grant:
   ```bash
-  "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" \
-    grant --tag "<tag>" --project "<project_name>"
+  "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" grant --tag "<tag>"
   ```
-  This is exactly the grant the user used to have to create by hand before the
-  sweep; creating it here, after one confirmation, is the whole point. The default
-  TTL comfortably covers a sweep, and the grant is one-time — consumed when the
-  job succeeds (sub-step 6). Projects the user declines get no grant and are
-  skipped by the gate below.
+  If the user declines, create no grant and continue — `gh`-only work (the common
+  Dependabot case) still runs via its own allow rules; only a project that needs an
+  un-allowlisted privileged command will be blocked (and you handle that as a
+  followup, like any blocked step).
 
 - **Unattended session (a scheduled/cron run with no human to ask):** do **not**
-  prompt. Rely on grants created ahead of time — e.g. a `--repeat` grant for a
-  recurring scheduled sweep:
+  prompt. Rely on a grant created ahead of time:
   ```bash
-  "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" \
-    grant --tag "<tag>" --project "<project_name>" --repeat --ttl 8h
+  "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" grant --tag "<tag>" --ttl 12h
   ```
-  A privileged project without a grant is skipped and reported (see the gate).
+  Without it, `gh`-only work still runs; an un-allowlisted privileged command is
+  reported as a followup.
+
+Record the grant outcome as a run event so the sweep history shows whether it ran
+elevated:
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+  log --run "$RUN_ID" --level info --message "Sweep authorized for privileged commands (whole-run grant)."
+```
+
+The grant is run-scoped: **revoke it when the run finishes** (Step 6) so it cannot
+carry over to a later sweep — the generous default TTL is only a backstop if the
+run dies before it can revoke.
 
 For each job, you (the orchestrator) own the job lifecycle in the DB, and the
 subagent does the project work and logs its own progress events.
 
 **Per job, the orchestrator:**
 
-1. **Authorization gate (only if the job's `requires_authorization` is `true`).**
-   The up-front authorization step (before this loop) has already created a grant
-   for each privileged project the user confirmed; this gate enforces it. Before
-   dispatch, check for a valid grant for this project:
-   ```bash
-   if "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" \
-        check --tag "<tag>" --project "<project_name>" >/dev/null 2>&1; then
-     AUTHORIZED=1
-   else
-     AUTHORIZED=0
-   fi
-   ```
-   - If **no valid grant** (`AUTHORIZED=0`): the user declined this project at the
-     up-front prompt (or this is an unattended run with no pre-created grant). Do
-     **not** dispatch. Finish the job `--status skipped` and log a `warn` event
-     that names the grant condition (so an unattended skip is diagnosable without
-     re-reading the docs):
-     ```bash
-     "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
-       log --run "$RUN_ID" --job "$JOB_ID" --level warn \
-       --message "Skipped: requires authorization but no valid grant for this run (declined at the prompt, or an unattended run with no pre-created grant)."
-     ```
-     Then move on to the next job. (This gate runs in the orchestrator session, so
-     it holds regardless of whether the PreToolUse hook fires inside subagents.)
-   - If a **valid grant exists** (`AUTHORIZED=1`): proceed with the steps below,
-     and after the job succeeds **consume** the grant (step 6) so it cannot
-     silently authorize a future run.
-2. Marks the job running before dispatch:
+1. Marks the job running before dispatch:
    ```bash
    "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" start-job --job "$JOB_ID"
    "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
      log --run "$RUN_ID" --job "$JOB_ID" --level info --message "Starting maintenance-<tag> in <project_name>."
    ```
-3. Dispatches a subagent (via the Task/Agent tool). The subagent's task is to:
+2. Dispatches a subagent (via the Task/Agent tool). The subagent's task is to:
    - `cd` into `project_path`,
    - invoke that project's `maintenance-<tag>` skill and do the work,
    - log its own progress events to the **same** database, and
@@ -342,7 +322,7 @@ subagent does the project work and logs its own progress events.
    so they match their allow rules instead of being auto-denied (see **Never
    prefix an allowlisted command** above). The subagent should NOT touch the run
    row or call `finish-run`; the orchestrator owns those.
-4. After the subagent returns, write its summary to a temp file and finish the
+3. After the subagent returns, write its summary to a temp file and finish the
    job with the right status (`success`, `followup`, `failure`, or `skipped`):
    ```bash
    SUMMARY_TMP=$(mktemp)
@@ -363,11 +343,10 @@ subagent does the project work and logs its own progress events.
    - `failure` — the project's maintenance could not be completed; also pass
      `--error "<short reason>"`. A hard failure that a human must chase up should
      **also** get a followup ticket (next sub-step) so it is tracked.
-   - `skipped` — there was nothing to do (or the authorization gate in step 1
-     skipped it for lack of a grant).
+   - `skipped` — there was nothing to do.
 
    Log a closing event for the job and append the result to your action log.
-5. **Open followup tickets for anything needing a human.** For each distinct
+4. **Open followup tickets for anything needing a human.** For each distinct
    outstanding item this project left behind (i.e. each thing you'd list under
    "needs attention"), open a ticket and capture its number:
    ```bash
@@ -381,16 +360,6 @@ subagent does the project work and logs its own progress events.
    jobs and for any `failure` job a human must resolve; a clean `success`/`skipped`
    job gets none. (The user later resolves each ticket with
    `/zed:maint-followup <number> done|nope|update`.)
-6. **Consume the grant (only for an authorized job that succeeded).** If this job
-   went through the authorization gate (step 1, `AUTHORIZED=1`) and finished
-   `--status success`, consume the grant so a one-time authorization cannot carry
-   over to a later sweep:
-   ```bash
-   "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" \
-     consume --tag "<tag>" --project "<project_name>" >/dev/null 2>&1 || true
-   ```
-   Do **not** consume on failure — leaving the grant in place lets the user
-   retry without re-authorizing (it still expires on its own `--ttl`).
 
 **Serial (default / `--now`):** dispatch one subagent, wait for it to return,
 finish its job, then move to the next — in the discovery order (priority
@@ -464,6 +433,14 @@ fi
 rm -f "$RUN_SUMMARY_TMP"
 ```
 
+**Revoke the whole-sweep grant** if you created one at the start (Step 5), so the
+elevated authorization does not carry into a later sweep (the TTL is only a
+backstop). It's harmless if no grant was created:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" revoke --tag "<tag>" >/dev/null 2>&1 || true
+```
+
 - Use **`needs_followup`** whenever the run leaves any open followup ticket. The
   run is finished sweeping but awaits human action; it graduates to `completed`
   on its own when the last ticket is resolved (the orchestrator does **not** need
@@ -531,73 +508,63 @@ paths honor it:
 
 ## Authorization
 
-Some maintenance is privileged — a production deployment, say — and must **not**
-run unattended (or in an auto-accept / `dontAsk` session) just because the sweep
-reached it — it should take a deliberate "yes". A project opts into that
-authorization gate by declaring `requiresAuthorization: true` in the front matter
-of its own `maintenance-<tag>` skill:
+The model is **"assume elevated permission for the whole sweep."** You authorize
+**once, up front, for the entire run** — not per privileged project. This is a
+deliberate trade-off: less granular containment in exchange for a far simpler,
+more robust model. (It replaces the old per-project `requiresAuthorization` gate
+and the per-(tag, project) grant + TTL + one-time-consume machinery, which were
+fragile — an up-front grant could expire before a long serial sweep reached the
+last project, silently skipping it.)
 
-```yaml
----
-name: maintenance-weekly
-description: ...
-priority: 100            # deploy after everything else has updated
-requiresAuthorization: true
----
-```
+Why authorization is needed at all: most maintenance commands are fine without
+it. Bare `gh pr merge`/`gh pr close` match their own allow rules and run in any
+session (including an unattended/`dontAsk` sweep). The gap is **arbitrary
+privileged commands with no allow rule** — a project's `make deploy` or rollout —
+which the auto-accept classifier would otherwise prompt for or auto-deny. A
+whole-sweep grant lifts that block for the duration of the run.
 
 The control flow:
 
-1. **The sweep asks you once, up front, and grants for you.** When the run reaches
-   the Execute stage the orchestrator collects the privileged projects and — in an
-   interactive session — asks a single question listing them (default: authorize
-   all). For each one you confirm it creates the grant itself (Step 5, before the
-   per-job loop). You do **not** pre-run anything: answer the one prompt and the
-   sweep carries the deploys through; decline a project and it is simply skipped.
-2. **Unattended runs use a pre-created grant.** A scheduled/cron sweep has no one
-   to ask, so authorize ahead of time with an explicit command — a `--repeat`
-   grant is handy for a recurring schedule:
+1. **The sweep authorizes once, up front (Step 5, before the per-job loop).** In
+   an interactive session the orchestrator asks a single yes/no — authorize this
+   `<tag>` sweep to run privileged commands for the whole run? (default: yes) —
+   and, on yes, creates one whole-sweep grant:
    ```bash
-   "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" \
-     grant --tag weekly --project qubling.cloud --repeat --ttl 8h
+   "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" grant --tag weekly
    ```
-   Grants live under `<data-dir>/grants/`. `list`/`revoke` inspect and rescind;
-   `consume` spends a one-time grant.
-3. **The per-job gate enforces it.** Before dispatching a `requires_authorization`
-   project the orchestrator checks for a valid grant (Step 5, sub-step 1). No
-   grant → the project is **skipped** and reported; the rest of the sweep is
-   unaffected. A valid grant → it runs, and a one-time grant is **consumed** on
-   success so it cannot carry over to a later sweep.
-4. **A `PreToolUse` hook (`hooks/maintenance-authz.sh`, registered in
-   `hooks/hooks.json`) makes the privileged commands actually run.** For a project
-   with a valid grant it returns `permissionDecision: allow`, so the privileged
-   Bash commands run without the auto-accept classifier prompting or denying them;
-   with no grant it stays silent and defers to normal permission handling. The
-   hook **never denies** — it only lifts the block when a grant exists — so it
-   cannot break ordinary commands. It keys the grant to the command's project by
-   the cwd basename, so run privileged steps from the project root.
+2. **Unattended runs use a pre-created grant.** A scheduled/cron sweep has no one
+   to ask, so authorize ahead of time:
+   ```bash
+   "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" grant --tag weekly --ttl 12h
+   ```
+   Grants live under `<data-dir>/grants/`, one per tag (`sweep__<tag>.json`).
+   `list`/`revoke` inspect and rescind.
+3. **A `PreToolUse` hook (`hooks/maintenance-authz.sh`, registered in
+   `hooks/hooks.json`) makes the privileged commands actually run.** While **any**
+   valid whole-sweep grant exists it returns `permissionDecision: allow` for Bash
+   calls, so an un-allowlisted privileged command runs without the auto-accept
+   classifier prompting or denying it. With no grant it stays silent and defers to
+   normal permission handling. The hook **never denies** — it only lifts the block
+   when a grant exists — so it cannot break ordinary commands.
+4. **The run revokes its grant when it finishes (Step 6).** Authorization is
+   run-scoped, so it cannot carry into a later sweep; the generous default TTL is
+   only a backstop if the run dies before revoking.
 
-Because the orchestrator gate runs in the top-level session, the authorization
-requirement holds **even if** the running Claude Code does not apply plugin hooks
-to subagent tool calls: an unauthorized privileged project is never dispatched.
-The hook then additionally covers the case of running a project's
-`maintenance-<tag>` skill directly, outside the orchestrator.
+No per-project gate runs any more: every discovered project is dispatched to a
+subagent regardless (there is nothing to skip for lack of a grant). If the user
+declines authorization, the sweep still runs — only an un-allowlisted privileged
+command will block, and you record that as a followup like any other blocked step.
 
-**Liveness fallback.** The gate guarantees a privileged project never runs
-*without* a grant. For the authorized command to actually run *unblocked* in an
-unattended/`dontAsk` sweep, the `PreToolUse` hook must fire where the command
-runs. The hook reliably fires for top-level tool calls; whether it fires inside a
-dispatched subagent depends on the Claude Code version. If you find a privileged
-command still blocked inside its subagent, run that project's work **inline in
-the orchestrator session** (the orchestrator `cd`s into `project_path` and
-invokes the `maintenance-<tag>` skill itself, logging to the same `job_id`)
-instead of dispatching a subagent — the hook then applies and the grant unblocks
-the command. Reserve this for `requires_authorization` jobs; ordinary jobs still
-go to subagents.
-
-Pair `requiresAuthorization: true` with a high `priority` (so the privileged
-deploy runs last, after earlier projects have pushed their updates) — see
-**Ordering**.
+**Subagent hook-firing caveat.** The hook reliably fires for top-level tool calls;
+whether it fires inside a dispatched subagent depends on the Claude Code version.
+Bare `gh pr merge`/`gh pr close` are unaffected (they match allow rules directly,
+no hook needed), so ordinary Dependabot work runs fine in subagents. Only a
+project that runs an **un-allowlisted privileged command** (e.g. `make deploy`)
+depends on the hook firing where that command runs. If you find such a command
+still blocked inside its subagent, run that one project **inline in the
+orchestrator session** (the orchestrator `cd`s into `project_path` and invokes the
+`maintenance-<tag>` skill itself, logging to the same `job_id`) so the hook
+applies; ordinary jobs still go to subagents.
 
 ## Followups
 

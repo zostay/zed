@@ -1,35 +1,37 @@
 #!/usr/bin/env bash
 #
-# maintenance-authorize.sh — explicit, out-of-band authorization grants for
-# privileged maintenance tasks (e.g. production deployments).
+# maintenance-authorize.sh — one whole-sweep authorization grant per maintenance run.
 #
-# A project marks its `maintenance-<tag>` skill privileged with
-# `requiresAuthorization: true` in the skill front matter. The orchestrator then
-# refuses to run that project unattended unless a valid authorization *grant*
-# exists. You create a grant deliberately, ahead of the sweep, with `grant`; the
-# orchestrator (and the PreToolUse authorization hook) check for it, and it is
-# consumed/expired so it does not silently authorize every future run.
+# The maintenance model is "assume elevated permission for the whole sweep":
+# authorize **once, up front, for the entire run** rather than per privileged
+# project. A single grant (keyed by the sweep's `<tag>`) covers the whole run.
+# While it is valid, the PreToolUse hook (hooks/maintenance-authz.sh) lifts the
+# normal permission block for privileged commands — bare `gh pr merge`/`gh pr close`
+# already match their own allow rules, but arbitrary privileged commands like a
+# project's `make deploy` are covered by the grant for the duration of the run.
 #
-# Grants live as JSON files under <data-dir>/grants/, one per (tag, project):
-#   <tag>__<sanitized-project>.json
-#   { "tag", "project", "granted_at", "expires_at", "expires_epoch", "one_time", "note" }
+# This replaces the old per-(tag, project) grant + TTL + one-time consume-on-use
+# machinery. There is no per-project gate any more: an interactive sweep asks once
+# up front and creates the grant; an unattended sweep relies on a grant created
+# ahead of time; the run revokes the grant when it finishes (a generous default
+# TTL is only a backstop if the run dies before it can).
+#
+# Grants live as JSON files under <data-dir>/grants/, one per tag:
+#   sweep__<sanitized-tag>.json
+#   { "tag", "granted_at", "expires_at", "expires_epoch", "note" }
 #
 # Subcommands:
-#   grant   --tag T --project P [--ttl DUR] [--repeat] [--note S]
-#                       Create/replace a grant. Default ttl 2h, one-time.
-#                       --repeat makes it reusable until it expires (not consumed).
-#   check   --project P [--tag T]
-#                       Exit 0 if a valid (unexpired) grant exists, else exit 1.
-#                       With no --tag, matches a grant for that project under any tag.
-#                       Does NOT consume. Prints the matching grant JSON on stdout.
-#   consume --tag T --project P
-#                       check, then delete the grant if it is one-time. Exit 0 on
-#                       a valid grant, else exit 1. Idempotent for --repeat grants.
-#   revoke  --tag T --project P
-#                       Delete the grant if present (no error if absent).
-#   list                List all grants with their status (valid/expired).
-#   path    --tag T --project P
-#                       Print the grant file path (whether or not it exists).
+#   grant   --tag T [--ttl DUR] [--note S]
+#                       Create/replace the whole-sweep grant for tag T. Default
+#                       ttl 12h (a backstop — the run revokes on completion).
+#   check   [--tag T]
+#                       Exit 0 if a valid (unexpired) sweep grant exists, else 1.
+#                       With --tag, checks that tag; without, matches a valid grant
+#                       for ANY tag (this is what the hook uses). Does NOT mutate.
+#                       Prints the matching grant JSON on stdout.
+#   revoke  --tag T     Delete the grant if present (no error if absent).
+#   list                List all sweep grants with their status (valid/expired).
+#   path    --tag T     Print the grant file path (whether or not it exists).
 #
 # Durations (DUR): bare seconds, or <n>s / <n>m / <n>h / <n>d. Unknown subcommand
 # or bad args -> usage to stderr, exit 2.
@@ -46,24 +48,25 @@ source "$(dirname "${BASH_SOURCE[0]}")/maintenance-common.sh"
 
 mtnc_require jq
 
-DEFAULT_TTL="2h"
+# A generous default: only a backstop. The run revokes its grant on completion,
+# so this just bounds how long an orphaned grant (a run that died mid-sweep)
+# stays valid. It must comfortably exceed the wall-clock of a long serial sweep —
+# the run-#6 failure was a 2h grant expiring under a 2h+ run.
+DEFAULT_TTL="12h"
 
 usage() {
   cat >&2 <<'EOF'
 Usage: maintenance-authorize.sh <subcommand> [flags]
 
 Subcommands:
-  grant   --tag T --project P [--ttl DUR] [--repeat] [--note S]
-                      Create/replace an authorization grant (default ttl 2h, one-time).
-  check   --project P [--tag T]
-                      Exit 0 if a valid grant exists (prints it), else exit 1. No consume.
-  consume --tag T --project P
-                      check, then delete the grant if it is one-time. Exit 0 if valid.
-  revoke  --tag T --project P
-                      Delete the grant if present.
-  list                List all grants and their status.
-  path    --tag T --project P
-                      Print the grant file path.
+  grant   --tag T [--ttl DUR] [--note S]
+                      Create/replace the whole-sweep grant for tag T (default ttl 12h).
+  check   [--tag T]
+                      Exit 0 if a valid sweep grant exists (prints it), else exit 1.
+                      With --tag checks that tag; without, matches any tag (hook use).
+  revoke  --tag T     Delete the grant if present.
+  list                List all sweep grants and their status.
+  path    --tag T     Print the grant file path.
 
 Durations: bare seconds, or <n>s / <n>m / <n>h / <n>d (e.g. 30m, 24h, 2d).
 EOF
@@ -83,16 +86,16 @@ ensure_grants_dir() {
   printf '%s\n' "$d"
 }
 
-# Sanitize a tag/project token for safe use in a filename: keep [A-Za-z0-9._-],
-# replace everything else with '_'.
+# Sanitize a tag token for safe use in a filename: keep [A-Za-z0-9._-], replace
+# everything else with '_'.
 sanitize() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
 }
 
-# Grant file path for a (tag, project) pair.
+# Grant file path for a sweep tag.
 grant_file() {
-  local tag="$1" project="$2"
-  printf '%s/%s__%s.json\n' "$(grants_dir)" "$(sanitize "$tag")" "$(sanitize "$project")"
+  local tag="$1"
+  printf '%s/sweep__%s.json\n' "$(grants_dir)" "$(sanitize "$tag")"
 }
 
 # Parse a duration string into seconds on stdout. Returns 1 on a bad format.
@@ -129,9 +132,9 @@ grant_is_valid() {
   [ "$now" -lt "$exp" ]
 }
 
-# Parse --flag value pairs into globals: ARG_TAG ARG_PROJECT ARG_TTL ARG_NOTE
-# ARG_REPEAT. Unknown flags -> usage, exit 2.
-ARG_TAG=""; ARG_PROJECT=""; ARG_TTL=""; ARG_NOTE=""; ARG_REPEAT=0
+# Parse --flag value pairs into globals: ARG_TAG ARG_TTL ARG_NOTE. Unknown flags
+# -> usage, exit 2.
+ARG_TAG=""; ARG_TTL=""; ARG_NOTE=""
 # Require that a value-taking flag actually has a value. Called as `need_val "$@"`
 # so $1 is the flag and $2 (if present) its value; errors with usage/exit 2 when
 # the value is missing — instead of letting `shift 2` blow up under `set -e`.
@@ -141,25 +144,22 @@ need_val() {
 parse_flags() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --tag)     need_val "$@"; ARG_TAG="$2"; shift 2 ;;
-      --project) need_val "$@"; ARG_PROJECT="$2"; shift 2 ;;
-      --ttl)     need_val "$@"; ARG_TTL="$2"; shift 2 ;;
-      --note)    need_val "$@"; ARG_NOTE="$2"; shift 2 ;;
-      --repeat)  ARG_REPEAT=1; shift ;;
+      --tag)  need_val "$@"; ARG_TAG="$2"; shift 2 ;;
+      --ttl)  need_val "$@"; ARG_TTL="$2"; shift 2 ;;
+      --note) need_val "$@"; ARG_NOTE="$2"; shift 2 ;;
       *) echo "Error: unknown flag '$1'." >&2; usage; exit 2 ;;
     esac
   done
 }
 
-require_tag()     { [ -n "$ARG_TAG" ]     || { echo "Error: --tag is required." >&2; exit 2; }; }
-require_project() { [ -n "$ARG_PROJECT" ] || { echo "Error: --project is required." >&2; exit 2; }; }
+require_tag() { [ -n "$ARG_TAG" ] || { echo "Error: --tag is required." >&2; exit 2; }; }
 
 # --- subcommands -----------------------------------------------------------
 
 cmd_grant() {
   parse_flags "$@"
-  require_tag; require_project
-  local ttl="${ARG_TTL:-$DEFAULT_TTL}" secs now_epoch exp_epoch exp_iso one_time
+  require_tag
+  local ttl="${ARG_TTL:-$DEFAULT_TTL}" secs now_epoch exp_epoch exp_iso
   if ! secs="$(parse_ttl "$ttl")"; then
     echo "Error: invalid --ttl '$ttl' (use seconds, or <n>s/<n>m/<n>h/<n>d)." >&2
     exit 2
@@ -171,83 +171,63 @@ cmd_grant() {
   if exp_iso="$(date -u -r "$exp_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"; then :;
   elif exp_iso="$(date -u -d "@$exp_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"; then :;
   else exp_iso=""; fi
-  one_time=true; [ "$ARG_REPEAT" -eq 1 ] && one_time=false
 
   local dir file tmp
   dir="$(ensure_grants_dir)"
-  file="$(grant_file "$ARG_TAG" "$ARG_PROJECT")"
+  file="$(grant_file "$ARG_TAG")"
   tmp="$(mktemp "${dir}/.grant.XXXXXX")"
   jq -nc \
     --arg tag "$ARG_TAG" \
-    --arg project "$ARG_PROJECT" \
     --arg granted_at "$(mtnc_now)" \
     --arg expires_at "$exp_iso" \
     --argjson expires_epoch "$exp_epoch" \
-    --argjson one_time "$one_time" \
     --arg note "$ARG_NOTE" \
-    '{tag:$tag, project:$project, granted_at:$granted_at,
+    '{tag:$tag, granted_at:$granted_at,
       expires_at:(if $expires_at=="" then null else $expires_at end),
-      expires_epoch:$expires_epoch, one_time:$one_time,
+      expires_epoch:$expires_epoch,
       note:(if $note=="" then null else $note end)}' >"$tmp"
   # Force owner-only perms before publishing: the grant authorizes privileged
   # tasks, so it must not be world/group readable regardless of the umask.
   chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$file"
-  echo "Granted authorization for '${ARG_PROJECT}' (tag '${ARG_TAG}'): expires ${exp_iso:-never}, $([ "$one_time" = true ] && echo one-time || echo reusable)." >&2
+  echo "Authorized the '${ARG_TAG}' sweep: expires ${exp_iso:-never}." >&2
   printf '%s\n' "$file"
 }
 
 cmd_check() {
   parse_flags "$@"
-  require_project
   local file
   if [ -n "$ARG_TAG" ]; then
-    file="$(grant_file "$ARG_TAG" "$ARG_PROJECT")"
+    file="$(grant_file "$ARG_TAG")"
     if grant_is_valid "$file"; then cat "$file"; return 0; fi
-    echo "No valid grant for '${ARG_PROJECT}' (tag '${ARG_TAG}')." >&2
+    echo "No valid sweep grant for tag '${ARG_TAG}'." >&2
     return 1
   fi
-  # No tag: accept a valid grant for this project under any tag. Use nullglob
-  # with a fully-quoted directory so a data-dir path containing spaces is safe.
+  # No tag: accept any valid sweep grant. This is the hook's question — "is some
+  # sweep currently authorized?" — since the hook sees only the command, not the
+  # tag. Use nullglob with a fully-quoted directory so a data-dir path containing
+  # spaces is safe.
   local d f
   d="$(grants_dir)"
   shopt -s nullglob
-  for f in "$d"/*__"$(sanitize "$ARG_PROJECT")".json; do
+  for f in "$d"/sweep__*.json; do
     if grant_is_valid "$f"; then cat "$f"; shopt -u nullglob; return 0; fi
   done
   shopt -u nullglob
-  echo "No valid grant for '${ARG_PROJECT}' (any tag)." >&2
+  echo "No valid sweep grant (any tag)." >&2
   return 1
-}
-
-cmd_consume() {
-  parse_flags "$@"
-  require_tag; require_project
-  local file one_time
-  file="$(grant_file "$ARG_TAG" "$ARG_PROJECT")"
-  if ! grant_is_valid "$file"; then
-    echo "No valid grant to consume for '${ARG_PROJECT}' (tag '${ARG_TAG}')." >&2
-    return 1
-  fi
-  cat "$file"
-  one_time="$(jq -r '.one_time // true' "$file" 2>/dev/null || printf 'true')"
-  if [ "$one_time" = "true" ]; then
-    rm -f "$file"
-    echo "Consumed one-time grant for '${ARG_PROJECT}' (tag '${ARG_TAG}')." >&2
-  fi
-  return 0
 }
 
 cmd_revoke() {
   parse_flags "$@"
-  require_tag; require_project
+  require_tag
   local file
-  file="$(grant_file "$ARG_TAG" "$ARG_PROJECT")"
+  file="$(grant_file "$ARG_TAG")"
   if [ -f "$file" ]; then
     rm -f "$file"
-    echo "Revoked grant for '${ARG_PROJECT}' (tag '${ARG_TAG}')." >&2
+    echo "Revoked the '${ARG_TAG}' sweep grant." >&2
   else
-    echo "No grant to revoke for '${ARG_PROJECT}' (tag '${ARG_TAG}')." >&2
+    echo "No sweep grant to revoke for tag '${ARG_TAG}'." >&2
   fi
 }
 
@@ -257,12 +237,12 @@ cmd_list() {
   [ -d "$d" ] || { echo "No grants." >&2; return 0; }
   shopt -s nullglob
   local any=0
-  for f in "$d"/*.json; do
+  for f in "$d"/sweep__*.json; do
     any=1
     if grant_is_valid "$f"; then status="valid"; else status="expired"; fi
     # Grant files are user-writable state; skip a corrupt one with a warning
     # rather than letting jq's failure abort the listing under `set -e`.
-    jq -c --arg status "$status" '{tag, project, expires_at, one_time, status:$status}' "$f" 2>/dev/null \
+    jq -c --arg status "$status" '{tag, expires_at, status:$status}' "$f" 2>/dev/null \
       || echo "warning: skipping unreadable/corrupt grant file: $f" >&2
   done
   shopt -u nullglob
@@ -271,20 +251,19 @@ cmd_list() {
 
 cmd_path() {
   parse_flags "$@"
-  require_tag; require_project
-  grant_file "$ARG_TAG" "$ARG_PROJECT"
+  require_tag
+  grant_file "$ARG_TAG"
 }
 
 main() {
   local sub="${1:-}"
   [ "$#" -gt 0 ] && shift || true
   case "$sub" in
-    grant)   cmd_grant "$@" ;;
-    check)   cmd_check "$@" ;;
-    consume) cmd_consume "$@" ;;
-    revoke)  cmd_revoke "$@" ;;
-    list)    cmd_list "$@" ;;
-    path)    cmd_path "$@" ;;
+    grant)  cmd_grant "$@" ;;
+    check)  cmd_check "$@" ;;
+    revoke) cmd_revoke "$@" ;;
+    list)   cmd_list "$@" ;;
+    path)   cmd_path "$@" ;;
     ""|-h|--help|help) usage; [ "$sub" = "" ] && exit 2 || exit 0 ;;
     *) echo "Error: unknown subcommand '$sub'." >&2; usage; exit 2 ;;
   esac
