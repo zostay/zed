@@ -31,6 +31,7 @@ Before doing anything:
 
    - **Rebase remediation**: a custom rebase command/script the project uses in place of `@dependabot rebase` (e.g., because Dependabot's built-in rebase is too naive for the project's module layout).
    - **Failure remediation**: guidance describing failure modes that Dependabot PRs commonly hit in this project and a prescribed automatic fix for each — for example, "if tests fail in subproject go.mod files, run script X" or "if a `setup-go` version mismatch shows up in CI, run script Y." A remediation only qualifies as **automatic** if it is a single command/script/comment the project prescribes; open-ended debugging does not count.
+   - **Lockfile/install command**: the project's lockfile-regeneration command per ecosystem (e.g. `go mod tidy`, `npm install`, `bundle install`, `pip install`). Record it now; Step 3 uses it to regenerate a lockfile when batch-merging causes a lockfile-only conflict, and Step 4 uses it after each vulnerability fix. If none is documented, fall back to the ecosystem's standard command.
 
    Record any such guidance; it will override the default behavior in the steps below.
 5. Initialize an internal **action log** (an in-memory list). Every action taken in the steps below gets appended here. The log is used for the changelog update and the final summary.
@@ -50,6 +51,8 @@ Parse the JSONL output. Each line is a JSON object with these fields:
 - `number` — PR number
 - `title` — PR title
 - `branch` — head branch name
+- `base` — the PR's target branch (Step 3 cuts the sweep branch from this)
+- `ecosystem` — Dependabot package-ecosystem parsed from the branch (`go_modules`, `npm_and_yarn`, `github_actions`, …) or `null` for a non-standard branch
 - `mergeable` — merge state: `MERGEABLE`, `CONFLICTING`, or `UNKNOWN`
 - `checks_pass` — boolean or null; `true` only when every check concluded acceptably — `SUCCESS`, `NEUTRAL`, or intentionally `SKIPPED` (so an `if:`-gated job like "Build Summary" no longer makes a genuinely-ready PR look blocked); `false` when a check actually **failed** or has not finished yet; `null` if check info is unavailable (token lacks `checks:read` permission)
 - `review_decision` — review decision (may be empty if no reviews required)
@@ -90,8 +93,14 @@ re-conflicts the remaining open PRs and forces a `@dependabot rebase` + full CI
 wait before the next can go in. That conflict cascade was the dominant wall-clock
 cost of past sweeps. Instead, **combine the ready PRs onto the sweep branch**, so
 all their changes land together, run CI once (in Step 7), and merge once (in the
-single sweep PR). Each `base` field is the PR's target branch; ready Dependabot
-PRs share it in normal repos.
+single sweep PR).
+
+The sweep branch can only carry PRs that share a `base`. Ready Dependabot PRs
+share one base in normal repos, but if they target more than one (e.g. some target
+a release branch via Dependabot's `target-branch` config), batch only the PRs
+sharing a single base this run — use the most common base (normally the repository
+default branch) and leave PRs targeting other bases for a later run. From here on,
+`<base>` is that one shared base, and Steps 4–6 use the **same** `<base>`.
 
 Create the sweep branch from the up-to-date base (this is the **same** branch the
 vulnerability fixes and changelog will be committed to in Steps 4–5):
@@ -103,23 +112,23 @@ git checkout -b chore/dependabot-sweep-YYYY-MM-DD origin/<base>
 
 Use today's date. If the branch name is taken, append a counter (`-2`, `-3`, …).
 
-Then, for **each** ready PR (oldest first), fold its head branch in:
+Then, for **each** ready PR on `<base>` (oldest first), fold its head branch in:
 
 ```bash
 git fetch origin <branch>
 git merge --no-edit FETCH_HEAD
 ```
 
-Handle the result:
+Handle the result (on a conflict, list the conflicted paths with
+`git diff --name-only --diff-filter=U` to classify it):
 
 - **Clean merge** — keep it. Log the PR as batch-merged.
-- **Conflict only in generated lockfiles** (`go.sum`, `package-lock.json`,
-  `yarn.lock`, `Cargo.lock`, `Gemfile.lock`, `poetry.lock`, …) **while the
-  manifest merged cleanly** — resolve by regenerating the lockfile: run the
-  project's lock/install command for that ecosystem (the same command Step 4 uses,
-  e.g. `go mod tidy`, `npm install`, `bundle install`), `git add` the regenerated
-  lockfile, and `git commit --no-edit` to complete the merge. Log it as
-  batch-merged.
+- **Conflict only in generated lockfiles** (every conflicted path is a lockfile —
+  `go.sum`, `package-lock.json`, `yarn.lock`, `Cargo.lock`, `Gemfile.lock`,
+  `poetry.lock`, …) **while the manifest merged cleanly** — resolve by
+  regenerating the lockfile: run the project's lockfile/install command for that
+  ecosystem (recorded in Step 1), `git add` the regenerated lockfile, and
+  `git commit --no-edit` to complete the merge. Log it as batch-merged.
 - **Any other conflict** (a manifest conflict, or anything not resolvable by
   regenerating a lockfile) — **punt** it: `git merge --abort`, then leave the PR
   open and move on. A punt is a **silent skip**: do not comment, do not request a
@@ -127,14 +136,16 @@ Handle the result:
   are expected; punting and picking them up next sweep is the intended behavior.
   Log it as "punted (conflicting)" for the final summary only.
 
-If **zero** PRs batch-merged cleanly, the branch carries no dependency changes
-yet; keep it (Steps 4–5 may still add vulnerability fixes and a changelog), and if
-those steps add nothing either, Step 6 handles the empty branch.
+If **zero** PRs batch-merged cleanly, the branch so far carries no dependency
+changes; keep it (Steps 4–5 may still add vulnerability fixes and a changelog).
+Step 6 guards against pushing a commit-less branch, so an all-punted sweep with no
+vuln fixes ends cleanly rather than erroring on `gh pr create`.
 
 When the sweep PR merges in Step 7, each batched Dependabot PR's dependency
 reaches its target version on the base branch, so Dependabot auto-closes the
-superseded PRs. Listing them as `Closes #<number>` in the PR body (Step 6)
-reinforces this.
+superseded PRs on its next run. (GitHub's `Closes #<number>` keyword only
+auto-closes *issues*, not PRs, so the PR body's `Closes` lines just link the
+superseded PRs — the actual close is Dependabot's, not the keyword's.)
 
 ### 4. Fix vulnerability alerts (local changes)
 
@@ -170,18 +181,18 @@ Rank packages using these criteria in order:
 2. **Highest CVSS score** within that tier
 3. **Most alerts resolved** by fixing that package
 
-Use the sweep branch for the fixes. If Step 3 already created
-`chore/dependabot-sweep-YYYY-MM-DD` (ready PRs were batched), you are already on
-it — commit the fixes there. Otherwise create it now:
+Use the sweep branch for the fixes. If Step 3 already created the sweep branch
+(`chore/dependabot-sweep-YYYY-MM-DD` — whether or not any PR actually batched onto
+it), you are already on it; commit the fixes there. Otherwise create it now:
 
 ```bash
 git fetch origin
 git checkout -b chore/dependabot-sweep-YYYY-MM-DD origin/<base>
 ```
 
-Use today's date and the repository's default branch as `<base>`. If the branch
-name is already taken, append a counter (`-2`, `-3`, etc.) until you find an
-available name.
+Use today's date. `<base>` is the same shared base from Step 3 (the repository
+default branch when Step 3 was skipped). If the branch name is already taken,
+append a counter (`-2`, `-3`, etc.) until you find an available name.
 
 For each package, in priority order, up to a maximum of **10** packages:
 
@@ -239,19 +250,32 @@ docs: update changelog for dependabot sweep YYYY-MM-DD
 
 If you are still on the original branch (no local changes were made, no sweep branch was created), skip to Step 7.
 
-Push the sweep branch:
+You may be on a sweep branch that ended up **empty** — every ready PR punted in Step 3 and Steps 4–5 added nothing. Check before pushing:
+
+```bash
+git rev-list --count origin/<base>..HEAD
+```
+
+If the count is `0`, the branch has no commits to push. Delete it, return to the original branch, and skip to Step 7 (there is nothing to merge):
+
+```bash
+git checkout <original-branch>
+git branch -D chore/dependabot-sweep-YYYY-MM-DD
+```
+
+Otherwise push the sweep branch:
 
 ```bash
 git push -u origin HEAD
 ```
 
-Create a PR:
+Create a PR against the same base the branch was cut from:
 
 ```bash
-gh pr create --title "chore(deps): dependabot sweep YYYY-MM-DD" --body "<structured body>"
+gh pr create --base <base> --title "chore(deps): dependabot sweep YYYY-MM-DD" --body "<structured body>"
 ```
 
-The PR body should list all actions taken, organized by category (rebases requested, PRs batch-merged, vulnerabilities fixed, vulnerabilities skipped, PRs punted as conflicting). Use the action log to populate this. List each batch-merged Dependabot PR as `Closes #<number>` so it is linked to this PR and closed when the sweep PR merges.
+The PR body should list all actions taken, organized by category (rebases requested, PRs batch-merged, vulnerabilities fixed, vulnerabilities skipped, PRs punted as conflicting). Use the action log to populate this. List each batch-merged Dependabot PR as `Closes #<number>` so it is linked to this PR; the superseded PR is closed by Dependabot (which detects the bumped version on `<base>`), not by the keyword — see Step 3.
 
 Record the PR number (capture it from the `gh pr create` output, or read it with `gh pr view <branch> --json number`). You will need it in Step 7.
 
@@ -282,12 +306,12 @@ Handle the outcome:
 
 1. **No checks reported** — the PR has no CI / status checks (`gh pr checks` reports "no checks reported on the ..." and exits). There are no tests to wait for; proceed to merge.
 2. **All checks pass** — the command exits 0. Proceed to merge.
-3. **Checks failed or timed out** — the command exits non-zero (a failing check, or `gtimeout` exit 124). Do **not** merge. Run `gh pr checks <number>` to capture which checks failed or are still pending, log it, and leave the PR open for the developer to address. Skip to Step 8.
+3. **Checks failed or timed out** — the command exits non-zero (a failing check, or `gtimeout` exit 124). Do **not** merge. Run `gh pr checks <number>` to capture which checks failed or are still pending, log it, and leave the PR open for the developer to address. Skip to Step 8. (Batching trades the old per-PR partial-merge for one CI run: if the combined PR fails, none of the batched bumps land this run. That is the intended cost — the developer can split the failing branch or rerun next sweep; do not fall back to merging the PRs individually.)
 
-To merge (cases 1 and 2), use the repository's default merge method:
+To merge (cases 1 and 2), merge the sweep PR with a merge commit and delete its branch:
 
 ```bash
-gh pr merge <number> --merge
+gh pr merge <number> --merge --delete-branch
 ```
 
 Log the merge result. If the merge fails — for example, branch protection requires a human review or additional approvals — log the error and leave the PR open. Do **not** retry with `--admin` or any flag that bypasses branch protection rules or rulesets.
@@ -301,7 +325,8 @@ Record the outcome of this step (merged, left open due to failing checks, or mer
 
 ### 8. Return and report
 
-Return to the original branch:
+Return to the original branch (a successful merge with `--delete-branch` already
+left the sweep branch behind; this is still a safe no-op if so):
 
 ```bash
 git checkout <original-branch>

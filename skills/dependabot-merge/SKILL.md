@@ -79,26 +79,37 @@ If no PRs are ready to merge, tell the user there are no Dependabot PRs ready to
 merge right now (mention how many open PRs there are and why they aren't ready —
 conflicts, pending/failing checks, etc.) and stop.
 
+**Group by target branch.** The integration branch can only carry PRs that share
+a `base`. Ready Dependabot PRs share one base in normal repos, but if they do not
+(e.g. some target a release branch via Dependabot's `target-branch` config),
+batch only the PRs sharing a single base this run — process the most common base
+(normally the repository default branch) and leave PRs targeting other bases for
+a separate run, so no bump lands on the wrong branch. From here on, `<base>` is
+that one shared base.
+
 ### 4. Choose a path by count
 
-- **Exactly one** ready PR — there is nothing to batch. Merge it directly and
-  skip to Step 7:
+Among the ready PRs that share `<base>`:
+
+- **Exactly one** ready PR — there is nothing to batch. First tell the user which
+  PR you are going to merge (number, title, URL, and that it has no conflicts and
+  passing/unknown checks), then merge it directly and skip to Step 7:
 
   ```bash
-  gh pr merge <number> --merge          # add --auto if its checks_pass was null
+  gh pr merge <number> --merge --delete-branch   # add --auto if its checks_pass was null
   ```
 
 - **Two or more** ready PRs — batch them (Step 5). The integration branch
-  combines all ready PRs by default. You may instead split the batch **per
-  `ecosystem`** (one integration branch/PR per ecosystem) when that better
-  isolates a project's CI or when cross-ecosystem changes would otherwise land
-  together — but a single combined branch is the default and the bigger
-  wall-clock win (one CI run total).
+  combines all ready PRs on `<base>` by default. You may instead split the batch
+  **per `ecosystem`** — repeat Steps 5–6 once for each ecosystem group, each
+  producing its own integration branch/PR — when that better isolates a project's
+  CI; but a single combined branch is the default and the bigger wall-clock win
+  (one CI run total).
 
 ### 5. Build the integration branch
 
-All ready PRs share the same `base` in normal repos. Create an integration branch
-from the up-to-date base:
+Create the integration branch for `<base>` (the shared base from Step 3) from the
+up-to-date base:
 
 ```bash
 git fetch origin
@@ -108,20 +119,22 @@ git checkout -b chore/dependabot-merge-YYYY-MM-DD origin/<base>
 Use today's date. If the branch name is already taken, append a counter (`-2`,
 `-3`, …) until you find an available name.
 
-Then, for **each** ready PR (oldest first — the list is sorted oldest-first),
-fold its head branch into the integration branch:
+Then, for **each** ready PR on `<base>` (oldest first — the list is sorted
+oldest-first), fold its head branch into the integration branch:
 
 ```bash
 git fetch origin <branch>
 git merge --no-edit FETCH_HEAD
 ```
 
-Handle the result:
+Handle the result (on a conflict, list the conflicted paths with
+`git diff --name-only --diff-filter=U` to classify it):
 
 - **Clean merge** — keep it. Record the PR as batched and continue.
-- **Conflict only in generated lockfiles** (e.g. `go.sum`, `package-lock.json`,
-  `yarn.lock`, `Cargo.lock`, `Gemfile.lock`, `poetry.lock`) **while the manifest
-  merged cleanly** — resolve by regenerating the lockfile rather than punting:
+- **Conflict only in generated lockfiles** (every conflicted path is a lockfile —
+  `go.sum`, `package-lock.json`, `yarn.lock`, `Cargo.lock`, `Gemfile.lock`,
+  `poetry.lock`) **while the manifest merged cleanly** — resolve by regenerating
+  the lockfile rather than punting:
   run the project's lock/install command for that ecosystem (from Step 1),
   `git add` the regenerated lockfile, and `git commit --no-edit` to complete the
   merge. Record the PR as batched.
@@ -141,9 +154,9 @@ After folding all ready PRs, count how many were batched:
   (`git checkout <original-branch>` then `git branch -D <integration-branch>`),
   report that no PRs could be cleanly batched this run, and skip to Step 8.
 - **Exactly one batched** — the integration branch adds no value over merging
-  that PR directly. Delete it as above and merge the single batched PR with
-  `gh pr merge <number> --merge` (add `--auto` if its `checks_pass` was null),
-  then skip to Step 7.
+  that PR directly. Delete it as above, announce the PR to the user, and merge it
+  with `gh pr merge <number> --merge --delete-branch` (add `--auto` if its
+  `checks_pass` was null), then skip to Step 7.
 - **Two or more batched** — continue to Step 6.
 
 ### 6. Push, open a PR, wait for checks, and merge
@@ -156,6 +169,11 @@ gh pr create --base <base> \
   --title "chore(deps): batch merge N Dependabot PRs (YYYY-MM-DD)" \
   --body "<structured body>"
 ```
+
+**Record the new PR's number** from the `gh pr create` output (or read it with
+`gh pr view --json number --jq .number` while still on the branch) — the
+`<number>` in the watch/merge commands below is this integration PR, **not** the
+batched Dependabot PR numbers used in Steps 3–5.
 
 The body should list every batched PR as `- Closes #<number>: <title>` (use
 `Closes` so the superseded Dependabot PRs are linked; Dependabot also
@@ -186,10 +204,10 @@ not-green. Handle the outcome:
    or is pending, leave the integration PR open for the developer, and skip to
    Step 8.
 
-To merge (cases 1 and 2):
+To merge (cases 1 and 2), merge the integration PR and delete its branch:
 
 ```bash
-gh pr merge <number> --merge
+gh pr merge <number> --merge --delete-branch
 ```
 
 If the merge fails due to branch protection rules, rulesets, or any other policy,
@@ -202,20 +220,25 @@ only the direct single-PR merge paths.
 ### 7. (single-PR paths) Confirm the merge
 
 For the direct-merge paths (Step 4 one-PR case, or Step 5 one-batched case),
-report the merge result. If the merge fails due to branch protection or any other
-policy, report the error and **stop**. Do **not** retry with `--admin`.
+report the result. If you used `--auto` (checks were unknown), the merge is queued
+to land once checks pass — say "auto-merge enabled," not "merged." If the merge
+fails due to branch protection or any other policy, report the error. Either way,
+continue to Step 8. Do **not** retry with `--admin`.
 
 ### 8. Return and report
 
-Return to the original branch:
+Return to the original branch (the integration branch, if any, was already deleted
+in Steps 5–6):
 
 ```bash
 git checkout <original-branch>
 ```
 
-Report:
+If a left-open integration branch remains (Step 6 case 3, checks failed), leave it
+for the developer. Then report:
 
 - Which PRs were merged (directly or via the integration PR), with numbers/titles
+  — note any that are auto-merge-queued rather than already merged
 - The integration PR URL, if one was created, and whether it merged or was left
   open (and why — failing checks, merge blocked)
 - Which PRs were punted as conflicting (so the developer knows they remain open)
