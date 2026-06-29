@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.8.0 — 2026-06-29
+
+### Changed
+
+- `maintenance`: **assume elevated permission for the whole sweep.** Authorization
+  is now granted **once, up front, for the entire run** instead of per privileged
+  project. This retires the per-project `requiresAuthorization` opt-in gate and the
+  per-(tag, project) grant + TTL + one-time-consume machinery, which were fragile:
+  on a long serial sweep an up-front grant could expire before the run reached the
+  last privileged project, silently skipping it (run #6). A deliberate trade-off —
+  less granular containment for a far simpler, more robust model.
+  - `maintenance-authorize.sh` now manages a **single whole-sweep grant per tag**
+    (`sweep__<tag>.json`). Subcommands reduced to `grant`/`check`/`revoke`/`list`/
+    `path`; `consume`, `--repeat`, `--one-time`, and `--project` are gone. The
+    default TTL is now 12h (a backstop — the run revokes its grant on completion),
+    so it comfortably outlasts a long serial sweep.
+  - The `PreToolUse` hook (`maintenance-authz.sh`) now lifts the permission block
+    for Bash calls while **any** valid whole-sweep grant exists, rather than keying
+    on the cwd project basename + a per-project grant. It still never denies.
+  - The orchestrator no longer runs a per-job authorization gate or skips projects
+    for lack of a grant: every discovered project is dispatched. It asks **once**
+    up front (interactive; default authorize), creates the whole-sweep grant, and
+    **revokes it when the run finishes**. Unattended runs pre-create the grant with
+    `maintenance-authorize.sh grant --tag <tag>`.
+  - Why most runs are unaffected: bare `gh pr merge`/`gh pr close` match their own
+    allow rules and run without the grant. The grant exists only for the remaining
+    case — an **un-allowlisted privileged command** like a project's `make deploy`.
+  - `maintenance-discover.sh` no longer reads or emits `requiresAuthorization` /
+    `requires_authorization`; the discovery JSONL drops that field.
+  - **On-disk format change (breaking).** Grant files moved from the per-(tag,
+    project) `<tag>__<project>.json` to a single per-tag `sweep__<tag>.json`.
+    Pre-0.8 grant files are simply ignored — they no longer authorize anything,
+    and `list`/`revoke` no longer surface them. If you have leftover ones, delete
+    `<data-dir>/grants/*__*.json` (the old format) by hand; nothing reads them now.
+  - Constraint preserved: no elevation via `--admin`, branch-protection bypass, or
+    dangerous allow-globs.
+
 ## 0.7.0 — 2026-06-28
 
 ### Changed
