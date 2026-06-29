@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.0 — 2026-06-28
+
+### Changed
+
+- `dependabot-merge` and `dependabot-sweep`: stop merging Dependabot PRs one at a
+  time. Merging interdependent PRs individually re-conflicts every remaining open
+  PR after each merge, forcing a `@dependabot rebase` + full CI wait per PR — an
+  O(N) conflict/rebase/CI cascade that dominated sweep wall-clock in multi-module
+  repos (gobert, arrest-go) and blew authorization-grant TTLs mid-run.
+  - `dependabot-merge` now **combines all ready PRs onto a single integration
+    branch** and merges once: one CI run, one merge. A lone ready PR still merges
+    directly; a PR that conflicts when folded in is **punted** (silent skip, left
+    open) rather than fought. Lockfile-only conflicts are resolved by regenerating
+    the lockfile, not punted.
+  - `dependabot-sweep` **folds the ready PRs into its own sweep branch**, so the
+    batched dependency bumps, the vulnerability fixes, and the changelog all ride
+    the single sweep PR through CI once and merge once. The old per-merge re-fetch
+    cascade in Step 3 is gone. Superseded Dependabot PRs auto-close when the sweep
+    PR merges.
+- `scripts/dependabot-prs.sh`: emit two new fields per PR — `base` (the target
+  branch to cut the integration branch from) and `ecosystem` (the Dependabot
+  package-ecosystem parsed from the branch name, e.g. `go_modules`,
+  `npm_and_yarn`), so a caller can group and batch ready PRs. (zostay/zed#16)
+
 ## 0.6.3 — 2026-06-24
 
 ### Fixed

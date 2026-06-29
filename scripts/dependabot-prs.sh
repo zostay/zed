@@ -4,7 +4,15 @@
 # Outputs one JSON object per line (JSONL), sorted by oldest first.
 #
 # Output fields:
-#   number, title, branch, mergeable, checks_pass, review_decision, url
+#   number, title, branch, base, ecosystem, mergeable, checks_pass,
+#   review_decision, url
+#
+# `base` is the PR's target branch (baseRefName) — the branch a batch
+# integration branch should be cut from. `ecosystem` is the Dependabot
+# package-ecosystem parsed from the branch name (dependabot/<ecosystem>/...,
+# e.g. go_modules, npm_and_yarn, github_actions, pip, bundler, docker) or null
+# when the branch does not follow that convention. Both let a caller group ready
+# PRs and batch-merge them onto one branch instead of one PR at a time.
 #
 # checks_pass is true/false when status check info is available, or null when
 # the token lacks checks:read permission (statusCheckRollup inaccessible). It is
@@ -34,7 +42,7 @@ repo=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null) || {
   exit 1
 }
 
-base_fields="number,title,headRefName,mergeable,reviewDecision,url"
+base_fields="number,title,headRefName,baseRefName,mergeable,reviewDecision,url"
 
 # Try fetching with statusCheckRollup (requires checks:read token permission).
 # If that fails, fall back to fetching without it.
@@ -68,6 +76,12 @@ if [ "$has_checks" = true ]; then
     number: .number,
     title: .title,
     branch: .headRefName,
+    base: .baseRefName,
+    ecosystem: (
+      if (.headRefName // "" | startswith("dependabot/"))
+      then (.headRefName | split("/")[1])
+      else null end
+    ),
     mergeable: .mergeable,
     checks_pass: (
       if (.statusCheckRollup | length) == 0 then
@@ -96,6 +110,12 @@ else
     number: .number,
     title: .title,
     branch: .headRefName,
+    base: .baseRefName,
+    ecosystem: (
+      if (.headRefName // "" | startswith("dependabot/"))
+      then (.headRefName | split("/")[1])
+      else null end
+    ),
     mergeable: .mergeable,
     checks_pass: null,
     review_decision: .reviewDecision,

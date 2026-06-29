@@ -45,11 +45,18 @@ Run a full Dependabot maintenance sweep in a single pass. This orchestrates the
 work of the other three skills:
 
 1. Requests rebases for all conflicting Dependabot PRs
-2. Merges all ready-to-merge Dependabot PRs
-3. Fixes up to 10 vulnerability alerts (highest severity first), creating a
-   branch with one commit per package
+2. Batch-merges every ready-to-merge Dependabot PR by folding their branches onto
+   a single sweep branch (instead of merging one PR at a time, which re-conflicts
+   the rest); PRs that cannot be combined cleanly are punted to the next sweep
+3. Fixes up to 10 vulnerability alerts (highest severity first) on that same
+   branch, one commit per package
 4. Updates the project changelog (if one exists)
-5. Pushes the branch and opens a PR with a summary of all actions
+5. Pushes the branch and opens **one** PR carrying the batched dependency bumps,
+   the vulnerability fixes, and the changelog, with a summary of all actions
+
+Because everything rides one PR, CI runs once and the whole sweep merges once —
+avoiding the conflict/rebase/CI cascade that merging Dependabot PRs individually
+triggers in multi-module repos.
 
 ```
 /zed:dependabot-sweep
@@ -223,8 +230,12 @@ push them to the PR branch, and report on what was done.
 
 ### `dependabot-merge`
 
-Merge the oldest open Dependabot PR that is ready (no conflicts, all checks
-passing) using the repository's default merge method.
+Batch-merge the open Dependabot PRs that are ready (no conflicts, all checks
+passing). When two or more are ready, it combines their branches onto a single
+integration branch and merges once — running CI a single time and avoiding the
+conflict cascade that merging interdependent PRs one at a time causes. A single
+ready PR is merged directly; any PR that cannot be combined cleanly is left open
+for next time.
 
 ```
 /zed:dependabot-merge
