@@ -29,6 +29,11 @@
     case — an **un-allowlisted privileged command** like a project's `make deploy`.
   - `maintenance-discover.sh` no longer reads or emits `requiresAuthorization` /
     `requires_authorization`; the discovery JSONL drops that field.
+  - **On-disk format change (breaking).** Grant files moved from the per-(tag,
+    project) `<tag>__<project>.json` to a single per-tag `sweep__<tag>.json`.
+    Pre-0.8 grant files are simply ignored — they no longer authorize anything,
+    and `list`/`revoke` no longer surface them. If you have leftover ones, delete
+    `<data-dir>/grants/*__*.json` (the old format) by hand; nothing reads them now.
   - Constraint preserved: no elevation via `--admin`, branch-protection bypass, or
     dangerous allow-globs.
 

@@ -273,16 +273,22 @@ one deliberate "yes" that carries any deploy through.
   Without it, `gh`-only work still runs; an un-allowlisted privileged command is
   reported as a followup.
 
-Record the grant outcome as a run event so the sweep history shows whether it ran
-elevated:
+Record the grant outcome as a run event so the sweep history reflects what
+actually happened — log the elevated case **only when you created a grant**, and
+log the un-elevated case otherwise (user declined, or unattended with no
+pre-created grant), so the history never claims it ran elevated when it didn't:
 ```bash
+# only if you created/confirmed a whole-sweep grant above:
 "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
   log --run "$RUN_ID" --level info --message "Sweep authorized for privileged commands (whole-run grant)."
+# otherwise (no grant in effect):
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+  log --run "$RUN_ID" --level info --message "Sweep not elevated; gh-only work runs, un-allowlisted privileged commands will be reported as followups."
 ```
 
 The grant is run-scoped: **revoke it when the run finishes** (Step 6) so it cannot
 carry over to a later sweep — the generous default TTL is only a backstop if the
-run dies before it can revoke.
+run dies before it can revoke (see **Authorization** for that orphan window).
 
 For each job, you (the orchestrator) own the job lifecycle in the DB, and the
 subagent does the project work and logs its own progress events.
@@ -434,12 +440,20 @@ rm -f "$RUN_SUMMARY_TMP"
 ```
 
 **Revoke the whole-sweep grant** if you created one at the start (Step 5), so the
-elevated authorization does not carry into a later sweep (the TTL is only a
-backstop). It's harmless if no grant was created:
+elevated authorization does not carry into a later sweep. It's harmless if no
+grant was created:
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" revoke --tag "<tag>" >/dev/null 2>&1 || true
 ```
+
+Revoke on **every** exit path, not just the clean one: do it even when the run
+ends `failed` or the orchestration itself breaks part-way (wrap the rest of the
+sweep so this still runs). A grant left behind by an aborted run keeps elevating
+Bash in every session until its TTL expires — the orphan window described under
+**Authorization**. The TTL is only the backstop for the case the orchestrator
+never reaches this line at all (a hard crash / killed session); revoking here is
+what keeps that window from ever opening in normal operation.
 
 - Use **`needs_followup`** whenever the run leaves any open followup ticket. The
   run is finished sweeping but awaits human action; it graduates to `completed`
@@ -565,6 +579,29 @@ still blocked inside its subagent, run that one project **inline in the
 orchestrator session** (the orchestrator `cd`s into `project_path` and invokes the
 `maintenance-<tag>` skill itself, logging to the same `job_id`) so the hook
 applies; ordinary jobs still go to subagents.
+
+**Blast radius and the orphan window (know the trade-off).** A valid grant is
+deliberately broad: while it exists the hook allows **any** Bash command in **any**
+session on the machine — not just the sweep's own — and it matches a grant under
+**any** tag, not only the running sweep's. That is the "less granular containment"
+the model accepts in exchange for simplicity. Two consequences to keep bounded:
+
+- **Orphan after an aborted run.** The run revokes its grant when it finishes
+  (Step 6), including on the `failed` path — that is the primary control, and it
+  keeps the window closed in normal operation. The TTL only matters if the
+  orchestrator never reaches that revoke at all (a hard crash / killed session);
+  then the grant lingers — and silently elevates later sessions — until it
+  expires (default 12h). The default is intentionally long so a grant can't expire
+  *mid-sweep* (the original run-#6 failure); if you want a tighter orphan bound on
+  an unattended schedule, pass a smaller `--ttl` that still comfortably outlasts
+  your slowest run. If a sweep ever ends abnormally, `maintenance-authorize.sh
+  list` shows any lingering grant and `revoke --tag <tag>` clears it.
+- **Cross-tag / concurrent grants.** Because the hook matches any tag, a still-valid
+  grant from a *different* tag keeps elevating during an unrelated run, and a run's
+  `revoke --tag <tag>` only clears its own tag — use `list`/`revoke` to clean a
+  stray one. Do **not** run two sweeps of the *same* tag concurrently: they share
+  one grant file, so whichever finishes first revokes it and de-authorizes the
+  other mid-run.
 
 ## Followups
 

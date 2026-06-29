@@ -211,7 +211,10 @@ cmd_check() {
   d="$(grants_dir)"
   shopt -s nullglob
   for f in "$d"/sweep__*.json; do
-    if grant_is_valid "$f"; then cat "$f"; shopt -u nullglob; return 0; fi
+    # Unset nullglob before `cat` so that, under `set -e`, a `cat` failure (e.g.
+    # the file vanished between the validity check and here) can't abort with the
+    # shell option still toggled on.
+    if grant_is_valid "$f"; then shopt -u nullglob; cat "$f"; return 0; fi
   done
   shopt -u nullglob
   echo "No valid sweep grant (any tag)." >&2
