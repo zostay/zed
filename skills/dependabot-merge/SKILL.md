@@ -243,10 +243,11 @@ For the direct-merge paths (Step 4 one-PR case, or Step 5 one-batched case),
 report the result. If you used `--auto` (checks were unknown and auto-merge is
 available), the merge is queued to land once checks pass — say "auto-merge
 enabled," not "merged." If the merge fails, **quote the actual error** rather than
-inferring a policy (see Step 6); a common cause is passing `--auto` on a repo where
-auto-merge is disabled — fall back to a plain
-`gh pr merge <number> --merge --delete-branch`. Continue to Step 8. Do **not**
-retry with `--admin`.
+inferring a policy (see Step 6), then leave the PR open — the merge command was
+already chosen to match the repo's auto-merge setting in Step 1, so a blind retry
+(plain merge, `--admin`, etc.) is not the answer; a missing required review or a
+pending required check needs the developer, not a different flag. Continue to
+Step 8. Do **not** retry with `--admin`.
 
 ### 8. Return and report
 
