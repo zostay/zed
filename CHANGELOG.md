@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.8.1 — 2026-07-06
+
+### Fixed
+
+- `dependabot-merge` / `dependabot-sweep`: **don't blindly reach for `gh pr merge
+  --auto`, and don't hallucinate a review policy when a merge is rejected.** On a
+  repo with `allow_auto_merge: false`, GitHub rejects `gh pr merge --auto` with
+  "Auto-merge is not allowed for this repository." Agents were pattern-matching
+  that error — and the skills' old "for example, branch protection requires a human
+  review" phrasing — into a fabricated diagnosis ("the author can't self-merge, a
+  human must review") when the real cause was just a disabled repo *setting*. Right
+  outcome (leave the PR open) but wrong, misleading diagnosis.
+  - `dependabot-merge` now detects `allow_auto_merge` in pre-flight (Step 1) and
+    gates every `--auto` on it: when auto-merge is disabled it falls back to a plain
+    `gh pr merge --merge`. The null-`checks_pass` merge paths (Steps 4–5) and the
+    ready-PR filter (Step 3) reference that gate.
+  - `dependabot-sweep` never actually ran `--auto` (it folds PRs onto the sweep
+    branch and plain-merges the sweep PR), but its "Checks unknown" categorization
+    and Step 7 failure note were the source of the misleading `--auto` intent and
+    the "human must review" example. Both are corrected.
+  - Both skills' merge-failure guidance now says to **quote the actual error** and
+    not infer a self-merge / human-review policy unless the error literally says so.
+
 ## 0.8.0 — 2026-06-29
 
 ### Changed

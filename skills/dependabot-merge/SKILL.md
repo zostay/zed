@@ -39,6 +39,20 @@ skill, or file a followup for it; normal Dependabot conflicts are expected.
    it; you will use it to regenerate a lockfile when batching causes a
    lockfile-only conflict. If none is documented, fall back to the ecosystem's
    standard command.
+5. Detect whether GitHub auto-merge is available on this repo — Steps 4–6 need it
+   for any PR whose `checks_pass` is `null`:
+
+   ```bash
+   gh api "repos/{owner}/{repo}" --jq '.allow_auto_merge'
+   ```
+
+   Record the result. `true` means `gh pr merge --auto` works; `false` means
+   auto-merge is **disabled for the repository** and you must use a plain
+   `gh pr merge --merge` instead — GitHub rejects `--auto` on such repos with the
+   error "Auto-merge is not allowed for this repository." That error is about a
+   repository *setting*, not a review or branch-protection policy. (If the command
+   fails or returns nothing — e.g. the token cannot read repo settings — treat
+   auto-merge as unavailable and use plain merges.)
 
 ### 2. Fetch open Dependabot PRs
 
@@ -70,8 +84,9 @@ Parse the JSONL output. Each line is a JSON object with these fields:
 A PR is **ready to merge** when both conditions are met:
 
 1. `mergeable` is `MERGEABLE`
-2. `checks_pass` is `true` OR `null` (when null, use `--auto` on the eventual
-   merge so GitHub enforces branch protection rules)
+2. `checks_pass` is `true` OR `null` (when null and repo auto-merge is available,
+   use `--auto` on the eventual merge so GitHub enforces required checks; when
+   auto-merge is disabled — see Step 1 — fall back to a plain merge)
 
 Filter the list to only ready-to-merge PRs.
 
@@ -96,7 +111,8 @@ Among the ready PRs that share `<base>`:
   passing/unknown checks), then merge it directly and skip to Step 7:
 
   ```bash
-  gh pr merge <number> --merge --delete-branch   # add --auto if its checks_pass was null
+  # add --auto only if its checks_pass was null AND repo auto-merge is available (Step 1)
+  gh pr merge <number> --merge --delete-branch
   ```
 
 - **Two or more** ready PRs — batch them (Step 5). The integration branch
@@ -155,8 +171,9 @@ After folding all ready PRs, count how many were batched:
   report that no PRs could be cleanly batched this run, and skip to Step 8.
 - **Exactly one batched** — the integration branch adds no value over merging
   that PR directly. Delete it as above, announce the PR to the user, and merge it
-  with `gh pr merge <number> --merge --delete-branch` (add `--auto` if its
-  `checks_pass` was null), then skip to Step 7.
+  with `gh pr merge <number> --merge --delete-branch` (add `--auto` only if its
+  `checks_pass` was null **and** repo auto-merge is available — see Step 1), then
+  skip to Step 7.
 - **Two or more batched** — continue to Step 6.
 
 ### 6. Push, open a PR, wait for checks, and merge
@@ -210,9 +227,12 @@ To merge (cases 1 and 2), merge the integration PR and delete its branch:
 gh pr merge <number> --merge --delete-branch
 ```
 
-If the merge fails due to branch protection rules, rulesets, or any other policy,
-report the error and leave the PR open. Do **not** retry with `--admin` or any
-flag that bypasses protections.
+If the merge fails, **quote the actual error message** rather than guessing a
+cause — a rejected merge can mean required status checks are still pending, a
+required review is missing, or (if you passed `--auto`) auto-merge is disabled on
+the repo. Do not report it as a self-merge or human-review requirement unless the
+error literally says so. Report the error, leave the PR open, and do **not** retry
+with `--admin` or any flag that bypasses protections.
 
 Whether the integration PR merged or was left open, skip to Step 8 — Step 7 covers
 only the direct single-PR merge paths.
@@ -220,10 +240,13 @@ only the direct single-PR merge paths.
 ### 7. (single-PR paths) Confirm the merge
 
 For the direct-merge paths (Step 4 one-PR case, or Step 5 one-batched case),
-report the result. If you used `--auto` (checks were unknown), the merge is queued
-to land once checks pass — say "auto-merge enabled," not "merged." If the merge
-fails due to branch protection or any other policy, report the error. Either way,
-continue to Step 8. Do **not** retry with `--admin`.
+report the result. If you used `--auto` (checks were unknown and auto-merge is
+available), the merge is queued to land once checks pass — say "auto-merge
+enabled," not "merged." If the merge fails, **quote the actual error** rather than
+inferring a policy (see Step 6); a common cause is passing `--auto` on a repo where
+auto-merge is disabled — fall back to a plain
+`gh pr merge <number> --merge --delete-branch`. Continue to Step 8. Do **not**
+retry with `--admin`.
 
 ### 8. Return and report
 

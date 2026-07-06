@@ -63,7 +63,7 @@ Categorize every PR into one of four groups:
 1. **Conflicting** — `mergeable` is `CONFLICTING`
 2. **Failing checks** — `checks_pass` is `false` AND `mergeable` is NOT `CONFLICTING`
 3. **Ready to merge** — `mergeable` is `MERGEABLE` AND `checks_pass` is `true`
-4. **Checks unknown** — `checks_pass` is `null` AND `mergeable` is `MERGEABLE` (treat as ready to merge with `--auto`, which lets GitHub enforce branch protection rules)
+4. **Checks unknown** — `checks_pass` is `null` AND `mergeable` is `MERGEABLE` (treat as ready to merge: it is folded onto the sweep branch in Step 3 exactly like a ready PR, and the sweep PR's own CI run in Step 7 re-validates the combined changes before it merges — this path does **not** merge the PR directly, so it never uses `--auto`)
 
 For **every** conflicting PR, request a rebase. If Step 1 found project-specific rebase guidance (e.g., a custom rebase script), follow that guidance instead of the default `@dependabot rebase` comment — invoke the project's script or process for each conflicting PR exactly as the project's configuration prescribes. Otherwise, use the default:
 
@@ -308,13 +308,24 @@ Handle the outcome:
 2. **All checks pass** — the command exits 0. Proceed to merge.
 3. **Checks failed or timed out** — the command exits non-zero (a failing check, or `gtimeout` exit 124). Do **not** merge. Run `gh pr checks <number>` to capture which checks failed or are still pending, log it, and leave the PR open for the developer to address. Skip to Step 8. (Batching trades the old per-PR partial-merge for one CI run: if the combined PR fails, none of the batched bumps land this run. That is the intended cost — the developer can split the failing branch or rerun next sweep; do not fall back to merging the PRs individually.)
 
-To merge (cases 1 and 2), merge the sweep PR with a merge commit and delete its branch:
+To merge (cases 1 and 2), merge the sweep PR with a merge commit and delete its
+branch. The checks were already awaited above, so a plain merge is correct — do
+**not** add `--auto` (it requires the repo setting `allow_auto_merge`, and on repos
+where that is disabled GitHub rejects the command with "Auto-merge is not allowed
+for this repository"):
 
 ```bash
 gh pr merge <number> --merge --delete-branch
 ```
 
-Log the merge result. If the merge fails — for example, branch protection requires a human review or additional approvals — log the error and leave the PR open. Do **not** retry with `--admin` or any flag that bypasses branch protection rules or rulesets.
+Log the merge result. If the merge fails, **quote the actual error message** in the
+log and final report rather than inferring a cause — a rejected merge can mean
+required status checks are still pending or a required review is missing, and each
+needs a different response. In particular, do **not** report it as "a human must
+review" or "the author cannot self-merge" unless the error literally says so; an
+"auto-merge is not allowed" error is about a repository *setting*, not a review
+policy. Leave the PR open. Do **not** retry with `--admin` or any flag that
+bypasses branch protection rules or rulesets.
 
 When the sweep PR merges, the Dependabot PRs batched in Step 3 are superseded —
 Dependabot auto-closes each one once its dependency reaches the target version on
