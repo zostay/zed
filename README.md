@@ -195,6 +195,21 @@ flips that run from **Needs Followup** to **Completed**.
 With no `comment`, the skill writes a one-sentence summary of what happened toward
 the ticket from the current session's context.
 
+### `maint-followup-do`
+
+Examine a followup ticket and **actually move it forward**. Where `maint-followup`
+only records a decision you've already made, this skill investigates the ticket,
+then either completes the outstanding work in the current session — verifying the
+change — or explains a concrete path forward when it can't. It records progress on
+the ticket automatically and asks before closing it.
+
+```
+/zed:maint-followup-do <ticket-number>
+```
+
+Operates only on the current repository; if the ticket belongs to another project,
+it reports the mismatch and stops.
+
 ### `dependabot-fix`
 
 Fix the highest-priority open Dependabot vulnerability alert. Analyzes all open

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.0 — 2026-07-14
+
+### Added
+
+- `maint-followup-do`: a new skill that **works** a maintenance followup ticket,
+  rather than just recording a decision about it. Given a ticket number, it loads
+  the ticket (`get-followup`), confirms the current repository is the ticket's
+  project (and stops if not — it never switches projects), investigates what the
+  ticket actually needs against the live repo, then **either completes the work in
+  this session** — verifying the change — **or produces a concrete path forward**
+  when it can't. It records progress on the ticket automatically (`update`) and
+  asks before any `done`/`nope` that would close the ticket. It is the worker
+  counterpart to `maint-followup` (the recorder) and reuses the same
+  `maintenance-db.sh update-followup` mechanism.
+
 ## 0.8.1 — 2026-07-06
 
 ### Fixed
