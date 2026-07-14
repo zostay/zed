@@ -61,11 +61,18 @@ tickets from the same run:
 
 ### 2. Confirm you are in the right repository
 
-The ticket's `project_name` identifies the repository the work belongs to. This
-skill **only operates on the current repository** — it does not switch projects.
+The ticket's `project_name` identifies the repository the work belongs to. It is
+recorded as the **basename of the project directory** the sweep discovered (see
+`scripts/maintenance-discover.sh`), so compare against the current repo's directory
+basename — **not** its `origin` remote, which can differ from the directory name and
+cause a false mismatch:
 
-Determine the current repo (e.g. `basename "$(git rev-parse --show-toplevel)"`, or
-the `origin` remote). If it does **not** match the ticket's `project_name`:
+```bash
+[ "$(basename "$(git rev-parse --show-toplevel)")" = "<project_name>" ]
+```
+
+If the current repo's directory basename does **not** match the ticket's
+`project_name`:
 
 - Tell the user the ticket belongs to `<project_name>` but this session is in
   `<current repo>`, and **stop**.
