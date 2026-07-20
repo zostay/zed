@@ -44,6 +44,7 @@
     detail: null,
     events: [],               // ordered, deduped event store for the selected run
     seenEventIds: {},
+    maxEventId: 0,             // cached max event id (avoid rescanning events[])
     mountedEventsEl: null,     // which <ol> the live events are currently rendered into
     es: null,
     pollTimer: null,
@@ -285,6 +286,7 @@
     state.detail = null;
     state.events = [];
     state.seenEventIds = {};
+    state.maxEventId = 0;
     state.mountedEventsEl = null;
     state.prevStatus = null;
     state.expanded = {};
@@ -409,13 +411,12 @@
       if (state.seenEventIds[ev.id]) return;
       state.seenEventIds[ev.id] = 1;
       state.events.push(ev);
+      if (ev.id > state.maxEventId) state.maxEventId = ev.id;
     });
   }
-  function lastEventId() {
-    var n = 0;
-    for (var i = 0; i < state.events.length; i++) if (state.events[i].id > n) n = state.events[i].id;
-    return n;
-  }
+  // Cached — updated as events are ingested — so the SSE-connect and polling
+  // paths don't rescan the whole event array each tick.
+  function lastEventId() { return state.maxEventId; }
 
   // =========================================================================
   // View dispatch
@@ -904,11 +905,20 @@
     requestAnimationFrame(function () {
       var node = byId("ticket-" + fid);
       if (!node || !node.scrollIntoView) return;
-      node.scrollIntoView({ behavior: "smooth", block: "center" });
-      node.style.transition = "box-shadow 0.4s";
+      // Honor prefers-reduced-motion: JS-driven smooth scroll isn't covered by
+      // the CSS media guard, so jump instantly for those users. (The highlight's
+      // transition is neutralized by the reduced-motion CSS rule.)
+      var reduce = reducedMotion();
+      node.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "center" });
+      if (!reduce) node.style.transition = "box-shadow 0.4s";
       node.style.boxShadow = "0 0 0 2px rgba(192,132,252,0.5)";
       setTimeout(function () { node.style.boxShadow = ""; }, 1400);
     });
+  }
+
+  function reducedMotion() {
+    return !!(window.matchMedia &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   }
 
   function countOpen(fups) {
@@ -1060,7 +1070,10 @@
   }
   function inline(text) {
     var s = escHtml(text), codes = [];
-    s = s.replace(/`([^`]+)`/g, function (_, c) { codes.push(c); return " CODE" + (codes.length - 1) + " "; });
+    // Protect inline code with a private-use sentinel (U+F8FF) that cannot occur
+    // in normal text, so restoration can't be triggered by user content and no
+    // stray whitespace is injected around the code span.
+    s = s.replace(/`([^`]+)`/g, function (_, c) { codes.push(c); return "" + (codes.length - 1) + ""; });
     s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
     s = s.replace(/(^|[^_])_([^_\n]+)_/g, "$1<em>$2</em>");
@@ -1069,7 +1082,7 @@
       var safeUrl = url.replace(/"/g, "%22").replace(/'/g, "%27");
       return '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' + txt + '</a>';
     });
-    s = s.replace(/ CODE(\d+) /g, function (_, n) { return "<code>" + codes[+n] + "</code>"; });
+    s = s.replace(/(\d+)/g, function (_, n) { return "<code>" + codes[+n] + "</code>"; });
     return s;
   }
   // Escapes for both text and attribute contexts: quotes are encoded too, so
