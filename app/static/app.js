@@ -1,43 +1,60 @@
 /* ===========================================================================
    maintenance · observability deck — client
    Vanilla JS, no build step, no external network calls.
-   - Polls /api/runs for the sidebar.
-   - Streams the selected run via SSE (/api/stream/<id>) with a polling
-     fallback (/api/runs/<id> + /events) when SSE drops or errors.
-   - Renders a tiny inline Markdown subset for run + job summaries.
+
+   Layout is status-driven. One run-view container, two faces:
+     - run.status === "running"  → LIVE FOCUS  (current work + activity on top)
+     - otherwise                 → DEBRIEF     (stoplight + promoted followups)
+   A tiny hash router adds a separate followups page:
+     #/run/:id                   → the run (auto-face)
+     #/run/:id/followups         → full followup detail
+     #/run/:id/followup/:fid     → deep-link to one ticket
    =========================================================================== */
 (function () {
   "use strict";
 
   // ---- constants ----------------------------------------------------------
   var STAGES = [
-    { id: "starting",       label: "starting",       tag: "01" },
-    { id: "reading-config", label: "reading config", tag: "02" },
-    { id: "discovering",    label: "discovering",    tag: "03" },
-    { id: "executing",      label: "executing",      tag: "04" },
-    { id: "summarizing",    label: "summarizing",    tag: "05" },
-    { id: "done",           label: "done",           tag: "06" }
+    { id: "starting",       label: "start",   },
+    { id: "reading-config", label: "config",  },
+    { id: "discovering",    label: "discover" },
+    { id: "executing",      label: "execute"  },
+    { id: "summarizing",    label: "summary"  },
+    { id: "done",           label: "done"     }
   ];
-  var COUNT_KEYS = ["total", "pending", "running", "success", "followup", "failure", "skipped"];
-  // Terminal = the stream can close. 'needs_followup' is deliberately NOT terminal:
-  // the run is done sweeping but has open tickets, so we keep streaming to reflect
-  // tickets being resolved live until the run graduates to 'completed'.
+  // Terminal = the stream can close. 'needs_followup' is deliberately NOT
+  // terminal: the sweep is done but tickets remain, so we keep streaming to
+  // reflect tickets resolving live until the run graduates to 'completed'.
   var TERMINAL = { completed: 1, failed: 1, cancelled: 1 };
   var LEVEL_GLYPH = { info: "›", warn: "▲", error: "✕", success: "✓" };
+  var CHIP_GLYPH = {
+    success: "✓", skipped: "–", failure: "✕",
+    followup: "…", running: "⟳", pending: "○"
+  };
   var TICKET_STATUS_LABEL = { open: "open", done: "done", wontdo: "won't do" };
+  var ACTION_LABEL = { opened: "opened", update: "update", done: "done", nope: "won't do" };
+  // status → queue sort priority (what's left surfaces first)
+  var STATUS_PRIORITY = { running: 0, pending: 1, followup: 2, failure: 3, success: 4, skipped: 5 };
 
   // ---- state --------------------------------------------------------------
   var state = {
     runs: [],
+    route: { view: "run", runId: null, fid: null },
     selectedId: null,
-    detail: null,             // { run, jobs, counts }
-    jobsById: {},             // id -> last rendered job
-    lastEventId: 0,
+    detail: null,
+    events: [],               // ordered, deduped event store for the selected run
     seenEventIds: {},
-    es: null,                 // EventSource
+    maxEventId: 0,             // cached max event id (avoid rescanning events[])
+    mountedEventsEl: null,     // which <ol> the live events are currently rendered into
+    es: null,
     pollTimer: null,
     runsTimer: null,
-    expanded: {}              // job id -> bool (summary expanded)
+    prevStatus: null,         // for the running -> done reveal
+    expanded: {},             // result id -> summary expanded
+    foldOpen: false,          // debrief: clean-projects fold
+    logOpen: false,           // debrief: activity log
+    scrolledFid: null,        // followups page: ticket we've already auto-scrolled to
+    fpSig: null               // followups page: signature of last-rendered list
   };
 
   // ---- dom ----------------------------------------------------------------
@@ -47,21 +64,44 @@
     runsEmpty: byId("runs-empty"),
     emptyState: byId("empty-state"),
     runView: byId("run-view"),
+    followupsPage: byId("followups-page"),
+    // header
     rvTag: byId("rv-tag"),
-    rvMeta: byId("rv-meta"),
     rvStatus: byId("rv-status"),
+    rvMeta: byId("rv-meta"),
     rvTime: byId("rv-time"),
-    stepper: byId("stepper"),
-    counts: byId("counts"),
-    followupsSection: byId("followups-section"),
-    followupsHint: byId("followups-hint"),
-    followupsBody: byId("followups-body"),
-    followupsFoot: byId("followups-foot"),
-    jobs: byId("jobs"),
-    jobsHint: byId("jobs-hint"),
-    summary: byId("summary"),
+    stageRail: byId("stage-rail"),
+    // live face
+    prFill: byId("pr-fill"),
+    prStats: byId("pr-stats"),
+    now: byId("now"),
+    nowHint: byId("now-hint"),
+    queue: byId("queue"),
+    queueHint: byId("queue-hint"),
     events: byId("events"),
     eventsHint: byId("events-hint"),
+    followupStrip: byId("followup-strip"),
+    fsLabel: byId("fs-label"),
+    // debrief face
+    stoplight: byId("stoplight"),
+    dbFollowups: byId("db-followups"),
+    dbFollowupsLink: byId("db-followups-link"),
+    dbFollowupsBody: byId("db-followups-body"),
+    dbFollowupsFoot: byId("db-followups-foot"),
+    summary: byId("summary"),
+    results: byId("results"),
+    resultsHint: byId("results-hint"),
+    logToggle: byId("log-toggle"),
+    logCount: byId("log-count"),
+    eventsDebrief: byId("events-debrief"),
+    // followups page
+    fpBack: byId("fp-back"),
+    fpTitle: byId("fp-title"),
+    fpSub: byId("fp-sub"),
+    fpRunStatus: byId("fp-runstatus"),
+    fpList: byId("fp-list"),
+    fpHelp: byId("fp-help"),
+    // chrome
     conn: byId("conn"),
     clock: byId("clock")
   };
@@ -71,11 +111,65 @@
   // =========================================================================
   // Boot
   // =========================================================================
-  buildStepper();
-  buildCounts();
+  buildStageRail();
   startClock();
+  wireStaticHandlers();
+  window.addEventListener("hashchange", onRoute);
   refreshRuns(true);
   state.runsTimer = setInterval(refreshRuns, 4000);
+
+  function wireStaticHandlers() {
+    el.logToggle.addEventListener("click", function () {
+      state.logOpen = !state.logOpen;
+      el.logToggle.setAttribute("aria-expanded", state.logOpen ? "true" : "false");
+      el.eventsDebrief.hidden = !state.logOpen;
+      if (state.logOpen) mountEvents(el.eventsDebrief, false);
+      else if (state.mountedEventsEl === el.eventsDebrief) state.mountedEventsEl = null;
+    });
+  }
+
+  // =========================================================================
+  // Router
+  // =========================================================================
+  function parseHash() {
+    var h = (location.hash || "").replace(/^#\/?/, "");
+    var parts = h.split("/").filter(Boolean);   // e.g. ["run","4","followups"]
+    if (parts[0] === "run" && parts[1]) {
+      var runId = parseInt(parts[1], 10);
+      if (parts[2] === "followups") return { view: "followups", runId: runId, fid: null };
+      if (parts[2] === "followup" && parts[3]) {
+        return { view: "followups", runId: runId, fid: parseInt(parts[3], 10) };
+      }
+      return { view: "run", runId: runId, fid: null };
+    }
+    return { view: "run", runId: null, fid: null };
+  }
+
+  function onRoute() {
+    var next = parseHash();
+    var prev = state.route;
+    state.route = next;
+
+    if (next.runId == null) {
+      // no run in the hash — pick the newest if we have one
+      if (state.runs.length) { navigate(state.runs[0].id); return; }
+      showEmpty();
+      return;
+    }
+    // A new deep-linked ticket should re-scroll even if the run is unchanged.
+    if (next.fid !== (prev && prev.fid)) state.scrolledFid = null;
+    if (next.runId !== state.selectedId) {
+      selectRun(next.runId);         // loads detail, connects live, then renders
+    } else {
+      renderCurrentView();           // same run, just switched view (run <-> followups)
+    }
+  }
+
+  function navigate(runId, sub) {
+    var h = "#/run/" + runId + (sub ? "/" + sub : "");
+    if (location.hash === h) onRoute();     // same hash: re-run manually
+    else location.hash = h;
+  }
 
   // =========================================================================
   // Runs sidebar
@@ -85,13 +179,19 @@
       var runs = (data && data.runs) || [];
       state.runs = runs;
       renderRunList();
-      // Auto-select the newest run whenever nothing is selected — not just on the
-      // first load. The app is often opened before any run exists, so the initial
-      // fetch sees zero runs; the first poll that finds one must select it.
-      if (runs.length && state.selectedId == null) {
-        selectRun(runs[0].id);   // newest first → default selection
+      if (initial || state.selectedId == null) {
+        // Honor a deep link on load; otherwise default to the newest run.
+        var routed = parseHash();
+        if (routed.runId != null && findRun(routed.runId)) {
+          state.route = routed;
+          if (routed.runId !== state.selectedId) selectRun(routed.runId);
+        } else if (runs.length) {
+          navigate(runs[0].id);
+        } else {
+          showEmpty();
+        }
       } else if (state.selectedId != null && !findRun(state.selectedId) && runs.length) {
-        selectRun(runs[0].id);
+        navigate(runs[0].id);
       }
     }).catch(function () { /* server may be momentarily unreachable */ });
   }
@@ -144,9 +244,9 @@
 
       li.appendChild(top);
       li.appendChild(bottom);
-      li.addEventListener("click", function () { selectRun(run.id); });
+      li.addEventListener("click", function () { navigate(run.id); });
       li.addEventListener("keydown", function (e) {
-        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectRun(run.id); }
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); navigate(run.id); }
       });
       el.runList.appendChild(li);
     });
@@ -164,12 +264,7 @@
   function runHealth(run) {
     var c = run.counts || {};
     if (run.status === "running" || c.running) return "running";
-    // A completed run is fully resolved — every followup was closed, so the run
-    // graduated from needs_followup to completed. It reads OK even though its job
-    // rows keep their followup status counts. Terminal status wins over counts.
     if (run.status === "completed") return "ok";
-    // Failures outrank followup: a needs_followup run that also had failures must
-    // still show the fail signal in the sidebar, not be masked as followup.
     if (run.status === "failed" || c.failure) return "fail";
     if (run.status === "needs_followup" || c.followup) return "followup";
     if (run.status === "cancelled") return "idle";
@@ -187,32 +282,35 @@
   // Selection + live connection
   // =========================================================================
   function selectRun(id) {
-    if (state.selectedId === id && state.detail) {
-      // already showing; just ensure connection
-    }
     state.selectedId = id;
     state.detail = null;
-    state.jobsById = {};
-    state.lastEventId = 0;
+    state.events = [];
     state.seenEventIds = {};
+    state.maxEventId = 0;
+    state.mountedEventsEl = null;
+    state.prevStatus = null;
+    state.expanded = {};
+    state.foldOpen = false;
+    state.logOpen = false;
+    state.scrolledFid = null;
+    state.fpSig = null;
     el.events.innerHTML = "";
+    el.eventsDebrief.innerHTML = "";
     renderRunList();
-    el.emptyState.hidden = true;
-    el.runView.hidden = false;
 
     teardownLive();
-    // Initial full load via REST, then connect SSE for live updates.
     Promise.all([
       fetchJSON("/api/runs/" + id),
       fetchJSON("/api/runs/" + id + "/events?after=0")
     ]).then(function (res) {
       if (state.selectedId !== id) return;
-      applyDetail(res[0]);
-      applyEvents((res[1] && res[1].events) || []);
+      ingestDetail(res[0]);
+      ingestEvents((res[1] && res[1].events) || []);
+      renderCurrentView();
       connectLive(id);
     }).catch(function () {
-      // server hiccup: still try to stream
       connectLive(id);
+      renderCurrentView();
     });
   }
 
@@ -221,11 +319,8 @@
     setConn("init", "connecting");
     var es;
     try {
-      es = new EventSource("/api/stream/" + id + "?after=" + state.lastEventId);
-    } catch (e) {
-      startPolling(id);
-      return;
-    }
+      es = new EventSource("/api/stream/" + id + "?after=" + lastEventId());
+    } catch (e) { startPolling(id); return; }
     state.es = es;
 
     es.onopen = function () {
@@ -236,24 +331,23 @@
       if (state.selectedId !== id) return;
       var payload;
       try { payload = JSON.parse(ev.data); } catch (e) { return; }
-      if (payload.run) applyDetail({
-        run: payload.run, jobs: payload.jobs, counts: payload.counts,
-        followups: payload.followups, followup_counts: payload.followup_counts
-      });
-      if (payload.events && payload.events.length) applyEvents(payload.events);
+      var touched = false;
+      if (payload.run) {
+        ingestDetail({
+          run: payload.run, jobs: payload.jobs, counts: payload.counts,
+          followups: payload.followups, followup_counts: payload.followup_counts
+        });
+        touched = true;
+      }
+      if (payload.events && payload.events.length) { ingestEvents(payload.events); touched = true; }
+      if (touched) renderCurrentView();
     };
     es.onerror = function () {
       if (state.selectedId !== id) return;
-      // SSE dropped — the server closes terminal streams intentionally.
-      // If the run is finished we don't need to fall back; otherwise poll.
-      es.close();
-      state.es = null;
+      es.close(); state.es = null;
       var run = state.detail && state.detail.run;
-      if (run && TERMINAL[run.status]) {
-        setConn("down", "closed");
-      } else {
-        startPolling(id);
-      }
+      if (run && TERMINAL[run.status]) setConn("down", "closed");
+      else startPolling(id);
     };
   }
 
@@ -264,79 +358,138 @@
       if (state.selectedId !== id) return;
       Promise.all([
         fetchJSON("/api/runs/" + id),
-        fetchJSON("/api/runs/" + id + "/events?after=" + state.lastEventId)
+        fetchJSON("/api/runs/" + id + "/events?after=" + lastEventId())
       ]).then(function (res) {
         if (state.selectedId !== id) return;
-        if (res[0]) applyDetail(res[0]);
-        applyEvents((res[1] && res[1].events) || []);
+        if (res[0]) ingestDetail(res[0]);
+        ingestEvents((res[1] && res[1].events) || []);
+        renderCurrentView();
         var run = state.detail && state.detail.run;
-        if (run && TERMINAL[run.status]) {
-          stopPolling();
-          setConn("down", "closed");
-        }
-      }).catch(function () { /* keep trying */ });
+        if (run && TERMINAL[run.status]) { stopPolling(); setConn("down", "closed"); }
+      }).catch(function () {});
     };
     state.pollTimer = setInterval(tick, 1500);
     tick();
   }
 
-  function stopPolling() {
-    if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
-  }
-
+  function stopPolling() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } }
   function teardownLive() {
     if (state.es) { try { state.es.close(); } catch (e) {} state.es = null; }
     stopPolling();
   }
-
-  function setConn(stateName, label) {
-    el.conn.dataset.state = stateName;
+  function setConn(s, label) {
+    el.conn.dataset.state = s;
     el.conn.querySelector(".conn-label").textContent = label;
   }
 
   // =========================================================================
-  // Render detail
+  // Ingest (update state, no DOM)
   // =========================================================================
-  function applyDetail(detail) {
+  function ingestDetail(detail) {
     if (!detail || !detail.run) return;
     var prev = state.detail;
+    // The SSE payload carries followups only when something changed; fall back
+    // to the previous set so a jobs-only update doesn't blank them.
+    if (detail.followups == null && prev) detail.followups = prev.followups;
+    if (detail.followup_counts == null && prev) detail.followup_counts = prev.followup_counts;
     state.detail = detail;
-    var run = detail.run;
 
-    el.rvTag.textContent = run.tag;
-    el.rvMeta.textContent = "run #" + run.id +
-      (run.mode ? "  ·  " + run.mode : "") +
-      (run.options ? "  ·  " + compactOptions(run.options) : "");
-    el.rvStatus.dataset.status = run.status;
-    el.rvStatus.textContent = statusLabel(run.status);
-    el.rvTime.textContent = timeRange(run.started_at, run.finished_at);
-
-    renderStepper(run.stage, run.status);
-    renderCounts(detail.counts || {}, prev && prev.counts);
-    // The SSE payload carries followups only when something changed; fall back to
-    // the previous set so a jobs-only update doesn't blank the tickets table.
-    var followups = detail.followups != null ? detail.followups
-      : (prev && prev.followups) || [];
-    detail.followups = followups;
-    renderFollowups(followups);
-    renderJobs(detail.jobs || []);
-    renderSummary(run.summary);
-
-    // keep sidebar pill fresh for this run
-    var sidebarRun = findRun(run.id);
+    // keep sidebar row fresh
+    var sidebarRun = findRun(detail.run.id);
     if (sidebarRun) {
-      sidebarRun.status = run.status;
-      sidebarRun.stage = run.stage;
+      sidebarRun.status = detail.run.status;
+      sidebarRun.stage = detail.run.stage;
       sidebarRun.counts = detail.counts;
-      sidebarRun.finished_at = run.finished_at;
+      sidebarRun.finished_at = detail.run.finished_at;
       renderRunList();
     }
   }
 
+  function ingestEvents(events) {
+    if (!events || !events.length) return;
+    events.forEach(function (ev) {
+      if (state.seenEventIds[ev.id]) return;
+      state.seenEventIds[ev.id] = 1;
+      state.events.push(ev);
+      if (ev.id > state.maxEventId) state.maxEventId = ev.id;
+    });
+  }
+  // Cached — updated as events are ingested — so the SSE-connect and polling
+  // paths don't rescan the whole event array each tick.
+  function lastEventId() { return state.maxEventId; }
+
+  // =========================================================================
+  // View dispatch
+  // =========================================================================
+  function showEmpty() {
+    el.emptyState.hidden = false;
+    el.runView.hidden = true;
+    el.followupsPage.hidden = true;
+  }
+
+  function renderCurrentView() {
+    if (!state.detail || !state.detail.run) { return; }
+    el.emptyState.hidden = true;
+
+    if (state.route.view === "followups") {
+      el.runView.hidden = true;
+      el.followupsPage.hidden = false;
+      state.mountedEventsEl = null;
+      renderFollowupsPage(state.detail, state.route.fid);
+      return;
+    }
+
+    el.followupsPage.hidden = true;
+    el.runView.hidden = false;
+    renderRun(state.detail);
+  }
+
+  function renderRun(detail) {
+    var run = detail.run;
+    var face = run.status === "running" ? "live" : "debrief";
+    var faceChanged = el.runView.dataset.face !== face;
+    el.runView.dataset.face = face;
+
+    renderHeader(detail, face);
+
+    if (face === "live") {
+      renderLiveFace(detail);
+      mountEvents(el.events, faceChanged);       // (re)mount live log on the left column
+    } else {
+      renderDebriefFace(detail, faceChanged);
+      // debrief log is lazy — only mounted when the user expands it
+      if (state.logOpen) mountEvents(el.eventsDebrief, faceChanged);
+      else state.mountedEventsEl = null;
+    }
+
+    // one-time reveal when the agent finishes (running -> terminal/needs_followup)
+    if (state.prevStatus === "running" && run.status !== "running") {
+      playDebriefReveal();
+    }
+    state.prevStatus = run.status;
+  }
+
+  // -- shared header --------------------------------------------------------
+  function renderHeader(detail, face) {
+    var run = detail.run;
+    el.rvTag.textContent = run.tag;
+    el.rvStatus.dataset.status = run.status;
+    el.rvStatus.textContent = statusLabel(run.status);
+    el.rvMeta.textContent = "run #" + run.id +
+      (run.mode ? "  ·  " + run.mode : "") +
+      (run.options ? "  ·  " + compactOptions(run.options) : "");
+    el.rvTime.dataset.start = run.finished_at ? "" : (run.started_at || "");
+    el.rvTime.textContent = timeRange(run.started_at, run.finished_at);
+    if (face === "live") renderStageRail(run.stage, run.status);
+  }
+
+  function statusLabel(status) {
+    if (status === "needs_followup") return "needs followup";
+    return status || "";
+  }
   function compactOptions(opts) {
     try {
-      var o = JSON.parse(opts);
-      var flags = [];
+      var o = JSON.parse(opts), flags = [];
       Object.keys(o).forEach(function (k) {
         if (o[k] === true) flags.push("--" + k);
         else if (o[k] !== false && o[k] != null) flags.push("--" + k + " " + o[k]);
@@ -345,47 +498,27 @@
     } catch (e) { return ""; }
   }
 
-  // -- stepper --------------------------------------------------------------
-  function buildStepper() {
-    el.stepper.innerHTML = "";
+  // -- stage rail (live) ----------------------------------------------------
+  function buildStageRail() {
+    el.stageRail.innerHTML = "";
     STAGES.forEach(function (s) {
-      var d = document.createElement("div");
-      d.className = "step";
-      d.dataset.stage = s.id;
-      d.innerHTML =
-        '<span class="step-index"></span>' +
-        '<span class="step-name">' + s.label + '</span>' +
-        '<span class="step-tag">' + s.tag + '</span>';
-      el.stepper.appendChild(d);
+      var li = document.createElement("li");
+      li.className = "sr-step";
+      li.dataset.stage = s.id;
+      li.innerHTML = '<span class="sr-dot"></span><span>' + s.label + '</span>';
+      el.stageRail.appendChild(li);
     });
   }
-  function statusLabel(status) {
-    if (status === "needs_followup") return "needs followup";
-    return status || "";
-  }
-
-  function renderStepper(stage, status) {
+  function renderStageRail(stage, status) {
     var idx = stageIndex(stage);
-    // A finished run lights all stages as done. 'needs_followup' isn't terminal
-    // (tickets remain) but its sweep is done — stage 'done' covers both.
     var finished = TERMINAL[status] || stage === "done";
     var current = finished ? STAGES.length - 1 : idx;
-    var steps = el.stepper.children;
+    var steps = el.stageRail.children;
     for (var i = 0; i < steps.length; i++) {
-      var step = steps[i];
-      step.classList.remove("done", "current");
-      if (finished || status === "completed") {
-        step.classList.add("done");
-      } else if (i < current) {
-        step.classList.add("done");
-      } else if (i === current) {
-        step.classList.add("current");
-      }
-    }
-    // For a still-running last stage, mark current not just done.
-    if (!finished && current >= 0 && current < steps.length) {
-      steps[current].classList.remove("done");
-      steps[current].classList.add("current");
+      steps[i].classList.remove("done", "current");
+      if (finished) steps[i].classList.add("done");
+      else if (i < current) steps[i].classList.add("done");
+      else if (i === current) steps[i].classList.add("current");
     }
   }
   function stageIndex(stage) {
@@ -393,109 +526,266 @@
     return 0;
   }
 
-  // -- counts ---------------------------------------------------------------
-  function buildCounts() {
-    el.counts.innerHTML = "";
-    COUNT_KEYS.forEach(function (k) {
-      var d = document.createElement("div");
-      d.className = "count";
-      d.dataset.k = k;
-      d.innerHTML = '<span class="count-n">0</span><span class="count-label">' + k + '</span>';
-      el.counts.appendChild(d);
-    });
-  }
-  function renderCounts(counts, prev) {
-    var nodes = el.counts.children;
-    for (var i = 0; i < nodes.length; i++) {
-      var k = nodes[i].dataset.k;
-      var v = counts[k] != null ? counts[k] : 0;
-      var nEl = nodes[i].querySelector(".count-n");
-      if (prev && prev[k] !== v) {
-        nodes[i].classList.remove("hot");
-        void nodes[i].offsetWidth;
-        nodes[i].classList.add("hot");
-      }
-      nEl.textContent = v;
-    }
+  // =========================================================================
+  // LIVE FACE
+  // =========================================================================
+  function renderLiveFace(detail) {
+    var jobs = detail.jobs || [];
+    var counts = detail.counts || {};
+    renderProgressRail(counts);
+    renderNow(jobs);
+    renderQueue(jobs);
+    renderFollowupStrip(detail);
   }
 
-  // -- jobs -----------------------------------------------------------------
-  function renderJobs(jobs) {
-    el.jobsHint.textContent = jobs.length ? jobs.length + " discovered" : "";
-    if (!jobs.length) {
-      el.jobs.innerHTML = '<div class="muted" style="padding:14px">No projects discovered yet.</div>';
+  function renderProgressRail(counts) {
+    var total = counts.total || 0;
+    var done = total - (counts.pending || 0) - (counts.running || 0);
+    var pct = total ? Math.round((done / total) * 100) : 0;
+    el.prFill.style.width = pct + "%";
+
+    var stats = document.createElement("span");
+    stats.className = "pr-frac";
+    stats.textContent = done + " / " + total + " done";
+    el.prStats.innerHTML = "";
+    el.prStats.appendChild(stats);
+    el.prStats.appendChild(prStat("ok", counts.success));
+    if (counts.followup) el.prStats.appendChild(prStat("followup", counts.followup));
+    if (counts.failure) el.prStats.appendChild(prStat("fail", counts.failure));
+    if (counts.skipped) el.prStats.appendChild(prStat("skip", counts.skipped, "–"));
+  }
+  function prStat(kind, n, glyph) {
+    var s = document.createElement("span");
+    s.className = "pr-stat";
+    var dot = document.createElement("span");
+    dot.className = "ri-dot " + (kind === "skip" ? "" : kind);
+    if (kind === "skip") dot.style.background = "var(--skip)";
+    s.appendChild(dot);
+    s.appendChild(document.createTextNode(String(n || 0)));
+    return s;
+  }
+
+  function renderNow(jobs) {
+    var running = jobs.filter(function (j) { return j.status === "running"; });
+    el.nowHint.textContent = running.length ? running.length + " active" : "";
+    if (!running.length) {
+      el.now.innerHTML = '<div class="now-idle">Between projects — waiting for the next one to start…</div>';
       return;
     }
-    // Reconcile in place so we can animate only what changed.
-    var existing = {};
-    Array.prototype.forEach.call(el.jobs.children, function (node) {
-      if (node.dataset.jobId) existing[node.dataset.jobId] = node;
-    });
-
-    jobs.forEach(function (job) {
-      var prior = state.jobsById[job.id];
-      var node = existing[job.id];
-      var changed = !prior || prior.status !== job.status ||
-        (prior.summary || "") !== (job.summary || "") ||
-        (prior.error || "") !== (job.error || "");
-      if (!node) {
-        node = document.createElement("div");
-        node.dataset.jobId = job.id;
-        el.jobs.appendChild(node);
+    el.now.innerHTML = "";
+    running.forEach(function (job) {
+      var latest = latestEventFor(job.id);
+      var card = document.createElement("div");
+      card.className = "now-card";
+      var html =
+        '<div class="now-top">' +
+          '<span class="now-spin" aria-hidden="true"></span>' +
+          '<span class="now-name">' + esc(job.project_name || job.project_path) + '</span>' +
+          '<span class="now-elapsed" data-start="' + esc(job.started_at || "") + '">' +
+            esc(elapsedLabel(job.started_at)) + '</span>' +
+        '</div>';
+      if (job.skill_name) html += '<div class="now-skill">' + esc(job.skill_name) + '</div>';
+      if (latest) {
+        html += '<div class="now-latest"><span class="nl-caret">›</span>' +
+                '<span class="nl-msg"></span></div>';
       }
-      if (changed || !node.innerHTML) {
-        renderJobNode(node, job);
-        if (prior && prior.status !== job.status) {
-          node.classList.remove("flash"); void node.offsetWidth; node.classList.add("flash");
-        }
-      }
-      delete existing[job.id];
-      state.jobsById[job.id] = { status: job.status, summary: job.summary, error: job.error };
-    });
-    // Remove stale nodes
-    Object.keys(existing).forEach(function (id) {
-      if (existing[id].parentNode) existing[id].parentNode.removeChild(existing[id]);
+      card.innerHTML = html;
+      if (latest) card.querySelector(".nl-msg").textContent = latest.message || "";
+      el.now.appendChild(card);
     });
   }
 
-  function renderJobNode(node, job) {
-    node.className = "job";
-    node.dataset.status = job.status;
-    node.dataset.jobId = job.id;
-
-    var html = "";
-    html += '<div class="job-top">';
-    html += '<span class="job-icon"><span class="ind ' + esc(job.status) + '"></span></span>';
-    html += '<span class="job-name">' + esc(job.project_name || job.project_path) + '</span>';
-    html += '<span class="job-state" data-s="' + esc(job.status) + '">' + esc(job.status) + '</span>';
-    html += '</div>';
-    if (job.project_path && job.project_path !== job.project_name) {
-      html += '<div class="job-path">' + esc(job.project_path) + '</div>';
+  function latestEventFor(jobId) {
+    for (var i = state.events.length - 1; i >= 0; i--) {
+      if (state.events[i].job_id === jobId) return state.events[i];
     }
+    return state.events.length ? state.events[state.events.length - 1] : null;
+  }
+
+  function renderQueue(jobs) {
+    el.queueHint.textContent = jobs.length ? jobs.length + " projects" : "";
+    var sorted = jobs.slice().sort(function (a, b) {
+      var pa = STATUS_PRIORITY[a.status], pb = STATUS_PRIORITY[b.status];
+      if (pa == null) pa = 9; if (pb == null) pb = 9;
+      if (pa !== pb) return pa - pb;
+      return a.id - b.id;
+    });
+    var html = "";
+    sorted.forEach(function (j) {
+      html += '<span class="chip" data-s="' + esc(j.status) + '" title="' +
+        esc((j.project_name || "") + " — " + j.status) + '">' +
+        '<span class="chip-glyph">' + (CHIP_GLYPH[j.status] || "○") + '</span>' +
+        '<span class="chip-name">' + esc(j.project_name || j.project_path) + '</span>' +
+        '</span>';
+    });
+    el.queue.innerHTML = html || '<span class="muted">No projects discovered yet.</span>';
+  }
+
+  function renderFollowupStrip(detail) {
+    var fups = detail.followups || [];
+    var open = countOpen(fups);
+    if (!fups.length) { el.followupStrip.hidden = true; return; }
+    el.followupStrip.hidden = false;
+    el.followupStrip.href = "#/run/" + detail.run.id + "/followups";
+    var n = open || fups.length;
+    var word = (n === 1 ? "followup" : "followups");
+    el.fsLabel.innerHTML = "<b>" + n + "</b> " + word +
+      (open ? " queued for later" : " — all resolved");
+  }
+
+  // =========================================================================
+  // DEBRIEF FACE
+  // =========================================================================
+  function renderDebriefFace(detail, faceChanged) {
+    renderStoplight(detail.counts || {}, faceChanged);
+    renderDebriefFollowups(detail, faceChanged);
+    renderSummary(detail.run.summary);
+    renderResults(detail.jobs || []);
+    renderLogToggle();
+  }
+
+  function renderStoplight(counts, reveal) {
+    var lamps = [
+      { k: "success",  n: counts.success  || 0, label: "success" },
+      { k: "followup", n: counts.followup || 0, label: "followup" },
+      { k: "failure",  n: counts.failure  || 0, label: "failure" },
+      { k: "skipped",  n: counts.skipped  || 0, label: "skipped" }
+    ];
+    var html = "";
+    lamps.forEach(function (l, i) {
+      html += '<div class="lamp' + (l.n ? " lit" : "") + (reveal ? " reveal" : "") +
+              '" data-k="' + l.k + '"' +
+              (reveal ? ' style="animation-delay:' + (i * 90) + 'ms"' : "") + '>' +
+        '<span class="lamp-orb" aria-hidden="true"></span>' +
+        '<span class="lamp-text">' +
+          '<span class="lamp-n">' + l.n + '</span>' +
+          '<span class="lamp-label">' + l.label + '</span>' +
+        '</span></div>';
+    });
+    el.stoplight.innerHTML = html;
+  }
+
+  function renderDebriefFollowups(detail, reveal) {
+    var fups = detail.followups || [];
+    if (!fups.length) { el.dbFollowups.hidden = true; return; }
+    el.dbFollowups.hidden = false;
+    if (reveal) { el.dbFollowups.classList.remove("reveal"); void el.dbFollowups.offsetWidth; el.dbFollowups.classList.add("reveal"); }
+    el.dbFollowupsLink.href = "#/run/" + detail.run.id + "/followups";
+
+    var open = 0, closed = 0, rows = "";
+    fups.forEach(function (f) {
+      var st = f.status || "open";
+      if (st === "open") open++; else closed++;
+      var lc = f.last_comment, latest = "";
+      if (lc) {
+        var verb = lc.action && lc.action !== "opened" ? lc.action + ": " : "";
+        latest = esc(verb) + esc(lc.comment || "");
+      }
+      rows += '<tr class="tk-row' + (st !== "open" ? " is-closed" : "") + '">' +
+        '<td class="tk-num">#' + esc(f.id) + '</td>' +
+        '<td class="tk-proj">' + esc(f.project_name || "—") + '</td>' +
+        '<td class="tk-title">' + esc(f.title || "") +
+          (f.detail ? '<span class="tk-detail">' + esc(f.detail) + '</span>' : '') + '</td>' +
+        '<td class="tk-stat"><span class="tk-status" data-s="' + esc(st) + '">' +
+          esc(TICKET_STATUS_LABEL[st] || st) + '</span></td>' +
+        '<td class="tk-latest">' + (latest || '<span class="muted">—</span>') + '</td>' +
+        '</tr>';
+    });
+    el.dbFollowupsBody.innerHTML = rows;
+    if (open) {
+      el.dbFollowupsFoot.innerHTML =
+        'Resolve a ticket with <code>/zed:maint-followup &lt;#&gt; done|nope|update [comment]</code>' +
+        ' — when the last open ticket closes, this run flips to <strong>completed</strong>.';
+    } else {
+      el.dbFollowupsFoot.innerHTML = 'All followups resolved. This run is <strong>completed</strong>.';
+    }
+  }
+
+  function renderSummary(md) {
+    if (!md) { el.summary.innerHTML = '<p class="muted">No summary recorded for this run.</p>'; return; }
+    el.summary.innerHTML = renderMarkdown(md);
+  }
+
+  function renderResults(jobs) {
+    var attention = [], clean = [];
+    jobs.forEach(function (j) {
+      if (j.status === "failure" || j.status === "followup") attention.push(j);
+      else clean.push(j);
+    });
+    attention.sort(function (a, b) {
+      var pa = a.status === "failure" ? 0 : 1, pb = b.status === "failure" ? 0 : 1;
+      if (pa !== pb) return pa - pb;
+      return a.id - b.id;
+    });
+
+    var okN = clean.filter(function (j) { return j.status === "success"; }).length;
+    var skN = clean.filter(function (j) { return j.status === "skipped"; }).length;
+    el.resultsHint.textContent =
+      (attention.length ? attention.length + " need attention · " : "") +
+      clean.length + " clean";
+
+    el.results.innerHTML = "";
+    attention.forEach(function (j) { el.results.appendChild(resultCard(j, true)); });
+
+    if (clean.length) {
+      var fold = document.createElement("button");
+      fold.className = "result-fold";
+      fold.setAttribute("aria-expanded", state.foldOpen ? "true" : "false");
+      fold.innerHTML =
+        '<span class="rf-caret">' + (state.foldOpen ? "▾" : "▸") + '</span>' +
+        '<span class="rf-dot"></span>' +
+        '<span>' + clean.length + ' clean project' + (clean.length === 1 ? "" : "s") +
+        '  ·  ' + okN + ' ok, ' + skN + ' skipped</span>';
+      el.results.appendChild(fold);
+
+      var wrap = document.createElement("div");
+      wrap.className = "results";
+      wrap.style.marginTop = "8px";
+      wrap.hidden = !state.foldOpen;
+      clean.slice().sort(function (a, b) { return a.id - b.id; })
+        .forEach(function (j) { wrap.appendChild(resultCard(j, false)); });
+      el.results.appendChild(wrap);
+
+      fold.addEventListener("click", function () {
+        state.foldOpen = !state.foldOpen;
+        wrap.hidden = !state.foldOpen;
+        fold.setAttribute("aria-expanded", state.foldOpen ? "true" : "false");
+        fold.querySelector(".rf-caret").textContent = state.foldOpen ? "▾" : "▸";
+      });
+    }
+  }
+
+  function resultCard(job, expandByDefault) {
+    var node = document.createElement("div");
+    node.className = "result";
+    node.dataset.status = job.status;
+    var html =
+      '<div class="result-top">' +
+        '<span class="result-name">' + esc(job.project_name || job.project_path) + '</span>' +
+        '<span class="result-state" data-s="' + esc(job.status) + '">' + esc(job.status) + '</span>' +
+      '</div>';
     node.innerHTML = html;
 
     var hasError = job.status === "failure" && job.error;
     var hasSummary = !!job.summary;
     if (hasError || hasSummary) {
       var detail = document.createElement("div");
-      detail.className = "job-detail";
+      detail.className = "result-detail";
       if (hasError) {
         var er = document.createElement("div");
-        er.className = "job-error";
+        er.className = "result-error";
         er.textContent = job.error;
         detail.appendChild(er);
       }
       if (hasSummary) {
-        var expanded = state.expanded[job.id] ||
-          job.status === "failure" || job.status === "followup";
+        var open = state.expanded[job.id] != null ? state.expanded[job.id] : expandByDefault;
         var sum = document.createElement("div");
-        sum.className = "job-summary md";
+        sum.className = "result-summary md";
         sum.innerHTML = renderMarkdown(job.summary);
-        sum.style.display = expanded ? "" : "none";
-
+        sum.style.display = open ? "" : "none";
         var toggle = document.createElement("button");
-        toggle.className = "job-toggle";
-        toggle.textContent = expanded ? "▾ hide summary" : "▸ show summary";
+        toggle.className = "result-toggle";
+        toggle.textContent = open ? "▾ hide summary" : "▸ show summary";
         toggle.addEventListener("click", function () {
           var now = sum.style.display === "none";
           sum.style.display = now ? "" : "none";
@@ -507,90 +797,170 @@
       }
       node.appendChild(detail);
     }
+    return node;
   }
 
-  // -- run summary ----------------------------------------------------------
-  function renderSummary(md) {
-    if (!md) {
-      el.summary.innerHTML = '<p class="muted">No summary yet — it appears when the run finishes.</p>';
-      return;
-    }
-    el.summary.innerHTML = renderMarkdown(md);
+  function renderLogToggle() {
+    el.logCount.textContent = state.events.length ? state.events.length + " events" : "";
+    el.logToggle.setAttribute("aria-expanded", state.logOpen ? "true" : "false");
+    el.eventsDebrief.hidden = !state.logOpen;
+    el.logToggle.querySelector(".lt-caret").textContent = "▸";
   }
 
-  // -- followup tickets -----------------------------------------------------
-  function renderFollowups(followups) {
-    followups = followups || [];
-    if (!followups.length) {
-      el.followupsSection.hidden = true;
-      el.followupsBody.innerHTML = "";
-      return;
-    }
-    el.followupsSection.hidden = false;
+  // =========================================================================
+  // FOLLOWUPS PAGE
+  // =========================================================================
+  function renderFollowupsPage(detail, fid) {
+    var run = detail.run;
+    var fups = detail.followups || [];
 
-    var open = 0, closed = 0;
-    var rows = "";
-    followups.forEach(function (f) {
-      var st = f.status || "open";
-      if (st === "open") open++; else closed++;
-      var lc = f.last_comment;
-      var latest = "";
-      if (lc) {
-        var verb = lc.action && lc.action !== "opened" ? lc.action + ": " : "";
-        latest = esc(verb) + esc(lc.comment || "");
+    // Only rebuild when something actually changed. Skipping no-op renders keeps
+    // an SSE update (or the initial prime) from wiping the list and resetting the
+    // reader's scroll position — including a just-applied deep-link scroll.
+    var sig = run.status + "#" + fups.map(function (f) {
+      return f.id + ":" + (f.status || "open") + ":" + (f.updated_at || "") +
+        ":" + ((f.comments || []).length);
+    }).join("|");
+    if (sig !== state.fpSig) {
+      state.fpSig = sig;
+      el.fpBack.href = "#/run/" + run.id;
+      el.fpRunStatus.dataset.status = run.status;
+      el.fpRunStatus.textContent = statusLabel(run.status);
+      el.fpTitle.textContent = run.tag + " — followups";
+
+      var open = countOpen(fups), closed = fups.length - open;
+      el.fpSub.textContent = fups.length
+        ? (open + " open" + (closed ? "  ·  " + closed + " closed" : ""))
+        : "none for this run";
+
+      if (!fups.length) {
+        el.fpList.innerHTML = '<p class="muted">This run surfaced no followups.</p>';
+        el.fpHelp.textContent = "";
+      } else {
+        el.fpList.innerHTML = "";
+        fups.forEach(function (f) { el.fpList.appendChild(ticketCard(f)); });
+        if (open) {
+          el.fpHelp.innerHTML = "Work a ticket from your shell: " +
+            "<code>/zed:maint-followup &lt;#&gt; update|done|nope [comment]</code>. " +
+            "When the last open ticket closes, this run graduates to completed.";
+        } else {
+          el.fpHelp.textContent = "All followups for this run are resolved.";
+        }
       }
-      var closedRow = st !== "open" ? " is-closed" : "";
-      rows += '<tr class="tk-row' + closedRow + '">' +
-        '<td class="tk-num">#' + esc(f.id) + '</td>' +
-        '<td class="tk-proj">' + esc(f.project_name || "—") + '</td>' +
-        '<td class="tk-title">' + esc(f.title || "") +
-          (f.detail ? '<span class="tk-detail">' + esc(f.detail) + '</span>' : '') + '</td>' +
-        '<td class="tk-stat"><span class="tk-status" data-s="' + esc(st) + '">' +
-          esc(TICKET_STATUS_LABEL[st] || st) + '</span></td>' +
-        '<td class="tk-latest">' + (latest || '<span class="muted">—</span>') + '</td>' +
-        '</tr>';
-    });
-    el.followupsBody.innerHTML = rows;
+    }
 
-    el.followupsHint.textContent =
-      open + " open" + (closed ? "  ·  " + closed + " closed" : "");
-    if (open) {
-      el.followupsFoot.innerHTML =
-        'Resolve a ticket with <code>/zed:maint-followup &lt;#&gt; done|nope|update [comment]</code>' +
-        ' — when the last open ticket closes, this run flips to <strong>completed</strong>.';
-    } else {
-      el.followupsFoot.innerHTML =
-        'All followups resolved. This run is <strong>completed</strong>.';
+    // Auto-scroll to a deep-linked ticket once per navigation.
+    if (fid && state.scrolledFid !== fid) {
+      state.scrolledFid = fid;
+      scrollToTicket(fid);
     }
   }
 
-  // =========================================================================
-  // Events
-  // =========================================================================
-  function applyEvents(events) {
-    if (!events || !events.length) return;
-    var frag = document.createDocumentFragment();
-    var added = 0;
-    events.forEach(function (ev) {
-      if (state.seenEventIds[ev.id]) return;
-      state.seenEventIds[ev.id] = 1;
-      if (ev.id > state.lastEventId) state.lastEventId = ev.id;
-      frag.appendChild(buildEvent(ev));
-      added++;
-    });
-    if (!added) return;
-    // clear empty placeholder
-    var empty = el.events.querySelector(".events-empty");
-    if (empty) empty.remove();
-    el.events.appendChild(frag);
-    el.eventsHint.textContent = el.events.children.length + " events";
-    // autoscroll to newest
-    el.events.scrollTop = el.events.scrollHeight;
+  function ticketCard(f) {
+    var st = f.status || "open";
+    var node = document.createElement("div");
+    node.className = "ticket" + (st !== "open" ? " is-closed" : "");
+    node.id = "ticket-" + f.id;
+
+    var html =
+      '<div class="ticket-top">' +
+        '<span class="ticket-num">#' + esc(f.id) + '</span>' +
+        '<span class="ticket-proj">' + esc(f.project_name || "—") + '</span>' +
+        '<span class="tk-status" data-s="' + esc(st) + '">' +
+          esc(TICKET_STATUS_LABEL[st] || st) + '</span>' +
+      '</div>' +
+      '<h3 class="ticket-title">' + esc(f.title || "") + '</h3>';
+    if (f.detail) html += '<p class="ticket-detail">' + esc(f.detail) + '</p>';
+    node.innerHTML = html;
+
+    var comments = f.comments || [];
+    if (comments.length) {
+      var tl = document.createElement("ol");
+      tl.className = "ticket-timeline";
+      comments.forEach(function (c) {
+        var li = document.createElement("li");
+        li.className = "tl-item";
+        li.dataset.action = c.action || "update";
+        li.innerHTML =
+          '<span class="tl-ts">' + esc(clockTime(c.ts)) + '</span>' +
+          '<span class="tl-action">' + esc(ACTION_LABEL[c.action] || c.action || "note") + '</span>' +
+          '<span class="tl-comment"></span>';
+        li.querySelector(".tl-comment").textContent = c.comment || "";
+        tl.appendChild(li);
+      });
+      node.appendChild(tl);
+    }
+    if (st === "open") {
+      var res = document.createElement("div");
+      res.className = "ticket-resolve";
+      res.innerHTML = "resolve: <code>/zed:maint-followup " + esc(f.id) + " done|nope|update [comment]</code>";
+      node.appendChild(res);
+    }
+    return node;
   }
 
-  function buildEvent(ev) {
+  function scrollToTicket(fid) {
+    // Defer to the next frame so the freshly-rendered list is laid out and any
+    // competing render from the same tick has settled before we scroll.
+    requestAnimationFrame(function () {
+      var node = byId("ticket-" + fid);
+      if (!node || !node.scrollIntoView) return;
+      // Honor prefers-reduced-motion: JS-driven smooth scroll isn't covered by
+      // the CSS media guard, so jump instantly for those users. (The highlight's
+      // transition is neutralized by the reduced-motion CSS rule.)
+      var reduce = reducedMotion();
+      node.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "center" });
+      if (!reduce) node.style.transition = "box-shadow 0.4s";
+      node.style.boxShadow = "0 0 0 2px rgba(192,132,252,0.5)";
+      setTimeout(function () { node.style.boxShadow = ""; }, 1400);
+    });
+  }
+
+  function reducedMotion() {
+    return !!(window.matchMedia &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  }
+
+  function countOpen(fups) {
+    var n = 0;
+    (fups || []).forEach(function (f) { if ((f.status || "open") === "open") n++; });
+    return n;
+  }
+
+  // =========================================================================
+  // Events rendering (shared between live log and debrief log)
+  // =========================================================================
+  // Mount the full event list into `target`. No-op if already mounted there
+  // (so steady-state updates only append instead of re-rendering).
+  function mountEvents(target, force) {
+    if (state.mountedEventsEl === target && !force) return;
+    state.mountedEventsEl = target;
+    target.innerHTML = "";
+    if (!state.events.length) {
+      target.innerHTML = '<li class="events-empty">No activity yet.</li>';
+      return;
+    }
+    var frag = document.createDocumentFragment();
+    state.events.forEach(function (ev) { frag.appendChild(buildEvent(ev, false)); });
+    target.appendChild(frag);
+    target.scrollTop = target.scrollHeight;
+  }
+
+  // Called from ingest path via renderCurrentView; append only the new tail.
+  function appendNewEvents(newlyAdded) {
+    var target = state.mountedEventsEl;
+    if (!target || !newlyAdded.length) return;
+    var empty = target.querySelector(".events-empty");
+    if (empty) empty.remove();
+    var frag = document.createDocumentFragment();
+    newlyAdded.forEach(function (ev) { frag.appendChild(buildEvent(ev, true)); });
+    target.appendChild(frag);
+    target.scrollTop = target.scrollHeight;
+  }
+
+  function buildEvent(ev, animate) {
     var li = document.createElement("li");
-    li.className = "event enter";
+    li.className = "event" + (animate ? " enter" : "");
     li.dataset.level = ev.level || "info";
     var glyph = LEVEL_GLYPH[ev.level] || LEVEL_GLYPH.info;
     li.innerHTML =
@@ -601,41 +971,48 @@
     return li;
   }
 
+  // Wrap ingestEvents so the mounted list gets incremental appends. We diff by
+  // tracking how many events existed before the ingest.
+  var _ingestEvents = ingestEvents;
+  ingestEvents = function (events) {
+    var before = state.events.length;
+    _ingestEvents(events);
+    var added = state.events.slice(before);
+    if (added.length && state.mountedEventsEl) appendNewEvents(added);
+    if (el.eventsHint) el.eventsHint.textContent = state.events.length + " events";
+  };
+
+  // =========================================================================
+  // Transition reveal
+  // =========================================================================
+  function playDebriefReveal() {
+    // The stoplight + followups already render with the `reveal` class on the
+    // first debrief paint after the switch; nothing else to orchestrate here.
+    // (Kept as a hook so future run-complete effects have a home.)
+  }
+
   // =========================================================================
   // Minimal Markdown renderer
   //   Supports: # / ## / ### headings, - and * and 1. lists, ``` code fences,
-  //   `inline code`, **bold**, *em*/_em_, [text](url), --- rule, paragraphs.
+  //   `inline code`, **bold**, *em*/_em_, [text](url), --- rule, GFM tables.
   //   Everything is HTML-escaped first; only our own tags are injected.
   // =========================================================================
   function renderMarkdown(src) {
     if (!src) return "";
     var lines = String(src).replace(/\r\n?/g, "\n").split("\n");
-    var out = [];
-    var i = 0;
-    var listType = null;   // 'ul' | 'ol' | null
-
-    function closeList() {
-      if (listType) { out.push("</" + listType + ">"); listType = null; }
-    }
+    var out = [], i = 0, listType = null;
+    function closeList() { if (listType) { out.push("</" + listType + ">"); listType = null; } }
 
     while (i < lines.length) {
       var line = lines[i];
-
-      // fenced code block
       var fence = line.match(/^```\s*(\S*)\s*$/);
       if (fence) {
-        closeList();
-        var buf = [];
+        closeList(); var buf = []; i++;
+        while (i < lines.length && !/^```\s*$/.test(lines[i])) { buf.push(lines[i]); i++; }
         i++;
-        while (i < lines.length && !/^```\s*$/.test(lines[i])) {
-          buf.push(lines[i]); i++;
-        }
-        i++; // skip closing fence
         out.push("<pre><code>" + escHtml(buf.join("\n")) + "</code></pre>");
         continue;
       }
-
-      // GFM table: a row with pipes followed by a delimiter row (|---|:--:|...)
       if (line.indexOf("|") !== -1 && i + 1 < lines.length &&
           /\|/.test(lines[i + 1]) &&
           /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(lines[i + 1])) {
@@ -645,59 +1022,26 @@
           var l = /^:/.test(c), r = /:$/.test(c);
           return (l && r) ? "center" : r ? "right" : l ? "left" : "";
         });
-        i += 2;
-        var rows = [];
+        i += 2; var rows = [];
         while (i < lines.length && lines[i].indexOf("|") !== -1 && !/^\s*$/.test(lines[i])) {
           rows.push(splitRow(lines[i])); i++;
         }
         out.push(buildTable(header, aligns, rows));
         continue;
       }
-
-      // horizontal rule
-      if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
-        closeList(); out.push("<hr>"); i++; continue;
-      }
-
-      // headings
+      if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { closeList(); out.push("<hr>"); i++; continue; }
       var h = line.match(/^(#{1,3})\s+(.*)$/);
-      if (h) {
-        closeList();
-        var lvl = h[1].length;
-        out.push("<h" + lvl + ">" + inline(h[2]) + "</h" + lvl + ">");
-        i++; continue;
-      }
-
-      // unordered list
+      if (h) { closeList(); out.push("<h" + h[1].length + ">" + inline(h[2]) + "</h" + h[1].length + ">"); i++; continue; }
       var ul = line.match(/^\s*[-*+]\s+(.*)$/);
-      if (ul) {
-        if (listType !== "ul") { closeList(); out.push("<ul>"); listType = "ul"; }
-        out.push("<li>" + inline(ul[1]) + "</li>");
-        i++; continue;
-      }
-
-      // ordered list
+      if (ul) { if (listType !== "ul") { closeList(); out.push("<ul>"); listType = "ul"; } out.push("<li>" + inline(ul[1]) + "</li>"); i++; continue; }
       var ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
-      if (ol) {
-        if (listType !== "ol") { closeList(); out.push("<ol>"); listType = "ol"; }
-        out.push("<li>" + inline(ol[1]) + "</li>");
-        i++; continue;
-      }
-
-      // blank line
+      if (ol) { if (listType !== "ol") { closeList(); out.push("<ol>"); listType = "ol"; } out.push("<li>" + inline(ol[1]) + "</li>"); i++; continue; }
       if (/^\s*$/.test(line)) { closeList(); i++; continue; }
-
-      // paragraph (gather consecutive non-structural lines)
       closeList();
-      var para = [line];
-      i++;
-      while (i < lines.length &&
-             !/^\s*$/.test(lines[i]) &&
-             !/^```/.test(lines[i]) &&
-             !/^(#{1,3})\s+/.test(lines[i]) &&
-             !/^\s*[-*+]\s+/.test(lines[i]) &&
-             !/^\s*\d+[.)]\s+/.test(lines[i]) &&
-             !/^\s*([-*_])(\s*\1){2,}\s*$/.test(lines[i])) {
+      var para = [line]; i++;
+      while (i < lines.length && !/^\s*$/.test(lines[i]) && !/^```/.test(lines[i]) &&
+             !/^(#{1,3})\s+/.test(lines[i]) && !/^\s*[-*+]\s+/.test(lines[i]) &&
+             !/^\s*\d+[.)]\s+/.test(lines[i]) && !/^\s*([-*_])(\s*\1){2,}\s*$/.test(lines[i])) {
         para.push(lines[i]); i++;
       }
       out.push("<p>" + inline(para.join(" ")) + "</p>");
@@ -706,67 +1050,48 @@
     return out.join("");
   }
 
-  // split a table row into trimmed cells, dropping the optional leading/trailing
-  // pipe and honoring escaped pipes (\|).
   function splitRow(row) {
     var s = row.trim().replace(/^\|/, "").replace(/\|$/, "");
-    s = s.replace(/\\\|/g, "\uF8FF");        // protect escaped pipes
-    return s.split("|").map(function (c) {
-      return c.replace(/\uF8FF/g, "|").trim();
-    });
+    s = s.replace(/\\\|/g, "");
+    return s.split("|").map(function (c) { return c.replace(//g, "|").trim(); });
   }
-
   function alignAttr(a) { return a ? ' style="text-align:' + a + '"' : ""; }
-
   function buildTable(header, aligns, rows) {
     var h = "<thead><tr>";
-    header.forEach(function (c, idx) {
-      h += "<th" + alignAttr(aligns[idx]) + ">" + inline(c) + "</th>";
-    });
+    header.forEach(function (c, idx) { h += "<th" + alignAttr(aligns[idx]) + ">" + inline(c) + "</th>"; });
     h += "</tr></thead><tbody>";
     rows.forEach(function (r) {
       h += "<tr>";
-      for (var idx = 0; idx < header.length; idx++) {
-        h += "<td" + alignAttr(aligns[idx]) + ">" + inline(r[idx] != null ? r[idx] : "") + "</td>";
-      }
+      for (var idx = 0; idx < header.length; idx++) h += "<td" + alignAttr(aligns[idx]) + ">" + inline(r[idx] != null ? r[idx] : "") + "</td>";
       h += "</tr>";
     });
     h += "</tbody>";
     return '<table class="md-table">' + h + "</table>";
   }
-
-  // inline formatting on already-structural text
   function inline(text) {
-    // escape first, then re-introduce our markup via placeholder-safe regex
-    var s = escHtml(text);
-    // inline code (protect contents from further formatting)
-    var codes = [];
-    s = s.replace(/`([^`]+)`/g, function (_, c) {
-      codes.push(c);
-      return " CODE" + (codes.length - 1) + " ";
-    });
-    // bold then italic
+    var s = escHtml(text), codes = [];
+    // Protect inline code with a private-use sentinel (U+F8FF) that cannot occur
+    // in normal text, so restoration can't be triggered by user content and no
+    // stray whitespace is injected around the code span.
+    s = s.replace(/`([^`]+)`/g, function (_, c) { codes.push(c); return "" + (codes.length - 1) + ""; });
     s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
     s = s.replace(/(^|[^_])_([^_\n]+)_/g, "$1<em>$2</em>");
-    // links [text](url) — only http(s)/mailto/relative, escaped url
     s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (_, txt, url) {
       if (!/^(https?:|mailto:|\/|#)/i.test(url)) return txt;
-      // escHtml() (applied above) does not escape quotes; encode them so a
-      // crafted url can't break out of the href attribute (XSS).
       var safeUrl = url.replace(/"/g, "%22").replace(/'/g, "%27");
       return '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' + txt + '</a>';
     });
-    // restore code spans
-    s = s.replace(/ CODE(\d+) /g, function (_, n) {
-      return "<code>" + codes[+n] + "</code>";
-    });
+    s = s.replace(/(\d+)/g, function (_, n) { return "<code>" + codes[+n] + "</code>"; });
     return s;
   }
-
+  // Escapes for both text and attribute contexts: quotes are encoded too, so
+  // interpolating esc() inside `attr="..."` (chip titles, data-*, etc.) can't
+  // break out of the attribute. Many call sites rely on this.
   function escHtml(s) {
     return String(s)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
   function esc(s) { return escHtml(s == null ? "" : s); }
 
@@ -777,14 +1102,23 @@
     var tick = function () {
       var d = new Date();
       el.clock.textContent = pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+      updateElapsed();
     };
     tick(); setInterval(tick, 1000);
   }
   function pad(n) { return (n < 10 ? "0" : "") + n; }
 
+  // Re-tick any live elapsed labels (header running time + NOW cards).
+  function updateElapsed() {
+    if (el.rvTime.dataset.start) el.rvTime.textContent = "started " + relTime(el.rvTime.dataset.start);
+    var cards = el.now.querySelectorAll(".now-elapsed[data-start]");
+    for (var i = 0; i < cards.length; i++) {
+      if (cards[i].dataset.start) cards[i].textContent = elapsedLabel(cards[i].dataset.start);
+    }
+  }
+
   function parseTs(ts) {
     if (!ts) return null;
-    // stored as ISO-8601 UTC like 2026-06-01T17:04:05Z
     var d = new Date(ts);
     return isNaN(d.getTime()) ? null : d;
   }
@@ -792,6 +1126,15 @@
     var d = parseTs(ts);
     if (!d) return "--:--:--";
     return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+  }
+  function elapsedLabel(start) {
+    var d = parseTs(start);
+    if (!d) return "";
+    var sec = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+    var m = Math.floor(sec / 60), s = sec % 60;
+    if (m < 60) return pad(m) + ":" + pad(s);
+    var hh = Math.floor(m / 60); m = m % 60;
+    return hh + "h " + pad(m) + "m";
   }
   function relTime(ts) {
     var d = parseTs(ts);
@@ -806,15 +1149,12 @@
   function timeRange(start, finish) {
     var s = parseTs(start);
     if (!s) return "";
-    var label = "started " + clockTime(start);
     var end = parseTs(finish);
     if (end) {
       var dur = Math.max(0, Math.round((end.getTime() - s.getTime()) / 1000));
-      label += "  ·  " + fmtDur(dur);
-    } else {
-      label = "started " + relTime(start);
+      return "ran " + fmtDur(dur);
     }
-    return label;
+    return "started " + relTime(start);
   }
   function fmtDur(sec) {
     if (sec < 60) return sec + "s";
@@ -829,9 +1169,6 @@
   // =========================================================================
   function fetchJSON(url) {
     return fetch(url, { headers: { "Accept": "application/json" } })
-      .then(function (r) {
-        if (!r.ok) throw new Error("http " + r.status);
-        return r.json();
-      });
+      .then(function (r) { if (!r.ok) throw new Error("http " + r.status); return r.json(); });
   }
 })();

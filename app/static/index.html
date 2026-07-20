@@ -41,6 +41,8 @@
 
     <!-- Main detail -->
     <main class="detail" id="detail">
+
+      <!-- Empty state -->
       <div class="empty-state" id="empty-state">
         <div class="empty-glyph" aria-hidden="true">
           <span></span><span></span><span></span>
@@ -49,74 +51,148 @@
         <p>Start one with <code>/zed:maintenance &lt;tag&gt;</code> and live activity will stream in here.</p>
       </div>
 
-      <div class="run-view" id="run-view" hidden>
-        <!-- Run header -->
-        <section class="run-header">
-          <div class="run-id-block">
-            <span class="run-tag" id="rv-tag">tag</span>
-            <span class="run-meta" id="rv-meta">run #—</span>
-          </div>
-          <div class="run-status-block">
+      <!-- =========================================================== -->
+      <!-- RUN VIEW — one container, two faces switched by data-face   -->
+      <!-- =========================================================== -->
+      <div class="run-view" id="run-view" data-face="live" hidden>
+
+        <!-- Slim command header (shared by both faces) -->
+        <section class="rv-head" id="rv-head">
+          <div class="rv-head-id">
+            <span class="rv-tag" id="rv-tag">tag</span>
             <span class="status-pill" id="rv-status" data-status="running">running</span>
-            <span class="run-time" id="rv-time"></span>
           </div>
+          <div class="rv-head-meta">
+            <span class="rv-meta" id="rv-meta">run #—</span>
+            <span class="rv-time" id="rv-time"></span>
+          </div>
+          <!-- compact inline stage rail (live face) -->
+          <ol class="stage-rail" id="stage-rail" aria-label="run stage"></ol>
         </section>
 
-        <!-- Stage stepper -->
-        <section class="stepper" id="stepper" aria-label="run stage"></section>
+        <!-- ---------------------------------------------------------- -->
+        <!-- FACE A — LIVE FOCUS                                        -->
+        <!-- ---------------------------------------------------------- -->
+        <div class="face face-live" id="face-live">
 
-        <!-- Counts -->
-        <section class="counts" id="counts"></section>
-
-        <!-- Followup tickets -->
-        <section class="followups" id="followups-section" hidden>
-          <div class="pane-head">
-            <span class="pane-title">FOLLOWUPS</span>
-            <span class="pane-hint" id="followups-hint"></span>
-          </div>
-          <div class="followups-wrap">
-            <table class="followups-table">
-              <thead>
-                <tr>
-                  <th class="tk-num">#</th>
-                  <th>Project</th>
-                  <th>Needs followup</th>
-                  <th class="tk-stat">Status</th>
-                  <th>Latest update</th>
-                </tr>
-              </thead>
-              <tbody id="followups-body"></tbody>
-            </table>
-          </div>
-          <p class="followups-foot" id="followups-foot"></p>
-        </section>
-
-        <!-- Two columns: jobs + summary/log -->
-        <div class="run-body">
-          <section class="jobs-pane">
-            <div class="pane-head">
-              <span class="pane-title">PROJECTS</span>
-              <span class="pane-hint" id="jobs-hint"></span>
-            </div>
-            <div class="jobs" id="jobs"></div>
+          <!-- one-line progress rail -->
+          <section class="progress-rail" id="progress-rail">
+            <div class="pr-bar" id="pr-bar" aria-hidden="true"><span class="pr-fill" id="pr-fill"></span></div>
+            <div class="pr-stats" id="pr-stats"></div>
           </section>
 
-          <section class="side-pane">
+          <div class="live-grid">
+            <!-- left: NOW + QUEUE -->
+            <section class="live-work">
+              <div class="pane-head">
+                <span class="pane-title">NOW</span>
+                <span class="pane-hint" id="now-hint"></span>
+              </div>
+              <div class="now" id="now"></div>
+
+              <div class="pane-head" style="margin-top:18px">
+                <span class="pane-title">QUEUE</span>
+                <span class="pane-hint" id="queue-hint"></span>
+              </div>
+              <div class="queue" id="queue"></div>
+            </section>
+
+            <!-- right: activity -->
+            <section class="live-activity">
+              <div class="pane-head">
+                <span class="pane-title">ACTIVITY</span>
+                <span class="pane-hint" id="events-hint"></span>
+              </div>
+              <ol class="events" id="events"></ol>
+            </section>
+          </div>
+
+          <!-- demoted followup strip -->
+          <a class="followup-strip" id="followup-strip" href="#" hidden>
+            <span class="fs-icon" aria-hidden="true">▸</span>
+            <span class="fs-label" id="fs-label">followups queued</span>
+            <span class="fs-view">view →</span>
+          </a>
+        </div>
+
+        <!-- ---------------------------------------------------------- -->
+        <!-- FACE B — DEBRIEF                                           -->
+        <!-- ---------------------------------------------------------- -->
+        <div class="face face-debrief" id="face-debrief">
+
+          <!-- stoplight board -->
+          <section class="stoplight" id="stoplight" aria-label="run outcome"></section>
+
+          <!-- followups promoted to top -->
+          <section class="db-followups" id="db-followups" hidden>
+            <div class="pane-head">
+              <span class="pane-title">FOLLOWUPS</span>
+              <a class="pane-link" id="db-followups-link" href="#">full detail →</a>
+            </div>
+            <div class="followups-wrap">
+              <table class="followups-table">
+                <thead>
+                  <tr>
+                    <th class="tk-num">#</th>
+                    <th>Project</th>
+                    <th>Needs followup</th>
+                    <th class="tk-stat">Status</th>
+                    <th>Latest update</th>
+                  </tr>
+                </thead>
+                <tbody id="db-followups-body"></tbody>
+              </table>
+            </div>
+            <p class="followups-foot" id="db-followups-foot"></p>
+          </section>
+
+          <!-- run summary -->
+          <section class="db-summary">
             <div class="pane-head">
               <span class="pane-title">RUN SUMMARY</span>
             </div>
             <div class="summary md" id="summary">
-              <p class="muted">No summary yet — it appears when the run finishes.</p>
+              <p class="muted">No summary recorded for this run.</p>
             </div>
+          </section>
 
-            <div class="pane-head" style="margin-top:22px">
-              <span class="pane-title">ACTIVITY</span>
-              <span class="pane-hint" id="events-hint"></span>
+          <!-- per-project results -->
+          <section class="db-results">
+            <div class="pane-head">
+              <span class="pane-title">PROJECT RESULTS</span>
+              <span class="pane-hint" id="results-hint"></span>
             </div>
-            <ol class="events" id="events"></ol>
+            <div class="results" id="results"></div>
+          </section>
+
+          <!-- demoted activity log -->
+          <section class="db-log">
+            <button class="log-toggle" id="log-toggle" aria-expanded="false">
+              <span class="lt-caret">▸</span>
+              <span class="pane-title">ACTIVITY LOG</span>
+              <span class="pane-hint" id="log-count"></span>
+            </button>
+            <ol class="events events-collapsed" id="events-debrief" hidden></ol>
           </section>
         </div>
       </div>
+
+      <!-- =========================================================== -->
+      <!-- FOLLOWUPS PAGE                                              -->
+      <!-- =========================================================== -->
+      <div class="followups-page" id="followups-page" hidden>
+        <a class="back-link" id="fp-back" href="#">← back to run</a>
+        <div class="fp-head">
+          <div>
+            <h1 class="fp-title" id="fp-title">Followups</h1>
+            <span class="fp-sub" id="fp-sub"></span>
+          </div>
+          <span class="status-pill" id="fp-runstatus" data-status="needs_followup"></span>
+        </div>
+        <div class="fp-list" id="fp-list"></div>
+        <p class="fp-help" id="fp-help"></p>
+      </div>
+
     </main>
   </div>
 
