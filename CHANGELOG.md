@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.10.0 — 2026-08-03
+
+### Added
+
+- `maintenance` observability app: **status-driven focus/debrief redesign.** The
+  run view is now one container with two faces that switch automatically on
+  `run.status`, so the agent's current work stays top-of-fold while a run is live
+  and followups float to the top once the sweep is done.
+  - **Live Focus** (`status=running`): viewport-pinned with no page scroll — slim
+    header plus inline stage rail, a one-line progress bar, a NOW hero for the
+    running project (spinner, live elapsed, latest activity), a dense QUEUE chip
+    grid, a full-height ACTIVITY log, and followups collapsed to a quiet one-line
+    strip that opens the followups page.
+  - **Debrief** (`needs_followup`/`completed`/`failed`/`cancelled`): the order
+    inverts so followups float to the top — stoplight board (lamps light when
+    non-zero), promoted followups table, run summary, per-project results triaged
+    worst-first with the clean majority folded, activity log demoted.
+  - **Followups page**: hash-routed `#/run/:id/followups` (plus a
+    `/followup/:fid` deep link with one-shot auto-scroll) showing full comment
+    timelines, rendered from data already in `/api/runs/:id` — no new endpoint.
+  - The running→done transition animates live over SSE with a
+    stoplight/followups reveal, guarded by `prefers-reduced-motion`.
+
+  Frontend-only: `app/static/{index.html,styles.css,app.js}`. `server.py` is
+  untouched — every field both faces need was already served. Existing
+  constraints kept: Python 3 stdlib server, vanilla JS, no pip/npm/CDN/build.
+
+### Fixed
+
+- `maintenance` observability app: the shared HTML escaper now encodes quotes
+  (`"` and `'`), closing an attribute-context XSS breakout at the many
+  `esc()`-into-attribute call sites (chip `title`, `data-*` attributes).
+
 ## 0.9.0 — 2026-07-14
 
 ### Added
