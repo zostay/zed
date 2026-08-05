@@ -137,10 +137,9 @@ New findings go elsewhere, in this order:
    (`gh issue comment <n> --body ...`) instead of opening a second.
 
    Step 2 already confirmed this session is in the ticket's project, so these run
-   bare and resolve to the right repository. Note that only `gh pr merge` and
-   `gh pr close` carry standing allow rules — an unattended session can have the
-   issue verbs come back permission-denied; that is case 2, not a reason to file a
-   followup.
+   bare and resolve to the right repository. The issue verbs carry standing allow
+   rules, but don't assume it — if one comes back permission-denied, that is
+   case 2 below, never a reason to file a followup.
 
 2. **Straight to the user, in your step 6 report** — when the project has no GitHub
    remote (`gh repo view` fails), when `gh issue create` is denied, or when the

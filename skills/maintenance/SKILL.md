@@ -365,13 +365,13 @@ subagent does the project work and logs its own progress events.
    ```bash
    gh repo view --json nameWithOwner -q .nameWithOwner
    ```
-   **Only `gh pr merge` and `gh pr close` have standing allow rules.** The `gh`
-   verbs this sub-step uses (`gh repo view`, `gh pr list`, `gh issue list`) do
-   not, so under an unattended sweep (`defaultMode: auto`) they can come back
-   **permission-denied** rather than with data. Tell the two apart before you log
-   anything — a denial says the tool was blocked, not that the project is off
-   GitHub, and recording it as "no remote" writes a false cause into the run
-   history:
+   `gh repo view`, `gh pr list` and `gh issue list` carry standing allow rules,
+   so they run bare in an unattended sweep. Do not *assume* they did: a rule can
+   be missing on a machine whose settings differ, and then the command comes back
+   **permission-denied** rather than with data. Tell that apart from a genuine
+   failure before you log anything — a denial says the tool was blocked, not that
+   the project is off GitHub, and recording it as "no remote" writes a false
+   cause into the run history:
    - **Denied / blocked** — log a `warn` (`"Weekly GitHub triage blocked by
      permissions; skipping."`) and stop this sub-step.
    - **Genuinely failed** (no remote, not a GitHub repo, not authenticated) —
@@ -542,9 +542,9 @@ subagent does the project work and logs its own progress events.
    gh issue list --repo "<owner/repo>" --state open --search "<distinctive words>"
    gh issue create --repo "<owner/repo>" --title "<what is broken>" --body "<what was observed, where, and why it matters>"
    ```
-   Neither verb has a standing allow rule (only `gh pr merge`/`gh pr close` do),
-   so under an unattended sweep either can come back **permission-denied**. If it
-   does, the finding is **not** downgraded to a followup ticket: report it to
+   Both verbs carry standing allow rules, so they run bare in an unattended
+   sweep — but do not assume it: if either comes back **permission-denied**,
+   the finding is **not** downgraded to a followup ticket. Report it to
    Sterling in your final roll-up message, exactly as for a project with no
    GitHub remote. Whichever way it was filed, don't file it twice, and put the
    resulting issue URL in the job summary. Real run #11 tickets that should have

@@ -133,10 +133,10 @@ the run status update without a refresh).
     it belongs on `<project_name>`.
 
   Also report it to the user rather than filing when the project has no GitHub
-  remote, when `gh issue create` comes back permission-denied (only `gh pr merge`
-  and `gh pr close` carry standing allow rules — an unattended session can have the
-  issue verbs blocked), or when the finding is really a question only they can
-  answer. A blocked or unfilable finding is **never** downgraded to a followup
+  remote, when `gh issue create` comes back permission-denied (the issue verbs
+  carry standing allow rules, but don't assume it — a session whose settings
+  differ can have them blocked), or when the finding is really a question only
+  they can answer. A blocked or unfilable finding is **never** downgraded to a followup
   ticket. Then say where it went in the comment you record, so the trail isn't lost.
 - Resolving tickets is the *only* thing that moves a run from **Needs Followup**
   to **Completed** — there is no separate "complete the run" step.
