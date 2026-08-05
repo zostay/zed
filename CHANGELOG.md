@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.11.0 — 2026-08-05
+
+### Added
+
+- `maintenance`: **weekly GitHub triage.** A run tagged exactly `weekly` now ends
+  each project with one cursory pass over that repo's open issues and PRs —
+  listing them, dropping Dependabot/deploy noise and anything the run itself just
+  created, ranking what's left, and keeping the top five. It never resolves,
+  merges, comments on, or checks out anything; the whole point is to remind you
+  what work is pending for *you*.
+  - New `project_issues` table (`scripts/schema.sql`) holding a per-run,
+    immutable snapshot, plus `add-project-issue`, `add-project-issues` (batch
+    JSONL/JSON-array) and `list-project-issues` in `maintenance-db.sh`.
+  - `server.py` serves `project_issues` and `top_issues` (the top 10 across all
+    projects) on `/api/runs/:id` and over SSE; both degrade to `[]` against a
+    database created before the table existed.
+  - The observability app gains a **GITHUB TRIAGE** section on the debrief face:
+    a ranked top-10 board across every project plus per-project groups, each row
+    a generous link that opens the item on GitHub in a new tab. Rank drives a
+    four-tier rail, age is colored by staleness, and issues and PRs carry
+    distinct glyphs. Only `https://` URLs are ever turned into links.
+  - Step 6 repeats the top 10 as a Markdown table in the run summary.
+  - Gated on the tag being **exactly** `weekly`: any other tag writes no rows,
+    and the app hides the section outright. A project with no GitHub remote is
+    an `info` event and a skip; any triage failure is a `warn` and never changes
+    a job's status.
+
+### Changed
+
+- `maintenance`, `maint-followup`, `maint-followup-do`: **followup tickets are
+  now deliberately scarce.** Run #11 opened ten tickets where roughly one was
+  warranted, so Step 5 now runs a three-way disposition — **punt → GitHub issue
+  → ticket** — with the real run #11 tickets quoted as worked examples:
+  - **Punt** anything next week's routine picks up on its own, unless it is
+    urgent (harm accrues first) or blocks the sweep from functioning.
+  - **File a GitHub issue** for anything describing a bug, misconfiguration, or
+    failure in the project or its tooling — it outlives the run, a ticket
+    doesn't.
+  - **Open a ticket** only for work that needs you personally before the next
+    run: a decision without which the sweep cannot function, a credential step,
+    a deploy you must approve. Tie-breakers: torn between ticket and issue, file
+    the issue; torn between ticket and punt, punt.
+  - `maint-followup` and `maint-followup-do` are now **forbidden from filing
+    followups at all** — the regression that produced tickets #63–#65. New
+    findings go to `gh issue create` (searching first to avoid duplicates) or
+    directly to you, with a comment on the worked ticket recording where the
+    finding went. Only a `/zed:maintenance` sweep may open a ticket.
+  - A job is `followup` only when it left a ticket; punted work and filed issues
+    are ordinary `success` output described in the job summary prose.
+
+- `maintenance` observability app: the debrief followups table is now **one row
+  per ticket, at most two lines tall**. The detail sub-line is gone from the
+  front page and the title / latest-update cells clamp with the full text in a
+  tooltip; the ticket number deep-links to the followups page, where the full
+  detail and complete comment timeline still live untouched.
+
+### Fixed
+
+- `maintenance-db.sh`: a batch `add-project-issues` whose rows all failed to
+  *write* (a mis-threaded `--job`, an unwritable database) exited 0 and looked
+  like success. Validation rejects are still skipped non-fatally, but a database
+  write failure now exits non-zero with a count.
+- `maintenance-db.sh`: a malformed pretty-printed JSON **array** fell through to
+  the line-oriented JSONL path and silently recorded a fraction of its elements.
+  It now fails loudly with jq's parse error and records nothing.
+- `maintenance-db.sh`: `--rank` outside 0..100 was rejected instead of clamped.
+- `maint-followup`: could file a GitHub issue against whatever repository the
+  session happened to be sitting in; it now checks the repo matches the ticket's
+  project first, as `maint-followup-do` already did.
+
 ## 0.10.0 — 2026-08-03
 
 ### Added

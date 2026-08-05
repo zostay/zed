@@ -301,12 +301,20 @@ code, .mono { font-family: var(--mono); }
   color: var(--ink-dim);
 }
 .pane-hint { font-family: var(--mono); font-size: var(--fs-105); color: var(--ink-faint); }
+/* A pill rather than a text link: the front-page followups table is deliberately
+   terse, so the way through to the full detail has to read as a control. */
 .pane-link {
-  font-family: var(--mono); font-size: var(--fs-105); letter-spacing: 0.06em;
+  font-family: var(--mono); font-size: var(--fs-100); letter-spacing: 0.08em;
   color: var(--followup); text-decoration: none;
-  border-bottom: 1px dotted rgba(192,132,252,0.5);
+  padding: 3px 10px; border-radius: 100px;
+  border: 1px solid rgba(192,132,252,0.35);
+  background: rgba(192,132,252,0.08);
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
 }
-.pane-link:hover { color: #d8b4fe; }
+.pane-link:hover {
+  color: #d8b4fe; border-color: rgba(192,132,252,0.7);
+  background: rgba(192,132,252,0.16);
+}
 .muted { color: var(--ink-faint); font-family: var(--mono); font-size: var(--fs-120); }
 
 /* --------------------------------------------------------------------------- run-view + faces */
@@ -617,7 +625,7 @@ code, .mono { font-family: var(--mono); }
 @keyframes lampon { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; } }
 
 /* --------------------------------------------------------------------------- DEBRIEF: sections */
-.db-followups, .db-summary, .db-results, .db-log { margin-bottom: 26px; }
+.db-followups, .db-triage, .db-summary, .db-results, .db-log { margin-bottom: 26px; }
 
 /* promoted followups table */
 .db-followups {
@@ -631,9 +639,20 @@ code, .mono { font-family: var(--mono); }
 @keyframes slideup { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; } }
 .followups-wrap { overflow-x: auto; }
 .followups-table {
-  width: 100%; border-collapse: collapse;
+  width: 100%; border-collapse: collapse; table-layout: fixed;
+  /* Fixed layout hands the last column whatever is left over, so mixing fixed
+     pixels with percentages starved "Latest update" to 0px (and overlapped the
+     headers) in any window under ~900px. Every column is a percentage summing
+     to 100% instead, and min-width lets .followups-wrap scroll horizontally
+     rather than crushing the columns on a narrow screen. */
+  min-width: 640px;
   font-size: var(--fs-125); color: var(--ink);
 }
+.tk-c-num    { width: 7%; }
+.tk-c-proj   { width: 18%; }
+.tk-c-title  { width: 36%; }
+.tk-c-stat   { width: 11%; }
+.tk-c-latest { width: 28%; }
 .followups-table th {
   text-align: left; font-family: var(--mono); font-weight: 600;
   font-size: var(--fs-095); letter-spacing: 0.12em; text-transform: uppercase;
@@ -642,17 +661,41 @@ code, .mono { font-family: var(--mono); }
   white-space: nowrap;
 }
 .followups-table td {
-  padding: 8px 10px; border-bottom: 1px solid var(--line-soft);
-  vertical-align: top;
+  padding: 5px 10px; border-bottom: 1px solid var(--line-soft);
+  vertical-align: middle;
 }
 .followups-table tr:last-child td { border-bottom: none; }
 .followups-table th.tk-num, .followups-table td.tk-num { width: 1%; white-space: nowrap; }
 .followups-table th.tk-stat, .followups-table td.tk-stat { width: 1%; white-space: nowrap; }
 .tk-num { font-family: var(--mono); color: var(--followup); font-weight: 600; }
-.tk-proj { font-family: var(--mono); color: var(--ink); white-space: nowrap; }
+/* The ticket number deep-links to that ticket on the followups page — the
+   terse front-page row's escape hatch to the full detail. */
+.tk-num a {
+  color: inherit; text-decoration: none;
+  border-bottom: 1px dotted rgba(192,132,252,0.35);
+}
+.tk-num a:hover { color: #d8b4fe; border-bottom-color: #d8b4fe; }
+/* Nowrap keeps the project name on one line; ellipsis keeps a long one (say
+   periodic-s3-sync) from painting over the adjacent title cell. */
+.tk-proj {
+  font-family: var(--mono); color: var(--ink); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
 .tk-title { color: var(--ink); }
-.tk-detail { display: block; color: var(--ink-dim); font-size: var(--fs-115); margin-top: 2px; }
 .tk-latest { color: var(--ink-dim); }
+/* Front-page rows stay one or two lines tall. The ticket's own detail text and
+   its comment timeline are deliberately not here — they live on the followups
+   page, one click away, so this board stays scannable at a glance.
+   The clamp lives on a padding-free inline-block inside the cell, not on the
+   <td> itself: a table cell blockifies away from -webkit-box, and its 5px
+   padding + 1px border made an em-based max-height on the cell slice the
+   bottom off the second line. On the span the belt clears two lines (2.7em)
+   with a hair of rounding slack, and still stops well short of a third. */
+.tk-title .clamp2, .tk-latest .clamp2 {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden;
+  line-height: 1.35; max-height: 2.75em;
+}
 .tk-row.is-closed { opacity: 0.6; }
 .tk-row.is-closed .tk-title { text-decoration: line-through; text-decoration-color: var(--ink-faint); }
 .tk-status {
@@ -670,6 +713,146 @@ code, .mono { font-family: var(--mono); }
   font-family: var(--mono); font-size: var(--fs-110);
   background: var(--panel-2); border: 1px solid var(--line);
   border-radius: 3px; padding: 1px 5px; color: var(--ink);
+}
+
+/* --------------------------------------------------------------------------- DEBRIEF: github triage
+   A reminder board, not a worklist: the sweep looked at these and touched
+   nothing. Every row is a whole-row link out to GitHub, so the click target is
+   the row and not a word inside it. Sky rail marks the section as "elsewhere"
+   (GitHub) — distinct from the purple rail that means "your ticket". */
+.db-triage {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--info);
+  border-radius: var(--radius);
+  background: linear-gradient(90deg, rgba(125,211,252,0.045), var(--panel) 45%);
+  padding: 16px 18px;
+}
+.db-triage.reveal { animation: slideup 0.5s ease backwards; animation-delay: 60ms; }
+.gt-note {
+  margin: -2px 0 14px; max-width: 74ch;
+  font-size: var(--fs-115); color: var(--ink-dim); line-height: 1.5;
+}
+.gt-note em { color: var(--ink); font-style: normal; text-decoration: underline dotted; }
+.gt-note strong { font-family: var(--mono); font-size: var(--fs-105); color: var(--ink-dim); font-weight: 600; }
+
+/* sub-headers inside the section (TOP 10 / BY PROJECT) */
+.gt-sub {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  padding-bottom: 6px; margin-bottom: 7px;
+  border-bottom: 1px solid var(--line);
+}
+.gt-sub-title {
+  font-family: var(--mono); font-size: var(--fs-095); letter-spacing: 0.2em;
+  color: var(--ink-dim);
+}
+.gt-sub-hint { font-family: var(--mono); font-size: var(--fs-090); color: var(--ink-faint); }
+.gt-by { margin-top: 20px; }
+
+/* rows */
+.gt-rows { display: flex; flex-direction: column; gap: 2px; }
+.gt-row {
+  position: relative;
+  display: grid; align-items: center;
+  gap: 0 10px;
+  /* min-height keeps the rhythm even when an item has no triage note, so the
+     board still scans as a rail of equal ticks. */
+  min-height: 47px;
+  padding: 6px 9px 6px 15px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: var(--rail);
+  color: inherit; text-decoration: none;
+  transition: background 0.12s, border-color 0.12s;
+}
+/* urgency rail — rank band, brightest at the top of the pile */
+.gt-row::before {
+  content: ""; position: absolute; left: 5px; top: 6px; bottom: 6px;
+  width: 3px; border-radius: 2px; background: var(--tier);
+}
+.gt-row[data-tier="0"] { --tier: var(--run); }
+.gt-row[data-tier="0"]::before { box-shadow: 0 0 8px rgba(251,191,36,0.35); }
+.gt-row[data-tier="1"] { --tier: rgba(251,191,36,0.42); }
+.gt-row[data-tier="2"] { --tier: var(--line); }
+.gt-row[data-tier="3"] { --tier: var(--line-soft); }
+
+a.gt-row:hover { background: var(--panel-2); border-color: var(--line); }
+a.gt-row:hover .gt-title { color: #fff; }
+a.gt-row:hover .gt-open { color: var(--accent); transform: translate(1px, -1px); }
+a.gt-row:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.gt-row.is-nolink { cursor: default; }
+
+/* board (top 10) carries an ordinal + the project it belongs to */
+.gt-board .gt-row { grid-template-columns: 20px 58px minmax(74px, 116px) minmax(0, 1fr) auto 12px; }
+.gt-group .gt-row { grid-template-columns: 58px minmax(0, 1fr) auto 12px; }
+
+.gt-ord {
+  font-family: var(--mono); font-size: var(--fs-100); text-align: right;
+  color: var(--ink-faint); font-variant-numeric: tabular-nums;
+}
+.gt-row[data-tier="0"] .gt-ord { color: var(--run); }
+
+.gt-kind {
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  font-family: var(--mono); font-size: var(--fs-105);
+  color: var(--ink-dim); font-variant-numeric: tabular-nums;
+}
+.gt-glyph { font-size: var(--fs-115); line-height: 1; }
+.gt-row[data-kind="issue"] .gt-glyph { color: var(--info); }
+.gt-row[data-kind="pr"]    .gt-glyph { color: var(--ok); }
+.gt-row[data-draft="1"]    .gt-glyph { color: var(--skip); }
+
+.gt-proj {
+  font-family: var(--mono); font-size: var(--fs-100); color: var(--ink-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.gt-body { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.gt-title {
+  font-size: var(--fs-120); color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.gt-triage {
+  font-family: var(--mono); font-size: var(--fs-095); color: var(--ink-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Leads the title line rather than trailing it, so a long title truncating into
+   an ellipsis can never eat the flag. */
+.gt-flag {
+  display: inline-block; margin-right: 7px; vertical-align: 1px;
+  font-family: var(--mono); font-size: var(--fs-085); letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--skip);
+  border: 1px solid var(--line); border-radius: 2px; padding: 0 4px;
+}
+.gt-age {
+  font-family: var(--mono); font-size: var(--fs-100); white-space: nowrap;
+  color: var(--ink-faint); font-variant-numeric: tabular-nums;
+}
+.gt-age[data-age="aging"] { color: var(--ink-dim); }
+.gt-age[data-age="stale"] { color: var(--fail); }
+.gt-open { font-family: var(--mono); font-size: var(--fs-110); color: var(--ink-faint); transition: color 0.12s, transform 0.12s; }
+.gt-row.is-nolink .gt-open { color: var(--skip); }
+
+/* per-project groups — column flow rather than a grid so a one-row project
+   can't punch a hole in the layout next to a five-row one */
+.gt-groups { columns: 2 430px; column-gap: 22px; }
+.gt-group { break-inside: avoid; margin-bottom: 16px; }
+.gt-group-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  padding-bottom: 5px; margin-bottom: 5px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.gt-group-name {
+  font-family: var(--mono); font-size: var(--fs-120); font-weight: 600; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.gt-group-meta {
+  font-family: var(--mono); font-size: var(--fs-095); color: var(--ink-faint);
+  white-space: nowrap;
+}
+
+@media (max-width: 900px) {
+  /* drop the project column from the board — the groups below still carry it */
+  .gt-board .gt-row { grid-template-columns: 20px 52px minmax(0, 1fr) auto 12px; }
+  .gt-board .gt-proj { display: none; }
 }
 
 /* run summary */

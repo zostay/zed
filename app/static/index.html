@@ -123,14 +123,25 @@
           <!-- stoplight board -->
           <section class="stoplight" id="stoplight" aria-label="run outcome"></section>
 
-          <!-- followups promoted to top -->
+          <!-- followups promoted to top — one line per ticket, detail lives on
+               the followups page behind "full detail" (and each # deep-links) -->
           <section class="db-followups" id="db-followups" hidden>
             <div class="pane-head">
               <span class="pane-title">FOLLOWUPS</span>
-              <a class="pane-link" id="db-followups-link" href="#">full detail →</a>
+              <a class="pane-link" id="db-followups-link" href="#">full detail &amp; comments →</a>
             </div>
             <div class="followups-wrap">
               <table class="followups-table">
+                <!-- Fixed column widths: with auto layout the long "latest
+                     update" text starved the title column and every row wrapped
+                     to three or four lines. -->
+                <colgroup>
+                  <col class="tk-c-num">
+                  <col class="tk-c-proj">
+                  <col class="tk-c-title">
+                  <col class="tk-c-stat">
+                  <col class="tk-c-latest">
+                </colgroup>
                 <thead>
                   <tr>
                     <th class="tk-num">#</th>
@@ -144,6 +155,38 @@
               </table>
             </div>
             <p class="followups-foot" id="db-followups-foot"></p>
+          </section>
+
+          <!-- weekly GitHub triage — hidden entirely unless the run recorded
+               project_issues, so non-weekly runs show nothing at all -->
+          <section class="db-triage" id="db-triage" hidden>
+            <div class="pane-head">
+              <span class="pane-title">GITHUB TRIAGE</span>
+              <span class="pane-hint" id="triage-hint"></span>
+            </div>
+            <p class="gt-note">
+              Open issues and pending PRs this weekly sweep noticed and did
+              <em>not</em> touch. Scan, pick what deserves your time, open it on
+              GitHub. Grouped by project, the one holding the most deserving
+              item first — find the same project by name in
+              <strong>PROJECT RESULTS</strong> below.
+            </p>
+
+            <div class="gt-board">
+              <div class="gt-sub">
+                <span class="gt-sub-title">TOP 10 · ALL PROJECTS</span>
+                <span class="gt-sub-hint">most deserving first</span>
+              </div>
+              <div class="gt-rows" id="gt-top"></div>
+            </div>
+
+            <div class="gt-by">
+              <div class="gt-sub">
+                <span class="gt-sub-title">BY PROJECT</span>
+                <span class="gt-sub-hint" id="gt-groups-hint"></span>
+              </div>
+              <div class="gt-groups" id="gt-groups"></div>
+            </div>
           </section>
 
           <!-- run summary -->

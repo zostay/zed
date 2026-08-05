@@ -301,11 +301,21 @@ subagent does the project work and logs its own progress events.
    "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
      log --run "$RUN_ID" --job "$JOB_ID" --level info --message "Starting maintenance-<tag> in <project_name>."
    ```
-2. Dispatches a subagent (via the Task/Agent tool). The subagent's task is to:
+2. Dispatches a subagent (via the Task/Agent tool). **Compose the whole prompt
+   before you dispatch** — sub-step 3 below is prompt *content*, not a step that
+   runs after the subagent returns. The subagent's task is to:
    - `cd` into `project_path`,
    - invoke that project's `maintenance-<tag>` skill and do the work,
-   - log its own progress events to the **same** database, and
-   - return a concise Markdown summary of what it changed.
+   - log its own progress events to the **same** database,
+   - **when `<tag>` is exactly `weekly`**, triage the project's open GitHub work
+     last, exactly as sub-step 3 spells out (fold that text into this prompt), and
+   - return a concise Markdown summary of what it changed, which **must** end
+     with the project's GitHub slug on its own line —
+     `repo: <owner/repo>` from bare `gh repo view --json nameWithOwner -q
+     .nameWithOwner`, or `repo: none` if that command does not succeed. You need
+     that slug in sub-step 5 to file a GitHub issue against the right repository;
+     `project_name` is only a directory basename and is **not** a valid `--repo`
+     value.
 
    Give the subagent exactly these three coordinates so it can log live activity
    that the web app shows in place:
@@ -328,8 +338,135 @@ subagent does the project work and logs its own progress events.
    so they match their allow rules instead of being auto-denied (see **Never
    prefix an allowlisted command** above). The subagent should NOT touch the run
    row or call `finish-run`; the orchestrator owns those.
-3. After the subagent returns, write its summary to a temp file and finish the
-   job with the right status (`success`, `followup`, `failure`, or `skipped`):
+3. **Weekly runs only — have the subagent triage the project's open GitHub work.**
+   **This sub-step is prompt text for the sub-step 2 subagent, not a thing you do
+   after it returns** — read it while you are still writing that prompt, paste it
+   in, and dispatch once. There is never a second subagent for triage.
+
+   Do this **only when `<tag>` is exactly `weekly`** (string equality: `weekly2`,
+   `weekly-fast` and `dependabot` do not count). For every other tag leave this
+   text out of the prompt completely — no `gh` calls, no rows — and the app hides
+   the section because the run's triage table stays empty.
+
+   The triage is performed by the **same subagent** dispatched in sub-step 2,
+   under the **same `job_id`**, **after** the project's `maintenance-weekly`
+   skill has finished its work. It runs last on purpose: only then does the
+   subagent know which PRs and issues *this run* created, so it can exclude them.
+   The text to hand it follows.
+
+   **It is a cursory glance and nothing more.** The subagent must never try to
+   resolve, merge, close, comment on, check out, or diff any of these items. Its
+   only output is up to five rows in the database. Anything it feels compelled to
+   act on belongs in its summary prose, not in a `gh` write command.
+
+   **a. Confirm the project is even on GitHub.** Run bare, never with the `PATH`
+   prefix (see **Never prefix an allowlisted command** above — the prefix makes
+   the command compound and defeats any allow rule that would have matched):
+   ```bash
+   gh repo view --json nameWithOwner -q .nameWithOwner
+   ```
+   **Only `gh pr merge` and `gh pr close` have standing allow rules.** The `gh`
+   verbs this sub-step uses (`gh repo view`, `gh pr list`, `gh issue list`) do
+   not, so under an unattended sweep (`defaultMode: auto`) they can come back
+   **permission-denied** rather than with data. Tell the two apart before you log
+   anything — a denial says the tool was blocked, not that the project is off
+   GitHub, and recording it as "no remote" writes a false cause into the run
+   history:
+   - **Denied / blocked** — log a `warn` (`"Weekly GitHub triage blocked by
+     permissions; skipping."`) and stop this sub-step.
+   - **Genuinely failed** (no remote, not a GitHub repo, not authenticated) —
+     there is nothing to triage. Log an `info` and stop this sub-step; this is a
+     normal outcome, not an error, and it must not change the job's status:
+     ```bash
+     export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "<DB_SCRIPT>" log --run <RUN_ID> --job <JOB_ID> --level info --message "No GitHub remote; skipping weekly GitHub triage."
+     ```
+
+   Either way the job's status is unaffected (see **f** below). Otherwise keep the
+   `owner/repo` it printed — it goes in `--repo`, and in the `repo:` line of the
+   summary sub-step 2 asked you to return.
+
+   **b. Collect the open work.** Both bare, both capped so a busy repo can't
+   flood the context:
+   ```bash
+   gh pr list  --state open --limit 30 --json number,title,url,author,labels,createdAt,updatedAt,isDraft
+   gh issue list --state open --limit 30 --json number,title,url,author,labels,createdAt,updatedAt
+   ```
+
+   **c. Exclude the noise.** Drop, without exception:
+   - **Dependabot** — `author.login` is `dependabot`, `dependabot[bot]` or
+     `app/dependabot`, **or** the item carries a `dependencies` label. The sweep
+     itself exists to handle these; re-listing them is exactly the noise this
+     section is meant to cut through.
+   - **Deploy/release automation** — release-please / changeset / version-bump
+     PRs, scheduled CI chores, anything a machine opens on a timer.
+   - **Anything this very run just created** — the sweep PR the subagent opened
+     minutes ago, an issue it filed under sub-step 5's rules. Cross-check the
+     numbers you know you created, and treat a `createdAt` later than this job's
+     start as suspect. When in doubt, drop it: the section's job is to remind
+     Sterling of work he has *not* seen, not to echo back what the sweep just did.
+
+   **d. Rank what survives and keep at most 5.** `rank` is 0..100 and **lower
+   means more deserving of attention**:
+   - **0–19** — a PR that is green and just needs review/merge, or an issue
+     reporting something that is live-broken right now.
+   - **20–49** — an issue with a clear next action someone could start today.
+   - **50–79** — ordinary open work, no urgency.
+   - **80–100** — idle or speculative: someday/maybe, stale discussion, an idea.
+
+   Break ties by age, older first. Keep the five best (lowest rank) and discard
+   the rest — five is a reminder, thirty is a backlog dump nobody reads.
+
+   **e. Record them in one batch.** Build a JSONL file — one compact JSON object
+   per line, at most five lines:
+   ```json
+   {"kind":"pr","number":850,"title":"Bump mysql 9.7.1 to 26.7.0","url":"https://github.com/zostay/gobert/pull/850","state":"open","author":"zostay","labels":"database","age_days":23,"triage":"Green but a major jump; needs a go/no-go from you.","rank":10,"updated_at":"2026-08-02T14:05:00Z"}
+   {"kind":"issue","number":31,"title":"Import drops trailing whitespace","url":"https://github.com/zostay/gobert/issues/31","state":"open","author":"someone","labels":"bug","age_days":61,"triage":"Reproducible; fix is small but unowned.","rank":30,"updated_at":"2026-07-19T09:12:00Z"}
+   ```
+   Write it with the **Write tool** to a path of your own (e.g.
+   `/tmp/triage-<project_name>.jsonl`), not with a shell heredoc — the JSON is
+   full of quotes and braces that a heredoc through the Bash tool mangles, and
+   `mktemp` + zsh `noclobber` makes a plain `>` a silent no-op (the trap
+   documented in sub-step 4). Then hand the file over and delete it:
+   ```bash
+   export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "<DB_SCRIPT>" add-project-issues --run <RUN_ID> --job <JOB_ID> --project "<project_name>" --repo "<owner/repo>" --file "/tmp/triage-<project_name>.jsonl"
+   rm -f "/tmp/triage-<project_name>.jsonl"
+   ```
+   Per-item keys are `kind` (`issue`|`pr`), `number`, `title`, `url`, `state`,
+   `author`, `labels` (comma-separated), `age_days`, `triage`, `rank`,
+   `updated_at`. `url` **must** start with `https://` — the UI turns it into a
+   link and anything else is rejected. `triage` is one plain sentence saying why
+   it deserves attention; it is the only prose the operator reads before deciding
+   to click. Rows are keyed `(run_id, project_name, kind, number)`, so re-running
+   a project inside the same run updates its rows instead of duplicating them.
+   `add-project-issues` skips and warns on a bad item rather than aborting, so one
+   malformed line cannot lose the other four. It does **not** shrug off a failed
+   *database write* — a wrong `<JOB_ID>` (foreign key violation) or an unwritable
+   DB makes it exit non-zero with a count on stderr. If it does, the project's
+   triage snapshot did not land: log a `warn` per **f** below and do not report
+   the triage as recorded. Use `add-project-issue` (singular, all-flags form) when
+   there is exactly one item and a file feels like overkill.
+   Set `state` to `draft` for a PR whose `isDraft` is true (and rank it high — a
+   draft is by definition not asking for anything yet), `open` otherwise, and
+   compute `age_days` from `createdAt` to now.
+
+   If nothing survives the filters — a common and perfectly good outcome — write
+   no rows at all and log an `info` event saying the project had nothing pending.
+   Never pad the list to five.
+
+   **f. Triage failure must never fail the job.** `gh` rate limits, an expired
+   token, a repo that 404s — none of that says anything about whether the
+   project's maintenance succeeded. On any error, log a `warn` and move on with
+   the status the maintenance work itself earned:
+   ```bash
+   export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "<DB_SCRIPT>" log --run <RUN_ID> --job <JOB_ID> --level warn --message "Weekly GitHub triage failed (<short reason>); continuing."
+   ```
+4. After the subagent returns, write its summary to a temp file and finish the
+   job with the right status (`success`, `followup`, `failure`, or `skipped`).
+
+   **Work sub-step 5's punt / GitHub-issue / ticket disposition _before_ you call
+   `finish-job`** — the status below is defined in terms of that outcome, and
+   there is no second `finish-job` call to correct it afterwards. Decide the
+   disposition, file whatever it calls for, and only then run:
    ```bash
    SUMMARY_TMP=$(mktemp)
    # Use `>|` (force-clobber), not `>`: `mktemp` pre-creates the file, and under
@@ -344,17 +481,102 @@ subagent does the project work and logs its own progress events.
    - `success` — the project's maintenance completed cleanly with nothing left
      for a human to do.
    - **`followup`** — the project at least **partially** succeeded but left work
-     that needs a human (a manual step, a decision, something to verify). Use this
-     for anything you would otherwise put in the run's "needs attention" section.
+     that needs **Sterling personally**, i.e. work you opened a ticket for under
+     sub-step 5. Leftovers that were punted to next week's run, or filed as a
+     GitHub issue on the project, do **not** make a job `followup` — they are
+     ordinary sweep output and belong in the summary prose of a `success` job.
    - `failure` — the project's maintenance could not be completed; also pass
-     `--error "<short reason>"`. A hard failure that a human must chase up should
-     **also** get a followup ticket (next sub-step) so it is tracked.
+     `--error "<short reason>"`. The *cause* of the failure — a broken build, a
+     broken lint, a migration-ordering bug — is a defect and goes to the
+     project's **issue tracker** (sub-step 5), not to a ticket. Open a ticket
+     only if the failure additionally means the sweep itself cannot function
+     until Sterling personally acts before the next run.
    - `skipped` — there was nothing to do.
 
    Log a closing event for the job and append the result to your action log.
-4. **Open followup tickets for anything needing a human.** For each distinct
-   outstanding item this project left behind (i.e. each thing you'd list under
-   "needs attention"), open a ticket and capture its number:
+5. **Followups — the default is _not_ to file.** A followup ticket is not a
+   general issue tracker and not a to-do list. It means one thing: *the weekly
+   maintenance routine needs Sterling personally, before the next run.* Run #11
+   opened ten tickets and should have opened roughly one; the rules below exist
+   to stop that from recurring, so apply them literally.
+
+   For each outstanding item this project left behind, pick exactly one of three
+   dispositions, and prefer them in this order: **punt → GitHub issue → ticket.**
+
+   **Punt (file nothing).** Weekly maintenance is a *routine*. If next week's run
+   will pick the item up on its own, say so in the job summary prose and file
+   nothing at all. The only exceptions are items that are genuinely **urgent**
+   (harm accrues before the next run — an actively exploited vulnerability, a
+   broken production deploy, data at risk) or **important** (it blocks the sweep
+   itself from functioning). Real run #11 tickets that should have been punted:
+   - *"Rebase/land the 3 open aws-sdk-go-v2 PRs"* — next week's sweep rebases them.
+   - *"Verify the fontawesome PRs went green after rebase"* — next week re-verifies.
+   - *"Decide how to resolve unfixable imaging alert #4"* — no deadline, blocks
+     nothing; it will be in front of him again in seven days.
+   - *"Decide on held PR #850 — mysql 9.7.1 to 26.7.0"* — a version-bump go/no-go
+     has no deadline and the sweep works fine without it. Yes, it is a decision
+     only he can make; that is not sufficient. Punt it, mention it in the job
+     summary, and let the weekly GitHub triage table put it back in front of him
+     (or file a GitHub issue if the hold needs a written rationale). Never a
+     ticket.
+
+   **GitHub issue (`gh issue create` — not a ticket).** Anything that describes a
+   **bug, misconfiguration, or failure in the project itself (or in the tooling)**
+   goes to that project's issue tracker, where it will still exist after this run
+   is forgotten. Search first so you don't create duplicates, then file; if a
+   matching open issue already exists, comment on it (or just cite it) instead.
+   **Prefer having the subagent file it before it returns** — it is already `cd`'d
+   into the project, needs no `--repo` at all, and knows the detail first-hand.
+   Fold that instruction into the sub-step 2 prompt whenever you can anticipate
+   the finding, and have it report the issue URL in its summary.
+
+   When you file it yourself afterwards, you **must** pass `--repo` explicitly,
+   because you are in the orchestrator's cwd, not the project's — a bare
+   `gh issue create` here files against **this session's own repo**, which is
+   never right. The `owner/repo` value is the `repo:` line sub-step 2 requires
+   every subagent to return (`project_name` is a directory basename and is *not*
+   a repo slug — never guess one from it). If the subagent returned
+   `repo: none`, or returned nothing usable, do **not** guess: fall through to the
+   no-remote case below. Run bare, never with the `PATH` prefix:
+   ```bash
+   gh issue list --repo "<owner/repo>" --state open --search "<distinctive words>"
+   gh issue create --repo "<owner/repo>" --title "<what is broken>" --body "<what was observed, where, and why it matters>"
+   ```
+   Neither verb has a standing allow rule (only `gh pr merge`/`gh pr close` do),
+   so under an unattended sweep either can come back **permission-denied**. If it
+   does, the finding is **not** downgraded to a followup ticket: report it to
+   Sterling in your final roll-up message, exactly as for a project with no
+   GitHub remote. Whichever way it was filed, don't file it twice, and put the
+   resulting issue URL in the job summary. Real run #11 tickets that should have
+   been GitHub issues:
+   - *"Dockerfile base image drifting: alpine not covered by Dependabot"* — a
+     defect in the project's Dependabot config.
+   - *"Add a gomod Dependabot entry for gin/examples/polymorphic"* — same.
+   - *"Migration ordering bug leaves internal/models tests running nowhere"* — a
+     bug in the project.
+   - *"Drop retired requiresAuthorization field from SKILL.md"* — a stale config
+     field, i.e. a defect.
+
+   If the project has **no** GitHub remote (`gh repo view` fails), report the
+   finding to Sterling in your final roll-up message instead — still never as a
+   followup ticket.
+
+   **Followup ticket (rare).** Reserve tickets for work only Sterling can do, that
+   cannot wait for the next run:
+   - a **decision only he can make** without which the sweep **itself cannot
+     function** next week — not merely: one PR was left unmerged, one alert left
+     unresolved, one version bump left undecided. That is punt.
+   - a **credential / access / 2FA step** only he can perform,
+   - a **manual deploy or rollout he must approve**,
+   - something **he explicitly asked to be told about**,
+   - a hard `failure` that stops the sweep itself from working until a human
+     chases it (the underlying defect still goes to the issue tracker).
+
+   "Blocks the sweep" means the same thing in both places on this page: next
+   week's run cannot do its job. It does **not** mean this week's run left
+   something undone — that is the normal condition of a routine.
+
+   Then, and only then:
    ```bash
    TICKET=$("${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
      add-followup --run "$RUN_ID" --job "$JOB_ID" --project "<project_name>" \
@@ -362,10 +584,19 @@ subagent does the project work and logs its own progress events.
    ```
    `add-followup` prints the sequential **ticket number** (and logs a live `warn`
    event so it appears in the activity feed). Keep the ticket numbers in your
-   action log — you will list them in the run summary. Open tickets for `followup`
-   jobs and for any `failure` job a human must resolve; a clean `success`/`skipped`
-   job gets none. (The user later resolves each ticket with
-   `/zed:maint-followup <number> done|nope|update`.)
+   action log — you will list them in the run summary. (The user later resolves
+   each ticket with `/zed:maint-followup <number> done|nope|update`.)
+
+   **The two tie-breakers, memorized:** when torn between a ticket and a GitHub
+   issue, file the **GitHub issue**. When torn between a ticket and punting,
+   **punt**. A defect that *also* blocks the sweep gets both — the GitHub issue
+   for the defect, one ticket referencing it for the blockage.
+
+   Note that a sweep is the **only** thing that ever opens a followup ticket:
+   `/zed:maint-followup` and `/zed:maint-followup-do` are forbidden from filing
+   new ones (they file GitHub issues or report to Sterling instead). So do not
+   decline to file something on the assumption that a later session will file it —
+   punt it deliberately, or file the GitHub issue yourself now.
 
 **Serial (default / `--now`):** dispatch one subagent, wait for it to return,
 finish its job, then move to the next — in the discovery order (priority
@@ -421,6 +652,35 @@ When the last ticket is closed, this run flips from **Needs Followup** to
 **Completed**.
 ```
 
+Omit that section entirely when the run filed no tickets — under the filing rules
+in Step 5 that is the normal outcome, and an empty "Needs attention" heading just
+invites someone to fill it. Punted work and issues filed on GitHub belong in the
+per-project prose instead, the latter with their issue URLs.
+
+**Weekly runs also get a Top 10 GitHub table.** When `<tag>` is exactly `weekly`,
+read back the best of what every project's triage recorded (Step 5, sub-step 3):
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+  list-project-issues --run "$RUN_ID" --limit 10
+```
+
+That prints JSONL already ordered most-deserving-first (rank ascending, then
+oldest first), across **all** projects. Render it as a table in the roll-up, one
+row per line of output, in the order printed:
+
+```markdown
+## Top 10 pending GitHub items across all projects
+| # | project | item | title | triage |
+|---|---|---|---|---|
+| 1 | gobert | [PR #850](https://github.com/zostay/gobert/pull/850) | Bump mysql 9.7.1 to 26.7.0 | Green but a major jump; needs a go/no-go from you. |
+| 2 | arrest-go | [issue #31](https://github.com/zostay/arrest-go/issues/31) | Import drops trailing whitespace | Reproducible; fix is small but unowned. |
+```
+
+Omit the section **entirely** when the tag is not `weekly` or when the command
+prints nothing. An empty or near-empty table is worse than no table — this
+section only earns its space when it is telling the operator something.
+
 Write it to a temp file and finish the run; `finish-run` sets the stage to `done`
 implicitly. **Choose the run status from whether any followup tickets are open:**
 
@@ -462,7 +722,8 @@ what keeps that window from ever opening in normal operation.
 - Use **`completed`** when there are no open tickets.
 - Use **`failed`** only if the orchestration itself broke (individual project
   failures do not by themselves fail the run — they are reported in the summary,
-  and any that need chasing have their own followup tickets).
+  their causes are filed as GitHub issues on the projects, and only one that
+  stops the sweep itself from working until Sterling acts has a followup ticket).
 
 ### 7. Report & observe
 
@@ -605,10 +866,16 @@ the model accepts in exchange for simplicity. Two consequences to keep bounded:
 
 ## Followups
 
-A sweep rarely leaves everything in a finished state — some projects partially
-succeed but need a human to finish the job (a manual deploy step, a decision, a
-verification). Rather than burying these in prose, the run records them as
-numbered **followup tickets** and surfaces a distinct status for them.
+A sweep occasionally leaves something only Sterling can finish — a manual deploy
+step, a decision that blocks the sweep, a credential he alone can rotate. Rather
+than burying those in prose, the run records them as numbered **followup
+tickets** and surfaces a distinct status for them.
+
+They are deliberately scarce. A followup is *not* the place for work next week's
+run repeats anyway (punt it) or for a defect in a project (that's a GitHub
+issue) — see the three-way disposition in Step 5, sub-step 5. A run that files
+zero tickets is the normal, healthy outcome; ten tickets means the rules were
+not applied.
 
 Statuses involved (all already understood by the DB and the observability app):
 
@@ -620,10 +887,10 @@ Statuses involved (all already understood by the DB and the observability app):
 
 How it flows:
 
-1. As the orchestrator finishes each job (Step 5), it sets `followup` status for
-   partial successes and opens one `add-followup` ticket per outstanding item
-   (also for failures a human must chase). `add-followup` assigns the sequential
-   ticket number and logs a live event.
+1. As the orchestrator finishes each job (Step 5), it opens an `add-followup`
+   ticket for each leftover that survives the punt/GitHub-issue/ticket triage —
+   and sets that job's status to `followup`. `add-followup` assigns the
+   sequential ticket number and logs a live event.
 2. At summary time (Step 6) the run is finished `needs_followup` if any ticket is
    open, and the **Needs attention** section lists the tickets by number.
 3. The user resolves each ticket from any session with
@@ -636,6 +903,40 @@ How it flows:
 
 Inspect tickets directly with `maintenance-db.sh list-followups [--run R]
 [--status open]` and `maintenance-db.sh get-followup --id N`.
+
+## GitHub triage
+
+Dependabot work is the part of maintenance a machine can finish. The part it
+cannot finish is everything *else* piling up on GitHub: a PR that has been green
+for three weeks waiting on a review, an issue nobody has looked at since March.
+Those never surface anywhere, because nothing routinely asks "what is waiting on
+me across all my repos?" The weekly sweep already walks every project, so it is
+the cheapest possible place to ask that question.
+
+So a **`weekly`** run adds one cursory pass per project: list the open issues and
+PRs, throw out the noise, rank what's left, keep the top five, write them to the
+`project_issues` table. The observability app renders them in the debrief face —
+a top-10 board across all projects plus a per-project table beside each project's
+result — and Step 6 repeats the top 10 in the run summary Markdown for whoever
+reads the transcript instead of the app.
+
+Three properties are load-bearing:
+
+- **Weekly-only.** Gated on the tag being exactly `weekly`. A `dependabot` or
+  ad-hoc sweep writes no rows and the app's section stays hidden. This is a
+  once-a-week nudge; attached to every run it becomes wallpaper.
+- **Cursory, never resolving.** The subagent reads listings and writes rows. It
+  does not open diffs, check out branches, comment, merge, close, or "just
+  quickly fix" anything. Triage that starts fixing turns a five-minute pass into
+  an unbounded one, and a sweep that quietly rewrites unrelated PRs is a sweep
+  nobody trusts to run unattended.
+- **Never fatal.** A missing GitHub remote is an `info` event and a skip; a `gh`
+  failure is a `warn` and a skip. The triage is a bonus on top of the real work
+  — it must never change a job's status or lose a successful sweep.
+
+Snapshots are per-run and immutable: next week's `weekly` run writes a fresh set
+under a new `run_id` rather than updating last week's, so an old run keeps
+showing what was actually pending the day it ran.
 
 ## Robustness
 

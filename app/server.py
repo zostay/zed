@@ -183,8 +183,34 @@ def fetch_followups(conn, run_id):
     return fups
 
 
+def fetch_project_issues(conn, run_id):
+    """Triaged GitHub issues/PRs a `weekly` run surfaced, most-deserving first.
+
+    Ordered by (rank ASC, age_days DESC, id ASC): lower rank means more
+    deserving of attention, ties go to the older item, and the row id keeps the
+    order stable. ``age_days`` may be NULL; SQLite sorts NULL lowest, so DESC
+    already pushes unknown-age rows to the end of their rank band.
+
+    Tolerates a database created before the project_issues table existed (older
+    schema): returns an empty list rather than raising, so an old DB opened by a
+    new server still serves its runs.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT * FROM project_issues WHERE run_id = ? "
+            "ORDER BY rank ASC, age_days DESC, id ASC",
+            (run_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [dict(r) for r in rows]
+
+
 def fetch_run_detail(db, run_id):
-    """Full run row + ordered jobs + counts + followups. None if run missing."""
+    """Full run row + ordered jobs + counts + followups + GitHub triage.
+
+    None if run missing.
+    """
     try:
         conn = db.connect()
     except sqlite3.Error:
@@ -198,12 +224,17 @@ def fetch_run_detail(db, run_id):
         ).fetchall()
         jobs = [dict(j) for j in jobs]
         followups = fetch_followups(conn, run_id)
+        project_issues = fetch_project_issues(conn, run_id)
         return {
             "run": dict(run),
             "jobs": jobs,
             "counts": _counts(jobs),
             "followups": followups,
             "followup_counts": _followup_counts(followups),
+            "project_issues": project_issues,
+            # The top-10 board is just the head of the same global ordering, so
+            # slice it here rather than paying for a second LIMITed query.
+            "top_issues": project_issues[:10],
         }
     except sqlite3.Error:
         return None
@@ -379,6 +410,8 @@ class Handler(BaseHTTPRequestHandler):
                     payload["counts"] = detail["counts"]
                     payload["followups"] = detail["followups"]
                     payload["followup_counts"] = detail["followup_counts"]
+                    payload["project_issues"] = detail["project_issues"]
+                    payload["top_issues"] = detail["top_issues"]
 
             if events:
                 changed = True
@@ -479,6 +512,11 @@ def _snapshot_sig(detail):
         parts.append("f%s:%s:%s:%s" % (
             f.get("id"), f.get("status"), f.get("updated_at"),
             (lc.get("comment") or "")[:48]))
+    # Include the GitHub triage rows so the section appears live as each job's
+    # subagent records them, instead of only on the next full page load.
+    for i in detail.get("project_issues", []):
+        parts.append("i%s:%s:%s" % (
+            i.get("id"), i.get("rank"), (i.get("triage") or "")[:48]))
     return "|".join("" if p is None else str(p) for p in parts)
 
 
