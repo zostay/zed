@@ -46,6 +46,24 @@
 #       by run and/or status.
 #   get-followup --id ID
 #       Print one ticket as a JSON object including its comment timeline.
+#   add-project-issue --run R [--job J] --project N [--repo OWNER/REPO]
+#                     --kind issue|pr --number N --title T --url U
+#                     [--state S] [--author A] [--labels L] [--age-days D]
+#                     [--triage T] [--rank N] [--updated-at TS]
+#       Record one cursorily-triaged GitHub issue/PR for a project. Prints the
+#       row id. INSERT OR REPLACE on UNIQUE(run_id,project_name,kind,number), so
+#       re-triaging a project inside one run updates instead of duplicating.
+#   add-project-issues --run R [--job J] --project N [--repo OWNER/REPO]
+#                      --file PATH
+#       Batch form: PATH is JSONL or a JSON array of objects with the per-item
+#       keys kind, number, title, url, state, author, labels, age_days, triage,
+#       rank, updated_at. Prints one row id per line. An item that fails
+#       validation is warned about on stderr and skipped; the rest still land.
+#       A failed *database write* is different: it exits non-zero with a count,
+#       so a mis-threaded --job or an unwritable DB never looks like success.
+#   list-project-issues [--run R] [--project N] [--limit N]
+#       Print triaged items as JSONL ordered by (rank ASC, age_days DESC,
+#       id ASC) — lowest rank is most deserving of attention.
 
 set -euo pipefail
 
@@ -77,6 +95,12 @@ Subcommands:
   update-followup --id ID --action update|done|nope --comment C
   list-followups  [--run R] [--status S]
   get-followup    --id ID
+  add-project-issue   --run R [--job J] --project N [--repo OWNER/REPO]
+                      --kind issue|pr --number N --title T --url U
+                      [--state S] [--author A] [--labels L] [--age-days D]
+                      [--triage T] [--rank N] [--updated-at TS]
+  add-project-issues  --run R [--job J] --project N [--repo OWNER/REPO] --file PATH
+  list-project-issues [--run R] [--project N] [--limit N]
 EOF
 }
 
@@ -563,6 +587,335 @@ SQL
   printf '%s\n' "$out"
 }
 
+# ---- GitHub triage --------------------------------------------------------
+
+# Non-fatal integer test. require_int dies, which is right for a single-item
+# write but wrong for a batch: one malformed item must not take the other four
+# down with it, so the batch path tests with this and skips instead.
+pi_is_int() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
+# As above, but tolerates a leading '-'. Only rank uses it: rank is advisory
+# ordering that gets clamped into 0..100, so a caller reaching for -1 to shout
+# "most urgent" should have its row stored at 0, not dropped.
+pi_is_signed_int() {
+  case "${1:-}" in
+    ''|'-') return 1 ;;
+    -*) pi_is_int "${1#-}" ;;
+    *) pi_is_int "$1" ;;
+  esac
+}
+
+# Complain about an invalid triage item. Strict (the single-item subcommand)
+# makes it fatal; otherwise it is a warning and the caller skips the row.
+# Always returns non-zero when it returns at all, so callers can write
+# `pi_reject ... || return 1` without tripping set -e.
+#
+# Status contract for pi_upsert, which the batch caller depends on:
+#   0  row written
+#   1  item rejected by validation (skipped; the batch keeps going, exits 0)
+#   3  the database write itself failed (the batch counts it and exits non-zero)
+# A malformed item is the caller's data problem and stays non-fatal; a failed
+# write means the snapshot silently did not land and must never look like
+# success.
+pi_reject() {
+  local strict="$1" msg="$2"
+  [ "$strict" -eq 1 ] && die "$msg" 2
+  printf 'Warning: %s; skipping item.\n' "$msg" >&2
+  return 1
+}
+
+# Validate one triaged GitHub item and INSERT OR REPLACE it, printing the id of
+# the row that now exists. Positional arguments, in order:
+#   1 strict  2 label  3 run  4 job  5 project  6 repo  7 kind  8 number
+#   9 title  10 url  11 state  12 author  13 labels  14 age_days  15 triage
+#  16 rank  17 updated_at
+# (Positional because bash has nothing better; the option loops below are the
+# readable surface and this is the shared tail they both funnel into.)
+pi_upsert() {
+  local strict="$1" label="$2" run="$3" job="$4" project="$5" repo="$6" \
+        kind="$7" number="$8" title="$9" url="${10}" state="${11}" \
+        author="${12}" labels="${13}" age_days="${14}" triage="${15}" \
+        rank="${16}" updated_at="${17}"
+
+  [ -n "$project" ] || pi_reject "$strict" "$label: project name is required" || return 1
+  [ -n "$title" ]   || pi_reject "$strict" "$label: title is required" || return 1
+  case "$kind" in
+    issue|pr) ;;
+    *) pi_reject "$strict" "$label: kind must be issue or pr (got: '$kind')" || return 1 ;;
+  esac
+  pi_is_int "$number" || pi_reject "$strict" "$label: number must be a non-negative integer (got: '$number')" || return 1
+  # The app turns url straight into an href, so only https:// ever gets stored;
+  # javascript:/data:/http:// links are rejected here rather than sanitized in
+  # three different readers.
+  case "$url" in
+    https://*) ;;
+    *) pi_reject "$strict" "$label: url must start with https:// (got: '$url')" || return 1 ;;
+  esac
+  if [ -n "$age_days" ]; then
+    pi_is_int "$age_days" || pi_reject "$strict" "$label: age-days must be a non-negative integer (got: '$age_days')" || return 1
+  fi
+  # Rank is advisory ordering, not data: an out-of-range value clamps to 0..100
+  # rather than losing the row — at either end, so a negative rank stores as 0.
+  if [ -n "$rank" ]; then
+    pi_is_signed_int "$rank" || pi_reject "$strict" "$label: rank must be an integer (got: '$rank')" || return 1
+    [ "$rank" -lt 0 ]   && rank=0
+    [ "$rank" -gt 100 ] && rank=100
+  else
+    rank=50
+  fi
+
+  local now now_e project_e title_e url_e kind_e
+  now="$(mtnc_now)"
+  now_e="$(mtnc_sql_escape "$now")"
+  project_e="$(mtnc_sql_escape "$project")"
+  title_e="$(mtnc_sql_escape "$title")"
+  url_e="$(mtnc_sql_escape "$url")"
+  kind_e="$(mtnc_sql_escape "$kind")"
+
+  local job_v repo_v state_v author_v labels_v age_v triage_v updated_v
+  if [ -n "$job" ];        then job_v="$job";                                    else job_v="NULL";     fi
+  if [ -n "$repo" ];       then repo_v="'$(mtnc_sql_escape "$repo")'";           else repo_v="NULL";    fi
+  if [ -n "$state" ];      then state_v="'$(mtnc_sql_escape "$state")'";         else state_v="NULL";   fi
+  if [ -n "$author" ];     then author_v="'$(mtnc_sql_escape "$author")'";       else author_v="NULL";  fi
+  if [ -n "$labels" ];     then labels_v="'$(mtnc_sql_escape "$labels")'";       else labels_v="NULL";  fi
+  if [ -n "$age_days" ];   then age_v="$age_days";                               else age_v="NULL";     fi
+  if [ -n "$triage" ];     then triage_v="'$(mtnc_sql_escape "$triage")'";       else triage_v="NULL";  fi
+  if [ -n "$updated_at" ]; then updated_v="'$(mtnc_sql_escape "$updated_at")'";  else updated_v="NULL"; fi
+
+  # INSERT OR REPLACE deletes the conflicting row and inserts a fresh one, which
+  # mints a new id — so read the id back by the UNIQUE key instead of trusting
+  # last_insert_rowid() to describe the row the caller asked about.
+  #
+  # The write is captured rather than streamed so a sqlite3 failure (a foreign
+  # key violation from a mis-threaded --job, a read-only database) can be told
+  # apart from a validation reject and reported as status 3. Without this the
+  # batch loop's `|| continue` swallowed every failed write and the subcommand
+  # still exited 0, losing a project's whole triage snapshot silently.
+  local ids=""
+  if ! ids="$(db_exec <<SQL
+INSERT OR REPLACE INTO project_issues
+  (run_id, job_id, project_name, repo, kind, number, title, url, state, author,
+   labels, age_days, triage, rank, updated_at, created_at)
+VALUES ($run, $job_v, '$project_e', $repo_v, '$kind_e', $number, '$title_e', '$url_e',
+        $state_v, $author_v, $labels_v, $age_v, $triage_v, $rank, $updated_v, '$now_e');
+SELECT id FROM project_issues
+ WHERE run_id=$run AND project_name='$project_e' AND kind='$kind_e' AND number=$number;
+SQL
+  )"; then
+    [ "$strict" -eq 1 ] && die "$label: database write failed" 1
+    printf 'Error: %s: database write failed.\n' "$label" >&2
+    return 3
+  fi
+  # A write that sqlite3 reported as fine but that left no row behind is still a
+  # failure from the caller's point of view — say so rather than printing blank.
+  if [ -z "$ids" ]; then
+    [ "$strict" -eq 1 ] && die "$label: database write recorded no row" 1
+    printf 'Error: %s: database write recorded no row.\n' "$label" >&2
+    return 3
+  fi
+  printf '%s\n' "$ids"
+}
+
+cmd_add_project_issue() {
+  local run="" job="" project="" repo="" kind="" number="" title="" url="" \
+        state="" author="" labels="" age_days="" triage="" rank="" updated_at=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --run)        run="$2";        shift 2 ;;
+      --job)        job="$2";        shift 2 ;;
+      --project)    project="$2";    shift 2 ;;
+      --repo)       repo="$2";       shift 2 ;;
+      --kind)       kind="$2";       shift 2 ;;
+      --number)     number="$2";     shift 2 ;;
+      --title)      title="$2";      shift 2 ;;
+      --url)        url="$2";        shift 2 ;;
+      --state)      state="$2";      shift 2 ;;
+      --author)     author="$2";     shift 2 ;;
+      --labels)     labels="$2";     shift 2 ;;
+      --age-days)   age_days="$2";   shift 2 ;;
+      --triage)     triage="$2";     shift 2 ;;
+      --rank)       rank="$2";       shift 2 ;;
+      --updated-at) updated_at="$2"; shift 2 ;;
+      *) die "add-project-issue: unknown option: $1" 2 ;;
+    esac
+  done
+  [ -n "$run" ]     || die "add-project-issue: --run is required"
+  [ -n "$project" ] || die "add-project-issue: --project is required"
+  [ -n "$kind" ]    || die "add-project-issue: --kind is required"
+  [ -n "$number" ]  || die "add-project-issue: --number is required"
+  [ -n "$title" ]   || die "add-project-issue: --title is required"
+  [ -n "$url" ]     || die "add-project-issue: --url is required"
+  require_int --run "$run"
+  [ -n "$job" ] && require_int --job "$job"
+
+  pi_upsert 1 "add-project-issue" "$run" "$job" "$project" "$repo" "$kind" \
+    "$number" "$title" "$url" "$state" "$author" "$labels" "$age_days" \
+    "$triage" "$rank" "$updated_at"
+}
+
+# Pull one key out of a compact JSON object, printing '' for a missing or null
+# value. tostring keeps the numeric keys (number, age_days, rank) as plain
+# digits so they can go straight into SQL after pi_is_int.
+pi_field() {
+  printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // "" | tostring'
+}
+
+# labels and author are the two keys a caller is most likely to hand over
+# straight from `gh --json`, where they arrive as an array of {name} objects and
+# a {login} object rather than as strings. Flatten those shapes here so the
+# skill does not have to reshape them first.
+pi_field_labels() {
+  printf '%s' "$1" | jq -r '
+    if (.labels | type) == "array"
+    then (.labels | map(if type == "object" then (.name // tostring) else tostring end) | join(","))
+    else (.labels // "" | tostring) end'
+}
+
+pi_field_author() {
+  printf '%s' "$1" | jq -r '
+    if (.author | type) == "object"
+    then (.author.login // .author.name // "")
+    else (.author // "" | tostring) end'
+}
+
+cmd_add_project_issues() {
+  local run="" job="" project="" repo="" file=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --run)     run="$2";     shift 2 ;;
+      --job)     job="$2";     shift 2 ;;
+      --project) project="$2"; shift 2 ;;
+      --repo)    repo="$2";    shift 2 ;;
+      --file)    file="$2";    shift 2 ;;
+      *) die "add-project-issues: unknown option: $1" 2 ;;
+    esac
+  done
+  [ -n "$run" ]     || die "add-project-issues: --run is required"
+  [ -n "$project" ] || die "add-project-issues: --project is required"
+  [ -n "$file" ]    || die "add-project-issues: --file is required"
+  require_int --run "$run"
+  [ -n "$job" ] && require_int --job "$job"
+  [ -f "$file" ] || die "add-project-issues: file not found: $file"
+  mtnc_require jq
+
+  # Normalize both accepted shapes to one compact object per line. A JSON array
+  # is exploded; a JSONL stream passes through as-is. If the file will not parse
+  # as a whole (typically one bad JSONL line poisoning the stream), fall back to
+  # parsing line by line so the good lines still get recorded.
+  local items="" line one first_char jq_err
+  first_char="$(awk 'NF { sub(/^[[:space:]]+/, ""); print substr($0, 1, 1); exit }' "$file")"
+  if ! items="$(jq -c 'if type == "array" then .[] else . end' < "$file" 2>/dev/null)"; then
+    # The line-by-line fallback only makes sense for JSONL, where a line *is* an
+    # item. In a JSON array every line is a fragment, so walking it line by line
+    # discards the well-formed elements and misreports them as unparseable —
+    # fail loudly instead, so the caller knows nothing landed.
+    if [ "$first_char" = "[" ]; then
+      jq_err="$(jq -c '.' < "$file" 2>&1 >/dev/null || true)"
+      die "add-project-issues: $file is a JSON array that does not parse; nothing was recorded${jq_err:+ (${jq_err})}" 2
+    fi
+    items=""
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -n "${line//[$' \t\r\n']/}" ] || continue
+      if one="$(printf '%s\n' "$line" | jq -c 'if type == "array" then .[] else . end' 2>/dev/null)"; then
+        items="${items}${one}"$'\n'
+      else
+        printf 'Warning: add-project-issues: unparseable JSON line; skipping item: %s\n' "$line" >&2
+      fi
+    done < "$file"
+  fi
+
+  local idx=0 written=0 hard_failures=0 rc=0
+  local item kind number title url state author labels age_days triage \
+        rank updated_at item_project item_repo
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    idx=$((idx + 1))
+    if ! printf '%s' "$item" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      printf 'Warning: add-project-issues: item %d is not a JSON object; skipping item.\n' "$idx" >&2
+      continue
+    fi
+    # Per-item values win over the flags; the flags are the per-project default.
+    item_project="$(pi_field "$item" project_name)"
+    [ -n "$item_project" ] || item_project="$project"
+    item_repo="$(pi_field "$item" repo)"
+    [ -n "$item_repo" ] || item_repo="$repo"
+    kind="$(pi_field "$item" kind)"
+    [ -n "$kind" ] || kind="issue"
+    number="$(pi_field "$item" number)"
+    title="$(pi_field "$item" title)"
+    url="$(pi_field "$item" url)"
+    state="$(pi_field "$item" state)"
+    author="$(pi_field_author "$item")"
+    labels="$(pi_field_labels "$item")"
+    age_days="$(pi_field "$item" age_days)"
+    triage="$(pi_field "$item" triage)"
+    rank="$(pi_field "$item" rank)"
+    updated_at="$(pi_field "$item" updated_at)"
+
+    # Non-strict: pi_upsert warns and returns non-zero on a bad item, and the
+    # `||` keeps set -e from ending the batch there. Status 1 is a validation
+    # reject (skip and keep going); status 3 is a failed database write, which
+    # must not be swallowed — those are counted and turn into a non-zero exit.
+    rc=0
+    pi_upsert 0 "add-project-issues: item $idx" "$run" "$job" "$item_project" \
+      "$item_repo" "$kind" "$number" "$title" "$url" "$state" "$author" \
+      "$labels" "$age_days" "$triage" "$rank" "$updated_at" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      written=$((written + 1))
+    elif [ "$rc" -ge 3 ]; then
+      hard_failures=$((hard_failures + 1))
+    fi
+  done <<< "$items"
+
+  if [ "$hard_failures" -gt 0 ]; then
+    die "add-project-issues: $hard_failures of $idx item(s) failed to write to the database ($written written)" 1
+  fi
+}
+
+cmd_list_project_issues() {
+  local run="" project="" limit=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --run)     run="$2";     shift 2 ;;
+      --project) project="$2"; shift 2 ;;
+      --limit)   limit="$2";   shift 2 ;;
+      *) die "list-project-issues: unknown option: $1" 2 ;;
+    esac
+  done
+  local where=""
+  if [ -n "$run" ]; then
+    require_int --run "$run"
+    where="WHERE run_id=$run"
+  fi
+  if [ -n "$project" ]; then
+    local project_e
+    project_e="$(mtnc_sql_escape "$project")"
+    if [ -n "$where" ]; then where="$where AND project_name='$project_e'"; else where="WHERE project_name='$project_e'"; fi
+  fi
+  local limit_clause=""
+  if [ -n "$limit" ]; then
+    require_int --limit "$limit"
+    limit_clause="LIMIT $limit"
+  fi
+
+  # rank ASC first: lower rank is more deserving of attention. Ties go to the
+  # older item, which is what age_days DESC buys.
+  db_exec <<SQL
+SELECT json_object(
+  'id', id, 'run_id', run_id, 'job_id', job_id,
+  'project_name', project_name, 'repo', repo, 'kind', kind, 'number', number,
+  'title', title, 'url', url, 'state', state, 'author', author,
+  'labels', labels, 'age_days', age_days, 'triage', triage, 'rank', rank,
+  'updated_at', updated_at, 'created_at', created_at
+) FROM project_issues $where ORDER BY rank ASC, age_days DESC, id ASC $limit_clause;
+SQL
+}
+
 case "$SUBCMD" in
   init)            cmd_init "$@" ;;
   start-run)       cmd_start_run "$@" ;;
@@ -576,6 +929,9 @@ case "$SUBCMD" in
   update-followup) cmd_update_followup "$@" ;;
   list-followups)  cmd_list_followups "$@" ;;
   get-followup)    cmd_get_followup "$@" ;;
+  add-project-issue)   cmd_add_project_issue "$@" ;;
+  add-project-issues)  cmd_add_project_issues "$@" ;;
+  list-project-issues) cmd_list_project_issues "$@" ;;
   *)
     printf 'Error: unknown subcommand: %s\n' "$SUBCMD" >&2
     usage

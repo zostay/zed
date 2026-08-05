@@ -32,6 +32,9 @@
     followup: "…", running: "⟳", pending: "○"
   };
   var TICKET_STATUS_LABEL = { open: "open", done: "done", wontdo: "won't do" };
+  // GitHub triage: issue vs PR has to be readable at a glance, so it gets both
+  // a glyph and a color (see .gt-row[data-kind] in the stylesheet).
+  var KIND_GLYPH = { issue: "◉", pr: "⇄" };
   var ACTION_LABEL = { opened: "opened", update: "update", done: "done", nope: "won't do" };
   // status → queue sort priority (what's left surfaces first)
   var STATUS_PRIORITY = { running: 0, pending: 1, followup: 2, failure: 3, success: 4, skipped: 5 };
@@ -88,6 +91,11 @@
     dbFollowupsLink: byId("db-followups-link"),
     dbFollowupsBody: byId("db-followups-body"),
     dbFollowupsFoot: byId("db-followups-foot"),
+    dbTriage: byId("db-triage"),
+    triageHint: byId("triage-hint"),
+    gtTop: byId("gt-top"),
+    gtGroups: byId("gt-groups"),
+    gtGroupsHint: byId("gt-groups-hint"),
     summary: byId("summary"),
     results: byId("results"),
     resultsHint: byId("results-hint"),
@@ -335,7 +343,8 @@
       if (payload.run) {
         ingestDetail({
           run: payload.run, jobs: payload.jobs, counts: payload.counts,
-          followups: payload.followups, followup_counts: payload.followup_counts
+          followups: payload.followups, followup_counts: payload.followup_counts,
+          project_issues: payload.project_issues, top_issues: payload.top_issues
         });
         touched = true;
       }
@@ -392,6 +401,10 @@
     // to the previous set so a jobs-only update doesn't blank them.
     if (detail.followups == null && prev) detail.followups = prev.followups;
     if (detail.followup_counts == null && prev) detail.followup_counts = prev.followup_counts;
+    // Same for the triage snapshot — and doubly so here, since an older server
+    // never sends these keys at all and the section must not blink out.
+    if (detail.project_issues == null && prev) detail.project_issues = prev.project_issues;
+    if (detail.top_issues == null && prev) detail.top_issues = prev.top_issues;
     state.detail = detail;
 
     // keep sidebar row fresh
@@ -639,6 +652,7 @@
   function renderDebriefFace(detail, faceChanged) {
     renderStoplight(detail.counts || {}, faceChanged);
     renderDebriefFollowups(detail, faceChanged);
+    renderTriage(detail, faceChanged);
     renderSummary(detail.run.summary);
     renderResults(detail.jobs || []);
     renderLogToggle();
@@ -681,14 +695,21 @@
         var verb = lc.action && lc.action !== "opened" ? lc.action + ": " : "";
         latest = esc(verb) + esc(lc.comment || "");
       }
+      // One line per ticket. The detail text and the comment timeline stay on
+      // the followups page — the # deep-links straight to the ticket there, and
+      // the clamped cells keep their full text in a title tooltip.
       rows += '<tr class="tk-row' + (st !== "open" ? " is-closed" : "") + '">' +
-        '<td class="tk-num">#' + esc(f.id) + '</td>' +
-        '<td class="tk-proj">' + esc(f.project_name || "—") + '</td>' +
-        '<td class="tk-title">' + esc(f.title || "") +
-          (f.detail ? '<span class="tk-detail">' + esc(f.detail) + '</span>' : '') + '</td>' +
+        '<td class="tk-num"><a href="#/run/' + esc(detail.run.id) + '/followup/' + esc(f.id) +
+          '" title="open ticket #' + esc(f.id) + ' with its full detail">#' + esc(f.id) + '</a></td>' +
+        '<td class="tk-proj" title="' + esc(f.project_name || "") + '">' +
+          esc(f.project_name || "—") + '</td>' +
+        '<td class="tk-title" title="' + esc(f.title || "") +
+          (f.detail ? esc(" — " + f.detail) : "") + '">' +
+          '<span class="clamp2">' + esc(f.title || "") + '</span></td>' +
         '<td class="tk-stat"><span class="tk-status" data-s="' + esc(st) + '">' +
           esc(TICKET_STATUS_LABEL[st] || st) + '</span></td>' +
-        '<td class="tk-latest">' + (latest || '<span class="muted">—</span>') + '</td>' +
+        '<td class="tk-latest"' + (lc ? ' title="' + esc(lc.comment || "") + '"' : "") + '>' +
+          '<span class="clamp2">' + (latest || '<span class="muted">—</span>') + '</span></td>' +
         '</tr>';
     });
     el.dbFollowupsBody.innerHTML = rows;
@@ -700,6 +721,136 @@
       el.dbFollowupsFoot.innerHTML = 'All followups resolved. This run is <strong>completed</strong>.';
     }
   }
+
+  // -- GitHub triage (weekly runs only) -------------------------------------
+  // A reminder board, not a worklist: the sweep looked and touched nothing.
+  // Empty `project_issues` (every non-weekly run) hides the section outright.
+  function renderTriage(detail, reveal) {
+    var items = detail.project_issues || [];
+    if (!items.length) { el.dbTriage.hidden = true; return; }
+    el.dbTriage.hidden = false;
+    if (reveal) { el.dbTriage.classList.remove("reveal"); void el.dbTriage.offsetWidth; el.dbTriage.classList.add("reveal"); }
+
+    // Rows arrive rank-ascending, so grouping in arrival order puts the project
+    // holding the most deserving item first. That is deliberately *not* the
+    // PROJECT RESULTS order (which partitions attention-first by job status) —
+    // the two sections are cross-referenced by project name, not by position.
+    var order = [], byProject = {};
+    items.forEach(function (it) {
+      var name = it.project_name || "—";
+      if (!byProject[name]) { byProject[name] = []; order.push(name); }
+      byProject[name].push(it);
+    });
+
+    el.triageHint.textContent =
+      items.length + plural(items.length, " item") + "  ·  " +
+      order.length + plural(order.length, " project");
+    el.gtGroupsHint.textContent = "up to 5 per project";
+
+    // The server already caps top_issues at 10; slice anyway so a stale or
+    // hand-rolled payload can't stretch the board.
+    var top = detail.top_issues || items;
+    var html = "";
+    top.slice(0, 10).forEach(function (it, i) { html += triageRow(it, i + 1); });
+    el.gtTop.innerHTML = html;
+
+    var groups = "";
+    order.forEach(function (name) {
+      var rows = byProject[name].slice(0, 5);
+      var prs = 0;
+      rows.forEach(function (r) { if (r.kind === "pr") prs++; });
+      var meta = [];
+      if (prs) meta.push(prs + plural(prs, " pr"));
+      if (rows.length - prs) meta.push((rows.length - prs) + plural(rows.length - prs, " issue"));
+      groups += '<div class="gt-group">' +
+        '<div class="gt-group-head">' +
+          '<span class="gt-group-name">' + esc(name) + '</span>' +
+          '<span class="gt-group-meta">' + esc(meta.join("  ·  ")) + '</span>' +
+        '</div>' +
+        '<div class="gt-rows">';
+      rows.forEach(function (it) { groups += triageRow(it, 0); });
+      groups += '</div></div>';
+    });
+    el.gtGroups.innerHTML = groups;
+  }
+
+  // One triage row. `ordinal` > 0 renders the ranked top-10 variant (position +
+  // project column); 0 renders the compact per-project variant. The whole row is
+  // the link — this board exists to be jumped from, so the target is generous.
+  function triageRow(it, ordinal) {
+    var kind = it.kind === "pr" ? "pr" : "issue";
+    var draft = String(it.state || "").toLowerCase() === "draft";
+    var href = safeHref(it.url);
+    var age = ageBand(it.age_days);
+    var tip = (it.repo ? it.repo + " " : "") + "#" + it.number +
+      (it.author ? "  ·  by " + it.author : "") +
+      (it.labels ? "  ·  " + it.labels : "") +
+      "\n" + (it.title || "") +
+      (it.triage ? "\n" + it.triage : "") +
+      (href ? "" : "\nno https url recorded — nothing to open");
+
+    var inner = "";
+    if (ordinal) inner += '<span class="gt-ord">' + pad(ordinal) + '</span>';
+    inner +=
+      '<span class="gt-kind">' +
+        '<span class="gt-glyph" aria-hidden="true">' + KIND_GLYPH[kind] + '</span>' +
+        '<span class="gt-num">#' + esc(it.number) + '</span>' +
+      '</span>';
+    if (ordinal) inner += '<span class="gt-proj">' + esc(it.project_name || "—") + '</span>';
+    inner +=
+      '<span class="gt-body">' +
+        '<span class="gt-title">' +
+          (draft ? '<span class="gt-flag">draft</span>' : "") + esc(it.title || "") +
+        '</span>' +
+        '<span class="gt-triage">' + esc(it.triage || "") + '</span>' +
+      '</span>' +
+      '<span class="gt-age" data-age="' + age.band + '">' + esc(age.label) + '</span>' +
+      // ↗ says "leaves the deck"; ⊘ says "the recorded url wasn't https, so
+      // there is deliberately nothing to click here".
+      '<span class="gt-open" aria-hidden="true">' + (href ? "↗" : "⊘") + '</span>';
+
+    var attrs = ' data-kind="' + kind + '" data-tier="' + rankTier(it.rank) + '"' +
+      (draft ? ' data-draft="1"' : "") + ' title="' + esc(tip) + '"';
+    if (!href) return '<div class="gt-row is-nolink"' + attrs + '>' + inner + '</div>';
+    return '<a class="gt-row" href="' + href + '" target="_blank" rel="noopener noreferrer"' +
+      attrs + ' aria-label="' + esc((kind === "pr" ? "pull request #" : "issue #") + it.number +
+      " · " + (it.title || "") + " · opens on GitHub") + '">' + inner + '</a>';
+  }
+
+  // Only ever emit an https:// href. Anything else — a javascript: URL, a
+  // relative path, junk from a bad triage run — loses the link and renders as
+  // plain text. escHtml() so the value is safe inside href="…" as well.
+  function safeHref(url) {
+    var s = String(url == null ? "" : url);
+    return /^https:\/\//i.test(s) ? escHtml(s) : null;
+  }
+
+  // rank is 0..100 with LOWER = more deserving; four bands drive the row rail.
+  // A missing rank lands mid-pack rather than at the top — Number(null) is 0,
+  // and an unranked row must not masquerade as the most urgent thing on screen.
+  function rankTier(rank) {
+    if (rank == null) return 2;
+    var r = Number(rank);
+    if (!isFinite(r)) return 2;
+    if (r < 20) return 0;
+    if (r < 50) return 1;
+    if (r < 80) return 2;
+    return 3;
+  }
+
+  // Age is the staleness signal — something open for four months should look
+  // different from something opened on Tuesday.
+  function ageBand(days) {
+    if (days == null) return { label: "—", band: "fresh" };
+    var d = Number(days);
+    if (!isFinite(d) || d < 0) return { label: "—", band: "fresh" };
+    return {
+      label: d < 100 ? d + "d" : Math.round(d / 30) + "mo",
+      band: d >= 90 ? "stale" : d >= 30 ? "aging" : "fresh"
+    };
+  }
+
+  function plural(n, word) { return n === 1 ? word : word + "s"; }
 
   function renderSummary(md) {
     if (!md) { el.summary.innerHTML = '<p class="muted">No summary recorded for this run.</p>'; return; }

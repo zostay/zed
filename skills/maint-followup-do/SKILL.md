@@ -115,6 +115,39 @@ bypass, no `git reset --hard`/`git checkout .` over unrelated uncommitted change
 force-merging past failing required checks. If those are the only ways forward, that
 is a finding for the path-forward write-up, not an action to take.
 
+**If the work surfaces something new** — a decision that has to be made before the
+ticket can move, or a defect you tripped over while investigating, or a fix whose
+implications reach past this ticket — **never file a followup for it.** Do not call
+`"$DB" add-followup` from this skill, for any reason at all. Followup tickets exist
+only to flag work that needs the user *personally* before the next weekly maintenance
+run, and only a `/zed:maintenance` sweep may open them. Those two cases — "this needs
+a decision first" and "I found another bug while I was in here" — are precisely the
+rationalizations that produced tickets nobody asked for.
+
+New findings go elsewhere, in this order:
+
+1. **A GitHub issue on this project.** Search first so you don't duplicate one:
+
+   ```bash
+   gh issue list --state open --search "<a few distinctive words>"
+   gh issue create --title "<what is wrong>" --body "<what you observed, where, why it matters>"
+   ```
+
+   If a matching open issue already exists, comment on that one
+   (`gh issue comment <n> --body ...`) instead of opening a second.
+
+   Step 2 already confirmed this session is in the ticket's project, so these run
+   bare and resolve to the right repository. The issue verbs carry standing allow
+   rules, but don't assume it — if one comes back permission-denied, that is
+   case 2 below, never a reason to file a followup.
+
+2. **Straight to the user, in your step 6 report** — when the project has no GitHub
+   remote (`gh repo view` fails), when `gh issue create` is denied, or when the
+   finding is really a question only they can answer.
+
+Either way, say where it went in the comment you record in step 5 (issue URL, or
+"raised with you directly"), so the trail from ticket to finding isn't lost.
+
 ### 5. Record the outcome
 
 Record progress on the ticket via the same database command the `maint-followup`
@@ -133,11 +166,16 @@ to confirm before recording a `done` or a `nope`.** State plainly what you finis
 (or why you're declining) and that closing it will resolve the ticket. Only run the
 close after they confirm; if they decline, fall back to an `update`.
 
-Write a one-sentence comment describing what you did, found, or decided:
+Write a one-sentence comment describing what you did, found, or decided — and if step
+4 sent a finding somewhere else, name that destination in it (the issue URL, or that
+you raised it with the user directly):
 
 ```bash
 "$DB" update-followup --id <ticket-number> --action <update|done|nope> --comment "<one sentence>"
 ```
+
+`update-followup` is the **only** followup command this skill runs. It comments and it
+closes; it never opens a ticket.
 
 It prints a JSON receipt, e.g.:
 
@@ -154,6 +192,9 @@ Tell the user, concisely:
 - the ticket number, its project/title, and what you determined it needed;
 - **what you did** — the change made and how you verified it — **or** the path
   forward, if you couldn't complete it;
+- **anything you filed or escalated on the way** — the URL of the GitHub issue you
+  opened or commented on, or the finding you are handing them directly because there
+  was no repo to file it against or because only they can decide it;
 - the action recorded on the ticket and its new status; and
 - from the receipt: how many followups remain open on the run (`open_remaining`),
   and — if `run_completed` is `true` — that this resolved the last one, so **the run

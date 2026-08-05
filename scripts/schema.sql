@@ -64,7 +64,35 @@ CREATE TABLE IF NOT EXISTS events (
   message TEXT    NOT NULL
 );
 
+-- Cursory GitHub triage snapshot: open issues/PRs a `weekly` sweep surfaced for
+-- a project so the operator is reminded what work is pending for them. Only
+-- weekly-tagged runs write here; every other tag leaves it empty and the app
+-- hides the section entirely. Rows are a point-in-time snapshot per run, never
+-- updated after the run — re-running weekly writes a fresh set under a new
+-- run_id.
+CREATE TABLE IF NOT EXISTS project_issues (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id       INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  job_id       INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
+  project_name TEXT    NOT NULL,
+  repo         TEXT,                                  -- owner/repo on GitHub
+  kind         TEXT    NOT NULL DEFAULT 'issue',      -- issue | pr
+  number       INTEGER NOT NULL,                       -- issue/PR number
+  title        TEXT    NOT NULL,
+  url          TEXT    NOT NULL,                       -- https://github.com/... (https only)
+  state        TEXT,                                   -- open | draft
+  author       TEXT,
+  labels       TEXT,                                   -- comma-separated
+  age_days     INTEGER,                                -- days since it was opened
+  triage       TEXT,                                   -- one-line cursory triage note
+  rank         INTEGER NOT NULL DEFAULT 50,            -- 0..100, LOWER = more deserving
+  updated_at   TEXT,                                   -- GitHub's updatedAt (ISO-8601)
+  created_at   TEXT    NOT NULL,                       -- when this row was recorded (UTC)
+  UNIQUE(run_id, project_name, kind, number)
+);
+
 CREATE INDEX IF NOT EXISTS idx_jobs_run   ON jobs(run_id);
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_followups_run        ON followups(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_followup_comments_fk ON followup_comments(followup_id, id);
+CREATE INDEX IF NOT EXISTS idx_project_issues_run ON project_issues(run_id, rank, id);

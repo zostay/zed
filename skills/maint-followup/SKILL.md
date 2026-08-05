@@ -107,5 +107,36 @@ the run status update without a refresh).
 
 - This skill only touches a single ticket per invocation. To see all tickets for
   a run, use `"$DB" list-followups --run <run-id>` (or `list-followups` for all).
+- **Never open a new followup from here.** `update-followup` is the only followup
+  command this skill runs; do not call `"$DB" add-followup`, not for a decision that
+  is blocking this ticket and not for a defect you noticed while recording it. Only a
+  `/zed:maintenance` sweep opens tickets, and only for work needing the user
+  personally before the next weekly run. Send new findings to a GitHub issue on the
+  project instead — but **establish which repository that is first.** This skill can
+  be invoked from any directory, and a bare `gh issue …` resolves the repo from the
+  session's cwd, so filing without checking lands the issue on whatever repo the user
+  happens to be sitting in. The ticket's `project_name` (from `get-followup` in
+  step 2) is recorded as the **basename of the project directory** the sweep
+  discovered, so compare against the current repo's directory basename — not its
+  `origin` remote, which can differ and cause a false mismatch:
+
+  ```bash
+  [ "$(basename "$(git rev-parse --show-toplevel)")" = "<project_name>" ]
+  ```
+
+  - **They match** — file it bare: `gh issue list --state open --search ...` first
+    so you don't duplicate, then comment on the match if there is one, otherwise
+    `gh issue create`.
+  - **They do not match** (or you are not in a git repo at all) — **do not file
+    anything.** You cannot name the right repository from here, and guessing one is
+    worse than not filing. Report the finding to the user in step 5 instead, saying
+    it belongs on `<project_name>`.
+
+  Also report it to the user rather than filing when the project has no GitHub
+  remote, when `gh issue create` comes back permission-denied (the issue verbs
+  carry standing allow rules, but don't assume it — a session whose settings
+  differ can have them blocked), or when the finding is really a question only
+  they can answer. A blocked or unfilable finding is **never** downgraded to a followup
+  ticket. Then say where it went in the comment you record, so the trail isn't lost.
 - Resolving tickets is the *only* thing that moves a run from **Needs Followup**
   to **Completed** — there is no separate "complete the run" step.
