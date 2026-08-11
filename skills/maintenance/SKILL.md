@@ -405,7 +405,8 @@ subagent does the project work and logs its own progress events.
 
    Do **not** drop an **issue this run filed** under sub-step 5's rules. Those
    used to be excluded here; they are now recorded deliberately, with
-   `--origin created`, so the app can badge them **NEW** (see **g** below). An
+   `--origin created`, so the app can badge them **NEW** — see *"Then record it
+   — on every tag"* in sub-step 5, which is where that recording happens. An
    issue the sweep opened is precisely work Sterling has not seen — burying it
    in summary prose was the gap this replaces.
 

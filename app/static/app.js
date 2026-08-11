@@ -841,9 +841,11 @@
       "<strong>PROJECT RESULTS</strong> below.";
 
     if (!nTriaged) {
+      // Number-agnostic: this branch renders for a run that filed one issue and
+      // for a run that filed six, so the copy must not presume either.
       return '<span class="gt-line is-new">' + filed +
-        " Open one on GitHub for the detail; its project is named on the row." +
-        "</span>";
+        " Each row names the project it belongs to and opens on GitHub for the" +
+        " full detail." + "</span>";
     }
     if (!nCreated) return '<span class="gt-line">' + noticed + locate + "</span>";
     return '<span class="gt-line is-new">' + filed + "</span>" +

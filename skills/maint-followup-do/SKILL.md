@@ -211,13 +211,12 @@ Tell the user, concisely:
 - the ticket number, its project/title, and what you determined it needed;
 - **what you did** — the change made and how you verified it — **or** the path
   forward, if you couldn't complete it;
-- **anything new you filed or escalated** (step 4) — the issue URL, or the
-  finding you are raising with them directly. Say plainly that it is new work
-  this session surfaced, not part of the ticket's original scope. A filed issue
-  also appears badged **NEW** on the run's page in the observability app;
-- **anything you filed or escalated on the way** — the URL of the GitHub issue you
-  opened or commented on, or the finding you are handing them directly because there
-  was no repo to file it against or because only they can decide it;
+- **anything you filed or escalated on the way** (step 4) — the URL of the GitHub
+  issue you opened or commented on, or the finding you are handing them directly
+  because there was no repo to file it against or because only they can decide it.
+  Say plainly that it is new work this session surfaced, not part of the ticket's
+  original scope. A filed issue also appears badged **NEW** on the run's page in
+  the observability app;
 - the action recorded on the ticket and its new status; and
 - from the receipt: how many followups remain open on the run (`open_remaining`),
   and — if `run_completed` is `true` — that this resolved the last one, so **the run
