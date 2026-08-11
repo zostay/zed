@@ -1,6 +1,6 @@
 {
   "name": "zed",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Personal Claude Code plugin with custom skills, agents, and tools.",
   "author": {
     "name": "zostay"

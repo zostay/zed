@@ -64,12 +64,21 @@ CREATE TABLE IF NOT EXISTS events (
   message TEXT    NOT NULL
 );
 
--- Cursory GitHub triage snapshot: open issues/PRs a `weekly` sweep surfaced for
--- a project so the operator is reminded what work is pending for them. Only
--- weekly-tagged runs write here; every other tag leaves it empty and the app
--- hides the section entirely. Rows are a point-in-time snapshot per run, never
--- updated after the run — re-running weekly writes a fresh set under a new
--- run_id.
+-- GitHub work surfaced by a run, of two kinds (see `origin`):
+--
+--   'triage'  — open issues/PRs a `weekly` sweep noticed and did not touch, so
+--               the operator is reminded what work is pending for them. Only
+--               weekly-tagged runs write these.
+--   'created' — an issue the run *filed itself*, under the punt → GitHub issue →
+--               ticket disposition in the maintenance skill. Written by runs of
+--               **any** tag, and by maint-followup/-do against the run that
+--               raised the ticket being worked. Without these the operator's
+--               only signal that a run opened an issue was a line of prose in a
+--               summary; the app badges them NEW instead.
+--
+-- A run with neither leaves the table empty and the app hides the section
+-- entirely. Rows are a point-in-time snapshot per run, never updated after the
+-- run — re-running weekly writes a fresh set under a new run_id.
 CREATE TABLE IF NOT EXISTS project_issues (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id       INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -88,6 +97,7 @@ CREATE TABLE IF NOT EXISTS project_issues (
   rank         INTEGER NOT NULL DEFAULT 50,            -- 0..100, LOWER = more deserving
   updated_at   TEXT,                                   -- GitHub's updatedAt (ISO-8601)
   created_at   TEXT    NOT NULL,                       -- when this row was recorded (UTC)
+  origin       TEXT    NOT NULL DEFAULT 'triage',      -- triage | created (see above)
   UNIQUE(run_id, project_name, kind, number)
 );
 

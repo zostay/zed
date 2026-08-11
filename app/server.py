@@ -184,26 +184,34 @@ def fetch_followups(conn, run_id):
 
 
 def fetch_project_issues(conn, run_id):
-    """Triaged GitHub issues/PRs a `weekly` run surfaced, most-deserving first.
+    """GitHub issues/PRs a run surfaced or filed, most-deserving first.
 
-    Ordered by (rank ASC, age_days DESC, id ASC): lower rank means more
-    deserving of attention, ties go to the older item, and the row id keeps the
-    order stable. ``age_days`` may be NULL; SQLite sorts NULL lowest, so DESC
-    already pushes unknown-age rows to the end of their rank band.
+    Issues the run *filed itself* (``origin='created'``) sort ahead of everything
+    else: they are the run's own output, the operator has no other signal that
+    they exist, and there are only ever a handful. Within each group the order is
+    (rank ASC, age_days DESC, id ASC) — lower rank means more deserving of
+    attention, ties go to the older item, and the row id keeps it stable.
+    ``age_days`` may be NULL; SQLite sorts NULL lowest, so DESC already pushes
+    unknown-age rows to the end of their rank band.
+    ``maintenance-db.sh list-project-issues`` orders identically — keep the two
+    in step.
 
-    Tolerates a database created before the project_issues table existed (older
-    schema): returns an empty list rather than raising, so an old DB opened by a
-    new server still serves its runs.
+    Tolerates a database created before the project_issues table existed, and one
+    created before it grew the ``origin`` column: returns an empty list rather
+    than raising on the former, and retries without the origin term on the
+    latter, so an old DB opened by a new server still serves its runs.
     """
-    try:
-        rows = conn.execute(
-            "SELECT * FROM project_issues WHERE run_id = ? "
-            "ORDER BY rank ASC, age_days DESC, id ASC",
-            (run_id,),
-        ).fetchall()
-    except sqlite3.Error:
-        return []
-    return [dict(r) for r in rows]
+    ordered = ("SELECT * FROM project_issues WHERE run_id = ? "
+               "ORDER BY (origin = 'created') DESC, rank ASC, age_days DESC, id ASC")
+    legacy = ("SELECT * FROM project_issues WHERE run_id = ? "
+              "ORDER BY rank ASC, age_days DESC, id ASC")
+    for sql in (ordered, legacy):
+        try:
+            rows = conn.execute(sql, (run_id,)).fetchall()
+        except sqlite3.Error:
+            continue
+        return [dict(r) for r in rows]
+    return []
 
 
 def fetch_run_detail(db, run_id):

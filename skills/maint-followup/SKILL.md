@@ -126,7 +126,18 @@ the run status update without a refresh).
 
   - **They match** — file it bare: `gh issue list --state open --search ...` first
     so you don't duplicate, then comment on the match if there is one, otherwise
-    `gh issue create`.
+    `gh issue create`. Then record the new issue against the ticket's run, so it
+    shows up badged **NEW** on that run's page in the observability app rather
+    than only in this session's transcript (`run_id` and `job_id` are both on the
+    ticket JSON from step 2; omit `--job` if it is null):
+
+    ```bash
+    "$DB" add-project-issue --run <run_id> --job <job_id> \
+      --project "<project_name>" --repo "<owner/repo>" --origin created \
+      --kind issue --number <n> --title "<issue title>" --url "<url gh printed>" \
+      --state open --age-days 0 --rank 20 \
+      --triage "Filed while recording followup #<ticket-number>: <one sentence>"
+    ```
   - **They do not match** (or you are not in a git repo at all) — **do not file
     anything.** You cannot name the right repository from here, and guessing one is
     worse than not filing. Report the finding to the user in step 5 instead, saying

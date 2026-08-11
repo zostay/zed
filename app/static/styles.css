@@ -734,6 +734,11 @@ code, .mono { font-family: var(--mono); }
 }
 .gt-note em { color: var(--ink); font-style: normal; text-decoration: underline dotted; }
 .gt-note strong { font-family: var(--mono); font-size: var(--fs-105); color: var(--ink-dim); font-weight: 600; }
+/* One idea per line: what the run filed, and what it merely noticed. */
+.gt-line { display: block; }
+.gt-line + .gt-line { margin-top: 5px; }
+.gt-line.is-new { color: var(--ink); }
+.gt-line.is-new b { color: var(--accent); font-weight: 600; }
 
 /* sub-headers inside the section (TOP 10 / BY PROJECT) */
 .gt-sub {
@@ -784,6 +789,19 @@ a.gt-row:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; 
 /* board (top 10) carries an ordinal + the project it belongs to */
 .gt-board .gt-row { grid-template-columns: 20px 58px minmax(74px, 116px) minmax(0, 1fr) auto 12px; }
 .gt-group .gt-row { grid-template-columns: 58px minmax(0, 1fr) auto 12px; }
+/* FILED BY THIS RUN spans projects like the top-10 board but is not ranked, so
+   it keeps the project column and drops the ordinal. */
+.gt-new .gt-row { grid-template-columns: 58px minmax(74px, 116px) minmax(0, 1fr) auto 12px; }
+
+/* An issue this run filed is the one thing here the operator has had no other
+   signal about, so it overrides the rank rail with the accent and keeps a lit
+   edge wherever it appears — the top board, or buried in a project group. */
+.gt-row[data-new="1"] { --tier: var(--accent); background: rgba(74,222,128,0.045); }
+.gt-row[data-new="1"]::before { box-shadow: 0 0 8px var(--accent-glow); }
+a.gt-row[data-new="1"]:hover { background: rgba(74,222,128,0.085); border-color: rgba(74,222,128,0.3); }
+
+.gt-new { margin-bottom: 20px; }
+.gt-new .gt-sub-title { color: var(--accent); }
 
 .gt-ord {
   font-family: var(--mono); font-size: var(--fs-100); text-align: right;
@@ -822,6 +840,12 @@ a.gt-row:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; 
   text-transform: uppercase; color: var(--skip);
   border: 1px solid var(--line); border-radius: 2px; padding: 0 4px;
 }
+/* NEW is the loud one: filled rather than outlined, so it reads as a sticker
+   slapped on the row instead of another muted metadata chip like `draft`. */
+.gt-flag.is-new {
+  color: var(--bg); background: var(--accent); border-color: var(--accent);
+  font-weight: 700; box-shadow: 0 0 10px var(--accent-glow);
+}
 .gt-age {
   font-family: var(--mono); font-size: var(--fs-100); white-space: nowrap;
   color: var(--ink-faint); font-variant-numeric: tabular-nums;
@@ -853,6 +877,11 @@ a.gt-row:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; 
   /* drop the project column from the board — the groups below still carry it */
   .gt-board .gt-row { grid-template-columns: 20px 52px minmax(0, 1fr) auto 12px; }
   .gt-board .gt-proj { display: none; }
+  /* …except on FILED BY THIS RUN, which has no per-project group to fall back
+     on when it is the only board on screen (a non-weekly run). Keep the project
+     there and drop the width instead. */
+  .gt-new .gt-row { grid-template-columns: 52px minmax(62px, 92px) minmax(0, 1fr) auto 12px; }
+  .gt-new .gt-proj { display: block; }
 }
 
 /* run summary */
