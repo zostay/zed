@@ -141,6 +141,25 @@ New findings go elsewhere, in this order:
    rules, but don't assume it — if one comes back permission-denied, that is
    case 2 below, never a reason to file a followup.
 
+   **Then record the issue against the ticket's run**, so it shows up badged
+   **NEW** on that run's debrief in the observability app instead of living only
+   in this session's transcript. The ticket JSON you loaded in step 1 carries both
+   ids you need — `run_id` and `job_id`:
+
+   ```bash
+   "$DB" add-project-issue --run <run_id> --job <job_id> \
+     --project "<project_name>" --repo "<owner/repo>" --origin created \
+     --kind issue --number <n> --title "<issue title>" --url "<url gh printed>" \
+     --state open --age-days 0 --rank 20 \
+     --triage "Filed while working followup #<ticket-number>: <one sentence>"
+   ```
+
+   `<n>` is the trailing path segment of the URL `gh issue create` printed, and
+   `<owner/repo>` comes from `gh repo view --json nameWithOwner -q .nameWithOwner`.
+   If `job_id` is null on the ticket, omit `--job`. If the call fails, note it and
+   move on — the issue itself is filed and named in your report, which is still
+   the durable record.
+
 2. **Straight to the user, in your step 6 report** — when the project has no GitHub
    remote (`gh repo view` fails), when `gh issue create` is denied, or when the
    finding is really a question only they can answer.
@@ -192,6 +211,10 @@ Tell the user, concisely:
 - the ticket number, its project/title, and what you determined it needed;
 - **what you did** — the change made and how you verified it — **or** the path
   forward, if you couldn't complete it;
+- **anything new you filed or escalated** (step 4) — the issue URL, or the
+  finding you are raising with them directly. Say plainly that it is new work
+  this session surfaced, not part of the ticket's original scope. A filed issue
+  also appears badged **NEW** on the run's page in the observability app;
 - **anything you filed or escalated on the way** — the URL of the GitHub issue you
   opened or commented on, or the finding you are handing them directly because there
   was no repo to file it against or because only they can decide it;

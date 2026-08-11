@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.12.0 — 2026-08-10
+
+### Added
+
+- `maintenance`, `maint-followup`, `maint-followup-do`: **issues a run files are
+  now surfaced, not just narrated.** 0.11.0 taught the skills to file a GitHub
+  issue rather than a followup ticket for incidental findings — but the only
+  trace of a filed issue was a line of prose in a job summary, so the operator
+  had no durable signal that the run had created work for them.
+  - `project_issues` gains an **`origin`** column (`triage` | `created`).
+    Anything the run files itself is recorded with `--origin created` the moment
+    `gh issue create` returns.
+  - **This is not weekly-gated.** Triage remains a `weekly`-only nudge about work
+    that was already there; a filed issue is work the run just created, on
+    whatever tag it ran under. A `dependabot` sweep that files one issue now
+    shows it in the debrief, where previously it showed nothing at all.
+  - The observability app renders them in a dedicated **FILED BY THIS RUN**
+    board at the top of the GitHub section, and badges every one of them
+    **NEW** — in that board and wherever else they appear, including inside the
+    per-project groups. The section title switches to `GITHUB ISSUES FILED` when
+    a run filed issues but triaged nothing.
+  - Run-filed rows sort **ahead of** triaged rows in both `list-project-issues`
+    and the app, so a `--limit`ed roll-up can never drop them in favour of
+    pre-existing backlog.
+  - Step 6 gains an **Issues filed by this run** summary section (any tag), and
+    the Top 10 table now passes `--origin triage` so the two don't restate each
+    other.
+  - `maint-followup` and `maint-followup-do` record what they file against the
+    ticket's own run, so an issue that came out of working a followup shows up
+    on that run's page instead of only in the session transcript.
+  - `add-project-issue` / `add-project-issues` take `--origin`; the batch form
+    also reads a per-item `origin` key (per-item wins). `list-project-issues`
+    takes `--origin` to filter.
+  - `init` gained a retrofit step: `CREATE TABLE IF NOT EXISTS` cannot add a
+    column to a table that already exists, so an idempotent guarded
+    `ALTER TABLE` backfills `origin` on databases created by 0.11.0. Existing
+    rows adopt `triage`, which is what they were.
+
+### Fixed
+
+- `maintenance` observability app: the GitHub section's boards were hidden but
+  never emptied, so selecting a run with no triage after one that had it left
+  the previous run's rows parked in the DOM. Every board is now cleared when it
+  is hidden.
+- `app/server.py` tolerates a `project_issues` table that predates the `origin`
+  column, retrying without the origin ordering term instead of returning an
+  empty list.
+
 ## 0.11.0 — 2026-08-05
 
 ### Added

@@ -92,6 +92,13 @@
     dbFollowupsBody: byId("db-followups-body"),
     dbFollowupsFoot: byId("db-followups-foot"),
     dbTriage: byId("db-triage"),
+    triageTitle: byId("triage-title"),
+    gtNote: byId("gt-note"),
+    gtNewBoard: byId("gt-new-board"),
+    gtNew: byId("gt-new"),
+    gtNewHint: byId("gt-new-hint"),
+    gtTopBoard: byId("gt-top-board"),
+    gtBy: byId("gt-by"),
     triageHint: byId("triage-hint"),
     gtTop: byId("gt-top"),
     gtGroups: byId("gt-groups"),
@@ -722,44 +729,89 @@
     }
   }
 
-  // -- GitHub triage (weekly runs only) -------------------------------------
-  // A reminder board, not a worklist: the sweep looked and touched nothing.
-  // Empty `project_issues` (every non-weekly run) hides the section outright.
+  // -- GitHub work surfaced by the run --------------------------------------
+  // Two populations share this section, told apart by `origin`:
+  //   created — issues the run opened itself under the punt/issue/ticket
+  //             disposition. Any tag can produce these; they get their own
+  //             board at the top and a NEW badge everywhere they appear,
+  //             because otherwise the only trace of them is a line of prose in
+  //             a summary nobody re-reads.
+  //   triage  — open work a weekly sweep noticed and did not touch.
+  // Empty `project_issues` hides the whole section, so a run that neither
+  // triaged nor filed anything shows nothing at all.
   function renderTriage(detail, reveal) {
     var items = detail.project_issues || [];
-    if (!items.length) { el.dbTriage.hidden = true; return; }
+    if (!items.length) {
+      el.dbTriage.hidden = true;
+      el.gtNew.innerHTML = el.gtTop.innerHTML = el.gtGroups.innerHTML = "";
+      return;
+    }
     el.dbTriage.hidden = false;
     if (reveal) { el.dbTriage.classList.remove("reveal"); void el.dbTriage.offsetWidth; el.dbTriage.classList.add("reveal"); }
 
-    // Rows arrive rank-ascending, so grouping in arrival order puts the project
+    var created = items.filter(isCreated);
+    var triaged = items.filter(function (it) { return !isCreated(it); });
+
+    el.triageTitle.textContent = triaged.length ? "GITHUB TRIAGE" : "GITHUB ISSUES FILED";
+    el.triageHint.textContent =
+      (created.length ? created.length + " new  ·  " : "") +
+      items.length + plural(items.length, " item");
+    el.gtNote.innerHTML = triageNote(created.length, triaged.length);
+
+    // Board 1 — what the run filed. Ordinal-less (there are only ever a few)
+    // but project-labelled, since it spans every project in the run.
+    // Each board is emptied when hidden, not just hidden: selecting a run with
+    // no triage after one that had it would otherwise leave the previous run's
+    // rows parked in the DOM, ready to reappear on any later un-hide.
+    el.gtNewBoard.hidden = !created.length;
+    if (created.length) {
+      el.gtNewHint.textContent = created.length + plural(created.length, " issue") + " opened by this run";
+      el.gtNew.innerHTML = created.map(function (it) { return triageRow(it, 0, true); }).join("");
+    } else {
+      el.gtNew.innerHTML = "";
+    }
+
+    // Board 2 — the pre-existing backlog, ranked. Deliberately excludes the
+    // created rows: they are already sitting in their own board directly above,
+    // and listing them twice on one screen reads as noise rather than emphasis.
+    // Derived from project_issues (the full set) rather than the server's
+    // top_issues, which is capped at 10 *before* the split and would otherwise
+    // yield fewer than 10 backlog rows.
+    el.gtTopBoard.hidden = !triaged.length;
+    if (triaged.length) {
+      el.gtTop.innerHTML = triaged.slice(0, 10).map(function (it, i) {
+        return triageRow(it, i + 1);
+      }).join("");
+    } else {
+      el.gtTop.innerHTML = "";
+    }
+
+    // Board 3 — per project, everything, created rows included and badged.
+    // Rows arrive already ordered, so grouping in arrival order puts the project
     // holding the most deserving item first. That is deliberately *not* the
     // PROJECT RESULTS order (which partitions attention-first by job status) —
     // the two sections are cross-referenced by project name, not by position.
+    el.gtBy.hidden = !triaged.length;
+    if (!triaged.length) { el.gtGroups.innerHTML = ""; return; }
+
     var order = [], byProject = {};
     items.forEach(function (it) {
       var name = it.project_name || "—";
       if (!byProject[name]) { byProject[name] = []; order.push(name); }
       byProject[name].push(it);
     });
-
-    el.triageHint.textContent =
-      items.length + plural(items.length, " item") + "  ·  " +
-      order.length + plural(order.length, " project");
-    el.gtGroupsHint.textContent = "up to 5 per project";
-
-    // The server already caps top_issues at 10; slice anyway so a stale or
-    // hand-rolled payload can't stretch the board.
-    var top = detail.top_issues || items;
-    var html = "";
-    top.slice(0, 10).forEach(function (it, i) { html += triageRow(it, i + 1); });
-    el.gtTop.innerHTML = html;
+    el.gtGroupsHint.textContent = order.length + plural(order.length, " project") + "  ·  up to 5 each";
 
     var groups = "";
     order.forEach(function (name) {
       var rows = byProject[name].slice(0, 5);
-      var prs = 0;
-      rows.forEach(function (r) { if (r.kind === "pr") prs++; });
+      var prs = 0, news = 0;
+      rows.forEach(function (r) {
+        if (r.kind === "pr") prs++;
+        if (isCreated(r)) news++;
+      });
       var meta = [];
+      if (news) meta.push(news + " new");
       if (prs) meta.push(prs + plural(prs, " pr"));
       if (rows.length - prs) meta.push((rows.length - prs) + plural(rows.length - prs, " issue"));
       groups += '<div class="gt-group">' +
@@ -774,19 +826,48 @@
     el.gtGroups.innerHTML = groups;
   }
 
+  function isCreated(it) { return it && it.origin === "created"; }
+
+  // The section means different things depending on which populations are in
+  // it, so the standfirst says which one the reader is looking at. When both are
+  // present they get a line each — run together in one paragraph the second
+  // sentence reads as if it were still describing the filed issues.
+  function triageNote(nCreated, nTriaged) {
+    var filed = "<b>" + nCreated + " issue" + (nCreated === 1 ? "" : "s") +
+      "</b> filed by this maintenance run — work it <em>created</em> for you.";
+    var noticed = "Open issues and pending PRs this weekly sweep noticed and did " +
+      "<em>not</em> touch. Scan, pick what deserves your time, open it on GitHub.";
+    var locate = " Grouped by project — find the same project by name in " +
+      "<strong>PROJECT RESULTS</strong> below.";
+
+    if (!nTriaged) {
+      return '<span class="gt-line is-new">' + filed +
+        " Open one on GitHub for the detail; its project is named on the row." +
+        "</span>";
+    }
+    if (!nCreated) return '<span class="gt-line">' + noticed + locate + "</span>";
+    return '<span class="gt-line is-new">' + filed + "</span>" +
+           '<span class="gt-line">' + noticed + locate + "</span>";
+  }
+
   // One triage row. `ordinal` > 0 renders the ranked top-10 variant (position +
-  // project column); 0 renders the compact per-project variant. The whole row is
-  // the link — this board exists to be jumped from, so the target is generous.
-  function triageRow(it, ordinal) {
+  // project column); 0 renders the compact per-project variant. `withProject`
+  // forces the project label on for a board that spans projects without being
+  // ranked (FILED BY THIS RUN). The whole row is the link — these boards exist
+  // to be jumped from, so the target is generous.
+  function triageRow(it, ordinal, withProject) {
     var kind = it.kind === "pr" ? "pr" : "issue";
     var draft = String(it.state || "").toLowerCase() === "draft";
+    var isNew = isCreated(it);
     var href = safeHref(it.url);
     var age = ageBand(it.age_days);
+    var showProject = withProject || !!ordinal;
     var tip = (it.repo ? it.repo + " " : "") + "#" + it.number +
       (it.author ? "  ·  by " + it.author : "") +
       (it.labels ? "  ·  " + it.labels : "") +
       "\n" + (it.title || "") +
       (it.triage ? "\n" + it.triage : "") +
+      (isNew ? "\nOpened by this maintenance run." : "") +
       (href ? "" : "\nno https url recorded — nothing to open");
 
     var inner = "";
@@ -796,10 +877,12 @@
         '<span class="gt-glyph" aria-hidden="true">' + KIND_GLYPH[kind] + '</span>' +
         '<span class="gt-num">#' + esc(it.number) + '</span>' +
       '</span>';
-    if (ordinal) inner += '<span class="gt-proj">' + esc(it.project_name || "—") + '</span>';
+    if (showProject) inner += '<span class="gt-proj">' + esc(it.project_name || "—") + '</span>';
     inner +=
       '<span class="gt-body">' +
         '<span class="gt-title">' +
+          // NEW before DRAFT: "this run made it" outranks "its author parked it".
+          (isNew ? '<span class="gt-flag is-new">NEW</span>' : "") +
           (draft ? '<span class="gt-flag">draft</span>' : "") + esc(it.title || "") +
         '</span>' +
         '<span class="gt-triage">' + esc(it.triage || "") + '</span>' +
@@ -810,10 +893,12 @@
       '<span class="gt-open" aria-hidden="true">' + (href ? "↗" : "⊘") + '</span>';
 
     var attrs = ' data-kind="' + kind + '" data-tier="' + rankTier(it.rank) + '"' +
-      (draft ? ' data-draft="1"' : "") + ' title="' + esc(tip) + '"';
+      (draft ? ' data-draft="1"' : "") + (isNew ? ' data-new="1"' : "") +
+      ' title="' + esc(tip) + '"';
     if (!href) return '<div class="gt-row is-nolink"' + attrs + '>' + inner + '</div>';
     return '<a class="gt-row" href="' + href + '" target="_blank" rel="noopener noreferrer"' +
-      attrs + ' aria-label="' + esc((kind === "pr" ? "pull request #" : "issue #") + it.number +
+      attrs + ' aria-label="' + esc((isNew ? "newly filed " : "") +
+      (kind === "pr" ? "pull request #" : "issue #") + it.number +
       " · " + (it.title || "") + " · opens on GitHub") + '">' + inner + '</a>';
   }
 

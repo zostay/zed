@@ -399,11 +399,15 @@ subagent does the project work and logs its own progress events.
      section is meant to cut through.
    - **Deploy/release automation** — release-please / changeset / version-bump
      PRs, scheduled CI chores, anything a machine opens on a timer.
-   - **Anything this very run just created** — the sweep PR the subagent opened
-     minutes ago, an issue it filed under sub-step 5's rules. Cross-check the
-     numbers you know you created, and treat a `createdAt` later than this job's
-     start as suspect. When in doubt, drop it: the section's job is to remind
-     Sterling of work he has *not* seen, not to echo back what the sweep just did.
+   - **The sweep PR this run just opened** — the subagent opened it minutes ago
+     and it is described in the job summary already. Treat a `createdAt` later
+     than this job's start as suspect.
+
+   Do **not** drop an **issue this run filed** under sub-step 5's rules. Those
+   used to be excluded here; they are now recorded deliberately, with
+   `--origin created`, so the app can badge them **NEW** (see **g** below). An
+   issue the sweep opened is precisely work Sterling has not seen — burying it
+   in summary prose was the gap this replaces.
 
    **d. Rank what survives and keep at most 5.** `rank` is 0..100 and **lower
    means more deserving of attention**:
@@ -433,7 +437,7 @@ subagent does the project work and logs its own progress events.
    ```
    Per-item keys are `kind` (`issue`|`pr`), `number`, `title`, `url`, `state`,
    `author`, `labels` (comma-separated), `age_days`, `triage`, `rank`,
-   `updated_at`. `url` **must** start with `https://` — the UI turns it into a
+   `updated_at`, `origin`. `url` **must** start with `https://` — the UI turns it into a
    link and anything else is rejected. `triage` is one plain sentence saying why
    it deserves attention; it is the only prose the operator reads before deciding
    to click. Rows are keyed `(run_id, project_name, kind, number)`, so re-running
@@ -460,6 +464,7 @@ subagent does the project work and logs its own progress events.
    ```bash
    export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "<DB_SCRIPT>" log --run <RUN_ID> --job <JOB_ID> --level warn --message "Weekly GitHub triage failed (<short reason>); continuing."
    ```
+
 4. After the subagent returns, write its summary to a temp file and finish the
    job with the right status (`success`, `followup`, `failure`, or `skipped`).
 
@@ -547,8 +552,40 @@ subagent does the project work and logs its own progress events.
    the finding is **not** downgraded to a followup ticket. Report it to
    Sterling in your final roll-up message, exactly as for a project with no
    GitHub remote. Whichever way it was filed, don't file it twice, and put the
-   resulting issue URL in the job summary. Real run #11 tickets that should have
-   been GitHub issues:
+   resulting issue URL in the job summary.
+
+   **Then record it — on every tag, not just `weekly`.** An issue the sweep
+   opened is work it *created for Sterling*, and a line of prose in a job
+   summary is not a signal he will see. Immediately after `gh issue create`
+   succeeds, in the same breath, record the issue with `--origin created`:
+   ```bash
+   export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "<DB_SCRIPT>" add-project-issue --run <RUN_ID> --job <JOB_ID> --project "<project_name>" --repo "<owner/repo>" --origin created --kind issue --number <n> --title "<issue title>" --url "<the https:// url gh printed>" --state open --age-days 0 --rank 20 --triage "<why this run filed it, one sentence>"
+   ```
+   `gh issue create` prints the new issue's URL; its trailing path segment is
+   `<n>`. **This step is not gated on the tag** — unlike the triage pass in
+   sub-step 3, it runs for `dependabot`, ad-hoc, and every other tag. The app
+   renders these under **FILED BY THIS RUN** with a **NEW** badge, so a sweep
+   that triaged nothing at all still shows what it opened; a `weekly` sweep
+   shows them above the backlog boards.
+
+   When the **subagent** files the issue (the preferred path above), fold this
+   recording call into its sub-step 2 prompt too, so it records what it filed
+   before returning — it has the URL and the number in hand and you do not.
+   Whoever files, records; do not record the same issue twice (the row is keyed
+   `(run_id, project_name, kind, number)`, so a duplicate call updates rather
+   than duplicating, but the second `--triage` silently overwrites the first).
+
+   `--triage` here answers "why did the sweep open this?", not "why does it
+   deserve attention" — e.g. *"Filed because `npm run build` fails on the pinned
+   vue-tsc; the sweep could not complete the frontend check."* Keep `--rank`
+   low enough that the item reads as live (10–30 suits something the sweep hit
+   head-on); the app sorts run-filed items ahead of the backlog regardless.
+
+   If the recording call fails, log a `warn` and carry on — the issue is filed
+   and named in the job summary, which is still the durable record. Never fail a
+   job over a missing triage row.
+
+   Real run #11 tickets that should have been GitHub issues:
    - *"Dockerfile base image drifting: alpine not covered by Dependabot"* — a
      defect in the project's Dependabot config.
    - *"Add a gomod Dependabot entry for gin/examples/polymorphic"* — same.
@@ -654,15 +691,36 @@ When the last ticket is closed, this run flips from **Needs Followup** to
 
 Omit that section entirely when the run filed no tickets — under the filing rules
 in Step 5 that is the normal outcome, and an empty "Needs attention" heading just
-invites someone to fill it. Punted work and issues filed on GitHub belong in the
-per-project prose instead, the latter with their issue URLs.
+invites someone to fill it. Punted work belongs in the per-project prose instead.
 
-**Weekly runs also get a Top 10 GitHub table.** When `<tag>` is exactly `weekly`,
-read back the best of what every project's triage recorded (Step 5, sub-step 3):
+**Every run that filed a GitHub issue gets an "Issues filed" section.** This is
+**not** gated on the tag — a `dependabot` sweep that opened one issue lists it
+here just as a `weekly` sweep does. Read back what the run recorded with
+`--origin created` (Step 5, sub-step 5):
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
-  list-project-issues --run "$RUN_ID" --limit 10
+  list-project-issues --run "$RUN_ID" --origin created
+```
+
+```markdown
+## Issues filed by this run
+| project | issue | why |
+|---|---|---|
+| go-ignite | [#118](https://github.com/zostay/go-ignite/issues/118) | `npm run build` fails on the pinned vue-tsc; the sweep could not complete the frontend check. |
+```
+
+These are work the run **created for Sterling**, so say so plainly — do not bury
+them among the items it merely noticed. Omit the section when the command prints
+nothing.
+
+**Weekly runs also get a Top 10 GitHub table.** When `<tag>` is exactly `weekly`,
+read back the best of what every project's triage recorded (Step 5, sub-step 3),
+excluding the run's own filings so the two sections don't restate each other:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+  list-project-issues --run "$RUN_ID" --origin triage --limit 10
 ```
 
 That prints JSONL already ordered most-deserving-first (rank ascending, then
@@ -923,8 +981,8 @@ reads the transcript instead of the app.
 Three properties are load-bearing:
 
 - **Weekly-only.** Gated on the tag being exactly `weekly`. A `dependabot` or
-  ad-hoc sweep writes no rows and the app's section stays hidden. This is a
-  once-a-week nudge; attached to every run it becomes wallpaper.
+  ad-hoc sweep triages nothing. This is a once-a-week nudge; attached to every
+  run it becomes wallpaper.
 - **Cursory, never resolving.** The subagent reads listings and writes rows. It
   does not open diffs, check out branches, comment, merge, close, or "just
   quickly fix" anything. Triage that starts fixing turns a five-minute pass into
@@ -937,6 +995,32 @@ Three properties are load-bearing:
 Snapshots are per-run and immutable: next week's `weekly` run writes a fresh set
 under a new `run_id` rather than updating last week's, so an old run keeps
 showing what was actually pending the day it ran.
+
+### Issues the run filed itself
+
+The same table carries a second population, told apart by its `origin` column.
+When a sweep declines to open a followup ticket and files a **GitHub issue**
+instead (Step 5, sub-step 5), it records that issue with `--origin created`.
+
+This is **not** weekly-gated, and that asymmetry is deliberate. Triage is a
+weekly nudge about work that was already there; a filed issue is work *this run
+just created for Sterling*, on whatever tag it happened to run under. Before
+this existed the only trace of such an issue was a line of prose in a job
+summary — filed, reported once, and effectively invisible thereafter. Now the
+app shows it under **FILED BY THIS RUN**, badged **NEW**, and Step 6 lists it in
+its own summary section.
+
+Consequences worth knowing:
+
+- A run of **any** tag can therefore show the GitHub section, where previously
+  only `weekly` could. A `dependabot` sweep that files one issue shows exactly
+  that one issue and neither backlog board.
+- Run-filed rows sort **ahead of** triaged rows everywhere (`list-project-issues`
+  and the app agree on this), so a `--limit`ed roll-up can never drop them in
+  favour of pre-existing backlog.
+- The weekly triage pass no longer excludes issues the run filed — it used to,
+  on the reasoning that they were already in the summary. That reasoning was the
+  bug. It still excludes the sweep's own **PR**, which genuinely is just noise.
 
 ## Robustness
 

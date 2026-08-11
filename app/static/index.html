@@ -157,30 +157,36 @@
             <p class="followups-foot" id="db-followups-foot"></p>
           </section>
 
-          <!-- weekly GitHub triage — hidden entirely unless the run recorded
-               project_issues, so non-weekly runs show nothing at all -->
+          <!-- GitHub work this run surfaced — hidden entirely unless the run
+               recorded project_issues. A weekly run fills all three boards; a
+               run of any other tag that filed an issue shows only FILED BY
+               THIS RUN. -->
           <section class="db-triage" id="db-triage" hidden>
             <div class="pane-head">
-              <span class="pane-title">GITHUB TRIAGE</span>
+              <span class="pane-title" id="triage-title">GITHUB</span>
               <span class="pane-hint" id="triage-hint"></span>
             </div>
-            <p class="gt-note">
-              Open issues and pending PRs this weekly sweep noticed and did
-              <em>not</em> touch. Scan, pick what deserves your time, open it on
-              GitHub. Grouped by project, the one holding the most deserving
-              item first — find the same project by name in
-              <strong>PROJECT RESULTS</strong> below.
-            </p>
+            <p class="gt-note" id="gt-note"></p>
 
-            <div class="gt-board">
+            <!-- issues the run opened itself — its own output, and otherwise
+                 only visible as a line of prose in a summary -->
+            <div class="gt-board gt-new" id="gt-new-board" hidden>
+              <div class="gt-sub">
+                <span class="gt-sub-title">FILED BY THIS RUN</span>
+                <span class="gt-sub-hint" id="gt-new-hint"></span>
+              </div>
+              <div class="gt-rows" id="gt-new"></div>
+            </div>
+
+            <div class="gt-board" id="gt-top-board" hidden>
               <div class="gt-sub">
                 <span class="gt-sub-title">TOP 10 · ALL PROJECTS</span>
-                <span class="gt-sub-hint">most deserving first</span>
+                <span class="gt-sub-hint">already open · most deserving first</span>
               </div>
               <div class="gt-rows" id="gt-top"></div>
             </div>
 
-            <div class="gt-by">
+            <div class="gt-by" id="gt-by" hidden>
               <div class="gt-sub">
                 <span class="gt-sub-title">BY PROJECT</span>
                 <span class="gt-sub-hint" id="gt-groups-hint"></span>

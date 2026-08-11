@@ -50,20 +50,23 @@
 #                     --kind issue|pr --number N --title T --url U
 #                     [--state S] [--author A] [--labels L] [--age-days D]
 #                     [--triage T] [--rank N] [--updated-at TS]
-#       Record one cursorily-triaged GitHub issue/PR for a project. Prints the
-#       row id. INSERT OR REPLACE on UNIQUE(run_id,project_name,kind,number), so
+#                     [--origin triage|created]
+#       Record one GitHub issue/PR for a project. --origin says where it came
+#       from: 'triage' (default) is one the sweep merely noticed; 'created' is
+#       one the run filed itself, which the app badges NEW. Prints the row id.
+#       INSERT OR REPLACE on UNIQUE(run_id,project_name,kind,number), so
 #       re-triaging a project inside one run updates instead of duplicating.
 #   add-project-issues --run R [--job J] --project N [--repo OWNER/REPO]
-#                      --file PATH
+#                      [--origin triage|created] --file PATH
 #       Batch form: PATH is JSONL or a JSON array of objects with the per-item
 #       keys kind, number, title, url, state, author, labels, age_days, triage,
-#       rank, updated_at. Prints one row id per line. An item that fails
+#       rank, updated_at, origin. Prints one row id per line. An item that fails
 #       validation is warned about on stderr and skipped; the rest still land.
 #       A failed *database write* is different: it exits non-zero with a count,
 #       so a mis-threaded --job or an unwritable DB never looks like success.
-#   list-project-issues [--run R] [--project N] [--limit N]
-#       Print triaged items as JSONL ordered by (rank ASC, age_days DESC,
-#       id ASC) — lowest rank is most deserving of attention.
+#   list-project-issues [--run R] [--project N] [--origin O] [--limit N]
+#       Print items as JSONL, run-created ones first, then by (rank ASC,
+#       age_days DESC, id ASC) — lowest rank is most deserving of attention.
 
 set -euo pipefail
 
@@ -99,8 +102,10 @@ Subcommands:
                       --kind issue|pr --number N --title T --url U
                       [--state S] [--author A] [--labels L] [--age-days D]
                       [--triage T] [--rank N] [--updated-at TS]
-  add-project-issues  --run R [--job J] --project N [--repo OWNER/REPO] --file PATH
-  list-project-issues [--run R] [--project N] [--limit N]
+                      [--origin triage|created]
+  add-project-issues  --run R [--job J] --project N [--repo OWNER/REPO]
+                      [--origin triage|created] --file PATH
+  list-project-issues [--run R] [--project N] [--origin triage|created] [--limit N]
 EOF
 }
 
@@ -183,6 +188,25 @@ if [ -z "$DB" ]; then
   DB="$(mtnc_db_path)"
 fi
 
+# Add a column to an existing table if it is not already there. schema.sql only
+# carries CREATE TABLE IF NOT EXISTS, which is a no-op against a table that
+# already exists — so a column added to schema.sql after a database was created
+# never reaches that database without a step like this. Idempotent: reads
+# PRAGMA table_info and returns quietly when the column is present.
+#
+# ALTER TABLE ... ADD COLUMN accepts NOT NULL only with a constant default, which
+# is exactly the shape used here (existing rows adopt the default).
+migrate_add_column() {
+  local table="$1" column="$2" decl="$3" present
+  present="$(sqlite3 "$DB" \
+    "SELECT COUNT(*) FROM pragma_table_info('$table') WHERE name='$column';" 2>/dev/null || echo 0)"
+  [ "${present:-0}" = "0" ] || return 0
+  sqlite3 "$DB" >/dev/null <<SQL
+PRAGMA busy_timeout=10000;
+ALTER TABLE $table ADD COLUMN $column $decl;
+SQL
+}
+
 cmd_init() {
   local dir
   dir="$(mtnc_ensure_data_dir)"
@@ -193,6 +217,16 @@ cmd_init() {
 PRAGMA busy_timeout=10000;
 $(cat -- "$SCHEMA_PATH")
 SQL
+
+  # Retrofits for databases created by an older plugin version. Each is a no-op
+  # once applied, so init stays idempotent.
+  #
+  # 0.12.0 — project_issues.origin distinguishes an item the sweep merely noticed
+  # ('triage') from one it filed itself ('created'), which the app badges NEW.
+  # Rows written before this column existed were all triage snapshots, so the
+  # default backfills them correctly.
+  migrate_add_column project_issues origin "TEXT NOT NULL DEFAULT 'triage'"
+
   printf '%s\n' "$DB"
 }
 
@@ -633,14 +667,14 @@ pi_reject() {
 # the row that now exists. Positional arguments, in order:
 #   1 strict  2 label  3 run  4 job  5 project  6 repo  7 kind  8 number
 #   9 title  10 url  11 state  12 author  13 labels  14 age_days  15 triage
-#  16 rank  17 updated_at
+#  16 rank  17 updated_at  18 origin
 # (Positional because bash has nothing better; the option loops below are the
 # readable surface and this is the shared tail they both funnel into.)
 pi_upsert() {
   local strict="$1" label="$2" run="$3" job="$4" project="$5" repo="$6" \
         kind="$7" number="$8" title="$9" url="${10}" state="${11}" \
         author="${12}" labels="${13}" age_days="${14}" triage="${15}" \
-        rank="${16}" updated_at="${17}"
+        rank="${16}" updated_at="${17}" origin="${18}"
 
   [ -n "$project" ] || pi_reject "$strict" "$label: project name is required" || return 1
   [ -n "$title" ]   || pi_reject "$strict" "$label: title is required" || return 1
@@ -668,14 +702,22 @@ pi_upsert() {
   else
     rank=50
   fi
+  # An unset origin means 'triage' — the overwhelmingly common case, and the
+  # value every row written before this column existed effectively had.
+  [ -n "$origin" ] || origin="triage"
+  case "$origin" in
+    triage|created) ;;
+    *) pi_reject "$strict" "$label: origin must be triage or created (got: '$origin')" || return 1 ;;
+  esac
 
-  local now now_e project_e title_e url_e kind_e
+  local now now_e project_e title_e url_e kind_e origin_e
   now="$(mtnc_now)"
   now_e="$(mtnc_sql_escape "$now")"
   project_e="$(mtnc_sql_escape "$project")"
   title_e="$(mtnc_sql_escape "$title")"
   url_e="$(mtnc_sql_escape "$url")"
   kind_e="$(mtnc_sql_escape "$kind")"
+  origin_e="$(mtnc_sql_escape "$origin")"
 
   local job_v repo_v state_v author_v labels_v age_v triage_v updated_v
   if [ -n "$job" ];        then job_v="$job";                                    else job_v="NULL";     fi
@@ -700,9 +742,10 @@ pi_upsert() {
   if ! ids="$(db_exec <<SQL
 INSERT OR REPLACE INTO project_issues
   (run_id, job_id, project_name, repo, kind, number, title, url, state, author,
-   labels, age_days, triage, rank, updated_at, created_at)
+   labels, age_days, triage, rank, updated_at, created_at, origin)
 VALUES ($run, $job_v, '$project_e', $repo_v, '$kind_e', $number, '$title_e', '$url_e',
-        $state_v, $author_v, $labels_v, $age_v, $triage_v, $rank, $updated_v, '$now_e');
+        $state_v, $author_v, $labels_v, $age_v, $triage_v, $rank, $updated_v, '$now_e',
+        '$origin_e');
 SELECT id FROM project_issues
  WHERE run_id=$run AND project_name='$project_e' AND kind='$kind_e' AND number=$number;
 SQL
@@ -723,7 +766,8 @@ SQL
 
 cmd_add_project_issue() {
   local run="" job="" project="" repo="" kind="" number="" title="" url="" \
-        state="" author="" labels="" age_days="" triage="" rank="" updated_at=""
+        state="" author="" labels="" age_days="" triage="" rank="" \
+        updated_at="" origin=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --run)        run="$2";        shift 2 ;;
@@ -741,6 +785,7 @@ cmd_add_project_issue() {
       --triage)     triage="$2";     shift 2 ;;
       --rank)       rank="$2";       shift 2 ;;
       --updated-at) updated_at="$2"; shift 2 ;;
+      --origin)     origin="$2";     shift 2 ;;
       *) die "add-project-issue: unknown option: $1" 2 ;;
     esac
   done
@@ -755,7 +800,7 @@ cmd_add_project_issue() {
 
   pi_upsert 1 "add-project-issue" "$run" "$job" "$project" "$repo" "$kind" \
     "$number" "$title" "$url" "$state" "$author" "$labels" "$age_days" \
-    "$triage" "$rank" "$updated_at"
+    "$triage" "$rank" "$updated_at" "$origin"
 }
 
 # Pull one key out of a compact JSON object, printing '' for a missing or null
@@ -784,7 +829,7 @@ pi_field_author() {
 }
 
 cmd_add_project_issues() {
-  local run="" job="" project="" repo="" file=""
+  local run="" job="" project="" repo="" file="" origin=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --run)     run="$2";     shift 2 ;;
@@ -792,6 +837,7 @@ cmd_add_project_issues() {
       --project) project="$2"; shift 2 ;;
       --repo)    repo="$2";    shift 2 ;;
       --file)    file="$2";    shift 2 ;;
+      --origin)  origin="$2";  shift 2 ;;
       *) die "add-project-issues: unknown option: $1" 2 ;;
     esac
   done
@@ -831,7 +877,7 @@ cmd_add_project_issues() {
 
   local idx=0 written=0 hard_failures=0 rc=0
   local item kind number title url state author labels age_days triage \
-        rank updated_at item_project item_repo
+        rank updated_at item_project item_repo item_origin
   while IFS= read -r item; do
     [ -n "$item" ] || continue
     idx=$((idx + 1))
@@ -856,6 +902,8 @@ cmd_add_project_issues() {
     triage="$(pi_field "$item" triage)"
     rank="$(pi_field "$item" rank)"
     updated_at="$(pi_field "$item" updated_at)"
+    item_origin="$(pi_field "$item" origin)"
+    [ -n "$item_origin" ] || item_origin="$origin"
 
     # Non-strict: pi_upsert warns and returns non-zero on a bad item, and the
     # `||` keeps set -e from ending the batch there. Status 1 is a validation
@@ -864,7 +912,7 @@ cmd_add_project_issues() {
     rc=0
     pi_upsert 0 "add-project-issues: item $idx" "$run" "$job" "$item_project" \
       "$item_repo" "$kind" "$number" "$title" "$url" "$state" "$author" \
-      "$labels" "$age_days" "$triage" "$rank" "$updated_at" || rc=$?
+      "$labels" "$age_days" "$triage" "$rank" "$updated_at" "$item_origin" || rc=$?
     if [ "$rc" -eq 0 ]; then
       written=$((written + 1))
     elif [ "$rc" -ge 3 ]; then
@@ -878,12 +926,13 @@ cmd_add_project_issues() {
 }
 
 cmd_list_project_issues() {
-  local run="" project="" limit=""
+  local run="" project="" limit="" origin=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --run)     run="$2";     shift 2 ;;
       --project) project="$2"; shift 2 ;;
       --limit)   limit="$2";   shift 2 ;;
+      --origin)  origin="$2";  shift 2 ;;
       *) die "list-project-issues: unknown option: $1" 2 ;;
     esac
   done
@@ -897,22 +946,35 @@ cmd_list_project_issues() {
     project_e="$(mtnc_sql_escape "$project")"
     if [ -n "$where" ]; then where="$where AND project_name='$project_e'"; else where="WHERE project_name='$project_e'"; fi
   fi
+  if [ -n "$origin" ]; then
+    case "$origin" in
+      triage|created) ;;
+      *) die "list-project-issues: --origin must be triage or created (got: '$origin')" 2 ;;
+    esac
+    local origin_e
+    origin_e="$(mtnc_sql_escape "$origin")"
+    if [ -n "$where" ]; then where="$where AND origin='$origin_e'"; else where="WHERE origin='$origin_e'"; fi
+  fi
   local limit_clause=""
   if [ -n "$limit" ]; then
     require_int --limit "$limit"
     limit_clause="LIMIT $limit"
   fi
 
-  # rank ASC first: lower rank is more deserving of attention. Ties go to the
-  # older item, which is what age_days DESC buys.
+  # Issues this run filed itself come first: they are the run's own output and
+  # the operator has no other signal that they exist, so they must never be
+  # pushed off a --limit'ed roll-up by pre-existing backlog. Within each group,
+  # rank ASC (lower is more deserving) then oldest-first via age_days DESC.
+  # app/server.py orders identically — keep the two in step.
   db_exec <<SQL
 SELECT json_object(
   'id', id, 'run_id', run_id, 'job_id', job_id,
   'project_name', project_name, 'repo', repo, 'kind', kind, 'number', number,
   'title', title, 'url', url, 'state', state, 'author', author,
   'labels', labels, 'age_days', age_days, 'triage', triage, 'rank', rank,
-  'updated_at', updated_at, 'created_at', created_at
-) FROM project_issues $where ORDER BY rank ASC, age_days DESC, id ASC $limit_clause;
+  'updated_at', updated_at, 'created_at', created_at, 'origin', origin
+) FROM project_issues $where
+ ORDER BY (origin = 'created') DESC, rank ASC, age_days DESC, id ASC $limit_clause;
 SQL
 }
 
