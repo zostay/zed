@@ -30,9 +30,8 @@ across all your repositories at a glance.
 
 ### Batch note (be honest about this)
 
-Claude Code does **not** currently expose a user-facing batch primitive for
-orchestrating subagents from within a skill session. There is no "submit a batch
-of subagents and await them" API to call. Consequently:
+Claude Code does **not** expose a "submit a batch of subagents and await them"
+API. Consequently:
 
 - The **default** behavior is the methodical **serial** path: one project
   subagent at a time, in a deterministic order.
@@ -44,6 +43,17 @@ of subagents and await them" API to call. Consequently:
 
 Do not pretend a batch API exists. Pick serial (default / `--now`) or parallel
 (`--fast`) and follow the corresponding execution path in Step 5.
+
+**What does exist, and what the interactive queue depends on:** a dispatched
+subagent runs in the **background**, and you are notified when it finishes. So
+you can dispatch one and carry on issuing tool calls in the same turn without
+waiting for its result. That is not a batch API and it does not change the
+automated path — the serial path still dispatches a project subagent and waits
+for it, because it needs the summary to finish the job. It is what makes the
+interactive queue possible: an interactive subagent is dispatched and
+**deliberately never awaited** (Step 5), because the human it is waiting on may
+take hours, and blocking on them is the failure this whole feature exists to
+remove.
 
 ## Two queues, running at different paces
 
@@ -377,18 +387,38 @@ It prints exactly one JSON object. Act on its `kind`, then loop:
   ```bash
   "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" start-interactive --task "<task>"
   ```
-  Then dispatch per **Dispatching an interactive task** below.
-- **`job`** — run it exactly as the per-job sub-steps below describe. This covers
-  injected jobs too; there is nothing special to do for them.
-- **`idle`** — nothing runnable, but interactive work is still outstanding. Wait:
-  ```bash
-  "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" wait-for-work --run "$RUN_ID"
-  ```
-  It returns the moment something becomes runnable, or after ~8 minutes (chosen
-  to sit under the Bash ceiling) with another `idle`. After **two** consecutive
-  idle windows, stop waiting and **park** the run (Step 6). Parking is not
-  giving up and it is not a failure — it hands the run back to Sterling's own
-  pace and lets a later session finish it.
+  Then dispatch per **Dispatching an interactive task** below. Concretely: issue
+  the Task/Agent call and **keep going in the same turn** — your next tool call
+  is the next `next-work`, not a wait on that subagent's result. It runs in the
+  background and notifies you when it is done (see the **Batch note**). If you
+  find yourself blocked on it, you have reintroduced the exact failure this
+  feature exists to remove.
+- **`job`** — run it as the per-job sub-steps below describe, with one thing to
+  get right: dispatch the subagent against the **`skill_name` the payload
+  carries**, not `maintenance-<tag>`. For a discovered job those are the same;
+  for an **injected** job the skill is the follow-on stage an interactive task
+  queued (e.g. `maintenance-weekly-publish`). Re-running `maintenance-<tag>`
+  there would repeat the project's whole sweep — a second dependency pass, a
+  second round of paid API calls, a second triage — which is precisely the
+  duplicate-work failure of run #20.
+- **`idle`** — nothing is runnable right now. Look at `open_interactive` before
+  deciding what that means:
+  - **`open_interactive` > 0** — a human owes the run something. Wait:
+    ```bash
+    "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" wait-for-work --run "$RUN_ID" --timeout 480
+    ```
+    **Pass `timeout: 600000` to the Bash tool for this call.** The tool's
+    *default* timeout is 120s — the 10-minute figure is its maximum — so without
+    an explicit timeout an 8-minute wait is killed at two minutes and reads as a
+    hang. After **two** consecutive idle windows, stop waiting and **park** the
+    run (Step 6). Parking is not giving up and it is not a failure — it hands
+    the run back to Sterling's own pace and lets a later session finish it.
+  - **`open_interactive` == 0** — nobody is pending; `pending_jobs` counts work
+    that is `running` or stuck at `awaiting_interactive`. Do **not** park: there
+    is no human to wait for. Reconcile instead — finish any job whose subagent
+    has returned, and if a job is stuck at `awaiting_interactive` with no task to
+    release it, that is a bug in this run's bookkeeping: log a `warn`, finish the
+    job with the status it earned, and continue.
 - **`drained`** — both queues are empty. Go to Step 6.
 
 Under `--fast`, run the discovered priority groups as described below, and let
@@ -410,7 +440,11 @@ subagent does the project work and logs its own progress events.
    before you dispatch** — sub-step 3 below is prompt *content*, not a step that
    runs after the subagent returns. The subagent's task is to:
    - `cd` into `project_path`,
-   - invoke that project's `maintenance-<tag>` skill and do the work,
+   - invoke **the skill named by that job's `skill_name`** and do the work. For
+     a discovered job this is the project's `maintenance-<tag>` skill; for an
+     injected job it is the follow-on stage an interactive task queued, and
+     running `maintenance-<tag>` instead would repeat the project's entire
+     sweep,
    - log its own progress events to the **same** database,
    - **when `<tag>` is exactly `weekly`**, triage the project's open GitHub work
      last, exactly as sub-step 3 spells out (fold that text into this prompt), and
@@ -784,9 +818,18 @@ the remaining projects. One project's failure must not abort the others.
 #### Dispatching an interactive task
 
 When the drain loop hands you an `interactive_start`, dispatch a subagent to run
-that project's interactive skill. Its prompt gets the same three coordinates a
-job subagent gets (`run_id`, `job_id`, `$DB_SCRIPT`) plus the `task` id, the same
-`PATH` bootstrap instruction, and these rules **verbatim** — they are the whole
+that project's interactive skill. Its prompt gets the same coordinates a job
+subagent gets (`run_id`, `job_id`, `$DB_SCRIPT`) plus the `task` id, the same
+`PATH` bootstrap instruction, and these rules **verbatim**.
+
+**If the payload's `job_id` is `null`** — which happens for a project that ships
+an interactive skill and no `maintenance-<tag>` skill, and for one whose
+interactive sub-skill declares a lower `priority` than its automated skill — tell
+the subagent to **omit `--job` entirely** from its logging calls. Passing the
+literal `null` fails `require_int` and exits 2 on *every* progress log, leaving
+that task invisible in the live view for its whole run.
+
+The rules — they are the whole
 point of the interactive queue, and every one of them is a lesson from run #20:
 
 - **Run the blocking command in the background and poll it.** Use the Bash tool's
@@ -807,7 +850,13 @@ point of the interactive queue, and every one of them is a lesson from run #20:
   destructive — in run #20 it burned a second round of paid API calls and threw
   away the first picker session.
 - **Hand the trailing automated stage back to the automated queue** rather than
-  doing it inline, so it is recorded, ordered, and resumable like any other job:
+  doing it inline, so it is recorded, ordered, and resumable like any other job.
+  **Do this before closing the task, always** — the order is load-bearing, not
+  stylistic. `finish-interactive` graduates a parked run whose queues have both
+  drained, so closing first can mark the run `completed`; the `add-job` that
+  follows then inserts a pending job into a finished run that `--resume` cannot
+  find (`list-parked` only lists parked runs), and the trailing stage is silently
+  never run while the run reports success.
   ```bash
   export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "<DB_SCRIPT>" add-job --run <RUN_ID> --path "<project_path>" --name "<project_name>" --skill "<follow-on-skill>" --origin injected --source-task <task>
   ```
@@ -906,16 +955,22 @@ over** and must not be finished:
 "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" list-interactive --run "$RUN_ID" --status started
 ```
 
-If any of those print anything, write your roll-up as usual and **park** rather
-than finish:
+If any of those print anything, **build the roll-up first** — the same one the
+finish path below writes, since a parked run sits in the app for hours and an
+empty summary is exactly what someone will be looking at — and then park instead
+of finishing:
 
 ```bash
+RUN_SUMMARY_TMP=$(mktemp)
+# `>|` (force-clobber), never a plain `>`: mktemp pre-creates the file and zsh
+# noclobber turns `>` into a silent no-op, recording an empty summary.
+printf '%s\n' "$ROLLUP" >| "$RUN_SUMMARY_TMP"
 "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
   park-run --run "$RUN_ID" --summary-file "$RUN_SUMMARY_TMP"
+rm -f "$RUN_SUMMARY_TMP"
 ```
 
-`park-run` sets `awaiting_interactive` and deliberately leaves `finished_at`
-NULL. (`finish-run` refuses the status outright, so this is not a choice you can
+`park-run` sets `awaiting_interactive` and clears `finished_at`. (`finish-run` refuses the status outright, so this is not a choice you can
 get wrong silently.) Then:
 
 - **Do NOT revoke the whole-sweep grant.** Revoke only on a true terminal finish
@@ -956,9 +1011,11 @@ grant was created:
 "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-authorize.sh" revoke --tag "<tag>" >/dev/null 2>&1 || true
 ```
 
-Revoke on **every** exit path, not just the clean one: do it even when the run
-ends `failed` or the orchestration itself breaks part-way (wrap the rest of the
-sweep so this still runs). A grant left behind by an aborted run keeps elevating
+Revoke on **every terminal** exit path, not just the clean one: do it even when
+the run ends `failed` or the orchestration itself breaks part-way (wrap the rest
+of the sweep so this still runs). The one exception is **parking**, which is not
+a terminal exit — a parked run is still going and a resumed session needs the
+grant it left in place (see **Parking instead of finishing**). A grant left behind by an aborted run keeps elevating
 Bash in every session until its TTL expires — the orphan window described under
 **Authorization**. The TTL is only the backstop for the case the orchestrator
 never reaches this line at all (a hard crash / killed session); revoking here is
@@ -1010,12 +1067,25 @@ Do **not** re-run discovery — both queues already live in the DB.
 2. Start the monitor if it isn't running (Step 3), so he can still press Start.
 3. Re-authorize the sweep (Step 5's grant), since the parked run kept no grant
    alive for you.
-4. `set-stage --run "$RUN_ID" --stage executing`, log an event saying the run was
+4. **Re-queue any task the previous session left mid-flight.** This is not
+   optional:
+   ```bash
+   "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" reset-interactive --run "$RUN_ID"
+   ```
+   A task is marked `started` *before* its subagent is dispatched, so one whose
+   session died is otherwise stranded beyond recovery: `next-work` returns only
+   `requested` tasks, `request-interactive` is a no-op past `discovered`, and the
+   app offers a Start button only for `discovered`. Without this step the resume
+   finds nothing runnable, parks, and repeats that forever. It is safe here and
+   only here — no subagent from the dead session can still be alive — so never
+   run it against a run with a live session.
+5. `set-stage --run "$RUN_ID" --stage executing`, log an event saying the run was
    resumed, and re-enter the **drain loop** exactly as in Step 5. Everything
    behaves identically from there — a `requested` task gets dispatched, injected
    jobs get run, and `drained` leads to Step 6.
-5. Finish (or park again — a resumed run that still has untouched tasks parks a
-   second time, which is fine and not a failure).
+6. Finish (or park again — a resumed run that still has untouched tasks parks a
+   second time, which is fine and not a failure, because step 4 guarantees every
+   outstanding task is re-dispatchable rather than stranded).
 
 A parked run also finishes itself in one narrow case: if a session closed the
 last interactive task and both queues were already drained, `finish-interactive`

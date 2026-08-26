@@ -59,7 +59,10 @@
     waiting on a person is not an alarm state.
   - New `maintenance-db.sh` subcommands: `add-interactive-task`,
     `request-interactive`, `start-interactive`, `finish-interactive`,
-    `list-interactive`, `next-work`, `wait-for-work`, `park-run`, `list-parked`.
+    `reset-interactive`, `list-interactive`, `next-work`, `wait-for-work`,
+    `park-run`, `list-parked`. `reset-interactive` is what a resume runs first:
+    a task is marked `started` before dispatch, so one whose session died would
+    otherwise be stranded beyond recovery.
     `finish-interactive` promotes the project's parked job (`done` → `success`,
     `abandoned` → `followup`) and graduates a parked run whose queues have both
     drained, mirroring how `update-followup` already graduates `needs_followup`.

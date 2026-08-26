@@ -167,7 +167,9 @@ How a run flows through it:
 
 If you are still working when the automated queue runs dry, the run **parks** and
 the session lets go. Take as long as you like; `/zed:maintenance <tag> --resume`
-re-attaches later and drains the rest. Distinct from **Needs Followup**, which
+re-attaches later and drains the rest — including re-dispatching anything the
+previous session had already started, so a session ending mid-task strands
+nothing. Distinct from **Needs Followup**, which
 means the run is over and owes you something afterwards — Awaiting You means the
 run is not over.
 
