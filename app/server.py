@@ -100,7 +100,12 @@ class DB:
         up on its next poll. Exactly one endpoint uses this, and it makes exactly
         one narrow, guarded UPDATE — see ``_handle_task_start``.
         """
-        conn = sqlite3.connect(os.path.abspath(self.path), timeout=5.0)
+        # mode=rw, not a bare path: a plain sqlite3.connect() *creates* a
+        # missing file, so a Start click against a mistyped --db would silently
+        # conjure an empty database and then mask the misconfiguration behind
+        # zero-run reads forever after. rw fails loudly instead.
+        conn = sqlite3.connect("file:%s?mode=rw" % _uri_path(os.path.abspath(self.path)),
+                               uri=True, timeout=5.0)
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA busy_timeout=3000;")
@@ -435,26 +440,44 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- writes ------------------------------------------------------------- #
 
+    def _allowed_origins(self):
+        """Origins that count as this app's own page, from the *bound* address.
+
+        Built from ``server_address`` rather than the request's ``Host`` header,
+        because Host is supplied by the client and proves nothing: a
+        DNS-rebinding page served from ``http://attacker.test:7373/`` that
+        resolves to 127.0.0.1 sends a matching Host and Origin — and, being
+        genuinely same-origin to itself, ``Sec-Fetch-Site: same-origin`` too —
+        so comparing the two against each other passes every attacker.
+        Comparing against the address we actually bound does not.
+        """
+        port = self.server.server_address[1]
+        allowed = set()
+        for host in ("127.0.0.1", "localhost", "[::1]"):
+            allowed.add("http://%s:%d" % (host, port))
+        bound = self.server.server_address[0]
+        if bound not in ("127.0.0.1", "0.0.0.0", "::", "::1"):
+            allowed.add("http://%s:%d" % (bound, port))
+        return allowed
+
     def _same_origin(self):
         """Reject a POST that did not come from this app's own page.
 
-        The server listens on 127.0.0.1, which is reachable by *any* page the
+        The server listens on loopback, which is reachable by *any* page the
         user happens to have open, not just ours. Without this check an
         unrelated site could fire a request at localhost and start someone's
         interactive task. Two independent signals, either sufficient to refuse:
-        a Fetch-Metadata site value other than same-origin, or an Origin header
-        that is not our own bound address. A request with neither header (curl,
-        a health probe) is allowed through — it is not a browser, so it is not
-        the confused-deputy case this guards.
+        a Fetch-Metadata site value other than same-origin, or an Origin that is
+        not one of our bound addresses. A request with neither header (curl, a
+        health probe) is allowed through — it is not a browser, so it is not the
+        confused-deputy case this guards.
         """
         site = self.headers.get("Sec-Fetch-Site")
         if site is not None and site not in ("same-origin", "none"):
             return False
         origin = self.headers.get("Origin")
-        if origin:
-            host = self.headers.get("Host") or ""
-            if origin not in ("http://%s" % host, "https://%s" % host):
-                return False
+        if origin and origin not in self._allowed_origins():
+            return False
         return True
 
     def _handle_task_start(self, run_id, task_id):
@@ -471,6 +494,29 @@ class Handler(BaseHTTPRequestHandler):
         answered with that task's current state and a 200. A double-click, a
         page refresh, or a retry must never disturb work in flight.
         """
+        # Drain the body FIRST, before any guard can return.
+        #
+        # This is HTTP/1.1 with keep-alive, so an unread body stays in the
+        # socket and is parsed as the start of the *next* request — a rejected
+        # POST followed by a GET on the same connection returns
+        # `501 Unsupported method ('{"x":1}GET')` and swallows the real request.
+        # Every early return below (403/415/413) is a rejection path, which is
+        # exactly when a body is most likely to be present, so the drain cannot
+        # sit after the guards.
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._send_json({"error": "bad Content-Length"}, status=400)
+            return
+        if length < 0 or length > 1024:
+            # Do not attempt to drain an oversized body; just close rather than
+            # read an arbitrary amount into memory to keep the socket usable.
+            self.close_connection = True
+            self._send_json({"error": "body too large"}, status=413)
+            return
+        if length > 0:
+            self.rfile.read(length)
+
         if not self._same_origin():
             self._send_json({"error": "cross-origin request refused"}, status=403)
             return
@@ -479,18 +525,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "expected Content-Type: application/json"},
                             status=415)
             return
-        # Drain and discard any body. There are no parameters — the URL carries
-        # everything — but an unread body wedges keep-alive on the connection.
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            self._send_json({"error": "bad Content-Length"}, status=400)
-            return
-        if length > 1024:
-            self._send_json({"error": "body too large"}, status=413)
-            return
-        if length > 0:
-            self.rfile.read(length)
 
         try:
             conn = self.db.connect_rw()
@@ -509,19 +543,24 @@ class Handler(BaseHTTPRequestHandler):
             if row["status"] == "discovered":
                 now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 with conn:
-                    conn.execute(
+                    cur = conn.execute(
                         "UPDATE interactive_tasks "
                         "SET status = 'requested', start_requested_at = ? "
                         "WHERE id = ? AND run_id = ? AND status = 'discovered'",
                         (now, task_id, run_id),
                     )
-                    conn.execute(
-                        "INSERT INTO events (run_id, job_id, ts, level, message) "
-                        "VALUES (?, ?, ?, 'info', ?)",
-                        (run_id, row["job_id"], now,
-                         "Interactive task #%d start requested; queued for "
-                         "dispatch." % task_id),
-                    )
+                    # Only log if this call is the one that actually moved the
+                    # row. Two concurrent clicks both read 'discovered', but one
+                    # UPDATE matches nothing — without this it would still write
+                    # a second "start requested" event for a single request.
+                    if cur.rowcount:
+                        conn.execute(
+                            "INSERT INTO events (run_id, job_id, ts, level, message) "
+                            "VALUES (?, ?, ?, 'info', ?)",
+                            (run_id, row["job_id"], now,
+                             "Interactive task #%d start requested; queued for "
+                             "dispatch." % task_id),
+                        )
                 row = conn.execute(
                     "SELECT * FROM interactive_tasks WHERE id = ?", (task_id,)
                 ).fetchone()

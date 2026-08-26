@@ -41,7 +41,7 @@
   var KIND_GLYPH = { issue: "◉", pr: "⇄" };
   var ACTION_LABEL = { opened: "opened", update: "update", done: "done", nope: "won't do" };
   // status → queue sort priority (what's left surfaces first)
-  var STATUS_PRIORITY = { running: 0, pending: 1, followup: 2, failure: 3, success: 4, skipped: 5 };
+  var STATUS_PRIORITY = { running: 0, awaiting_interactive: 1, pending: 2, followup: 3, failure: 4, success: 5, skipped: 6 };
 
   // ---- state --------------------------------------------------------------
   var state = {
@@ -57,6 +57,8 @@
     pollTimer: null,
     runsTimer: null,
     prevStatus: null,         // for the running -> done reveal
+    ixPending: {},            // interactive task id -> Start POST in flight
+    ixError: "",              // last Start failure, held until the next attempt
     expanded: {},             // result id -> summary expanded
     foldOpen: false,          // debrief: clean-projects fold
     logOpen: false,           // debrief: activity log
@@ -535,12 +537,23 @@
 
     Array.prototype.forEach.call(
       el.ixRows.querySelectorAll("button[data-task]"),
-      function (btn) { btn.addEventListener("click", onStartInteractive); }
+      function (btn) {
+        btn.addEventListener("click", onStartInteractive);
+        // A render triggered by the next SSE tick (~1s) would otherwise re-enable
+        // a button whose POST is still in flight, inviting a second click.
+        if (state.ixPending[btn.getAttribute("data-task")]) {
+          btn.disabled = true;
+          btn.textContent = "starting…";
+        }
+      }
     );
 
-    el.ixFoot.textContent = open
+    // An error survives re-renders until the next successful click; otherwise the
+    // message is wiped by the following SSE tick and the user never reads it.
+    el.ixFoot.textContent = state.ixError ? state.ixError : (open
       ? "Start one when you're ready. It runs alongside the automated work, at your pace — nothing here is on a clock."
-      : "";
+      : "");
+    el.ixFoot.dataset.tone = state.ixError ? "error" : "";
   }
 
   function isIxOpen(t) {
@@ -577,6 +590,8 @@
     var runId = btn.getAttribute("data-run");
     // Optimistic disable only. The authoritative state comes back over SSE when
     // the server has actually recorded the request.
+    state.ixPending[taskId] = 1;
+    state.ixError = "";
     btn.disabled = true;
     btn.textContent = "starting…";
     fetch("/api/runs/" + encodeURIComponent(runId) +
@@ -588,6 +603,7 @@
       if (!res.ok) throw new Error("HTTP " + res.status);
       return res.json();
     }).then(function (data) {
+      delete state.ixPending[taskId];
       // Fold the server's answer straight in so the row updates now rather than
       // on the next SSE tick.
       if (data && data.task && state.detail) {
@@ -598,9 +614,9 @@
         renderInteractiveBar(state.detail);
       }
     }).catch(function () {
-      btn.disabled = false;
-      btn.textContent = "Start";
-      el.ixFoot.textContent = "Could not record that — the sweep database may be busy. Try again.";
+      delete state.ixPending[taskId];
+      state.ixError = "Could not record that — the sweep database may be busy. Try again.";
+      if (state.detail) renderInteractiveBar(state.detail);
     });
   }
 

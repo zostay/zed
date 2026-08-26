@@ -527,6 +527,8 @@ code, .mono { font-family: var(--mono); }
   box-shadow: 0 0 10px rgba(251,191,36,0.10);
 }
 .chip[data-s="pending"] .chip-glyph { color: var(--ink-faint); }
+.chip[data-s="awaiting_interactive"] { border-left-color: var(--await); background: rgba(56,189,248,0.05); }
+.chip[data-s="awaiting_interactive"] .chip-glyph { color: var(--await); }
 
 /* --------------------------------------------------------------------------- events (activity) */
 .events {
@@ -594,7 +596,13 @@ code, .mono { font-family: var(--mono); }
   border-radius: var(--radius);
   background: var(--rail);
 }
-.ix-rows { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+/* Capped and scrollable: the live face is `overflow: hidden`, so an uncapped
+   bar with a dozen tasks would squeeze and then clip the NOW/QUEUE/activity grid
+   below it. */
+.ix-rows {
+  display: flex; flex-direction: column; gap: 6px; margin-top: 8px;
+  max-height: 34vh; overflow-y: auto;
+}
 .ix-row {
   display: flex; align-items: center; gap: 12px;
   padding: 8px 10px;
@@ -644,6 +652,7 @@ code, .mono { font-family: var(--mono); }
   font-size: var(--fs-105); color: var(--ink-faint);
 }
 .ix-foot:empty { display: none; }
+.ix-foot[data-tone="error"] { color: var(--fail); }
 
 /* --------------------------------------------------------------------------- DEBRIEF: stoplight */
 .stoplight {
