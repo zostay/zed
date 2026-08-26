@@ -1,30 +1,94 @@
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
+-- A single maintenance sweep.
+--
+-- status:
+--   running              — the sweep is in progress with a session attached
+--   awaiting_interactive — NOT over. Every queued automated job is done, but at
+--                          least one interactive task is unstarted or unfinished,
+--                          so the run cannot reach a terminal state. finished_at
+--                          stays NULL. A later session re-attaches with
+--                          `/zed:maintenance <tag> --resume` and drains the rest.
+--   needs_followup       — over, and a human owes it something afterwards (an
+--                          open followup ticket). Distinct from the above: that
+--                          one means the run is still going.
+--   completed | failed | cancelled — terminal.
 CREATE TABLE IF NOT EXISTS runs (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   tag         TEXT    NOT NULL,
   mode        TEXT,                                  -- serial | fast | now
-  status      TEXT    NOT NULL DEFAULT 'running',    -- running | completed | needs_followup | failed | cancelled
-  stage       TEXT    NOT NULL DEFAULT 'starting',   -- starting | reading-config | discovering | executing | summarizing | done
+  status      TEXT    NOT NULL DEFAULT 'running',    -- running | awaiting_interactive | completed | needs_followup | failed | cancelled
+  stage       TEXT    NOT NULL DEFAULT 'starting',   -- starting | reading-config | discovering | executing | awaiting-interactive | summarizing | done
   started_at  TEXT    NOT NULL,                       -- ISO-8601 UTC
-  finished_at TEXT,
+  finished_at TEXT,                                   -- NULL while running OR awaiting_interactive
   summary     TEXT,                                   -- Markdown run summary
   options     TEXT                                    -- JSON blob of CLI flags
 );
 
+-- One unit of automated work: run a project's skill and record the result.
+--
+-- `origin` says where the job came from. 'discovered' is the ordinary case — the
+-- discovery pass found the project's maintenance-<tag> skill. 'injected' is a job
+-- an interactive task queued back into the automated queue when the human
+-- finished with it (see interactive_tasks), which is why a project can hold more
+-- than one job per run and why the uniqueness key includes skill_name.
+--
+-- status 'awaiting_interactive' means the automated half is done but the project
+-- has an unresolved interactive task, so the job may not report success yet.
+-- finish-interactive promotes it afterwards.
 CREATE TABLE IF NOT EXISTS jobs (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  run_id       INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-  project_path TEXT    NOT NULL,
-  project_name TEXT    NOT NULL,
-  skill_name   TEXT,
-  status       TEXT    NOT NULL DEFAULT 'pending',   -- pending | running | success | followup | failure | skipped
-  started_at   TEXT,
-  finished_at  TEXT,
-  summary      TEXT,                                  -- Markdown per-project summary
-  error        TEXT,
-  UNIQUE(run_id, project_path)
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id         INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  project_path   TEXT    NOT NULL,
+  project_name   TEXT    NOT NULL,
+  skill_name     TEXT,
+  status         TEXT    NOT NULL DEFAULT 'pending', -- pending | running | success | followup | failure | skipped | awaiting_interactive
+  started_at     TEXT,
+  finished_at    TEXT,
+  summary        TEXT,                                -- Markdown per-project summary
+  error          TEXT,
+  origin         TEXT    NOT NULL DEFAULT 'discovered', -- discovered | injected
+  source_task_id INTEGER                              -- interactive_tasks.id when origin='injected'
+);
+
+-- Work that requires a human, discovered alongside the automated jobs and run in
+-- a *parallel* queue that the human starts and paces themselves. A project
+-- declares one by shipping a `maintenance-<tag>-<something>` skill whose front
+-- matter says `interactive: true`.
+--
+-- Lifecycle:
+--   discovered — found by the discovery pass; the app offers a Start button
+--   requested  — the human clicked Start. This row IS the intent record: the app
+--                is a viewer with no channel to the Claude Code session, so it
+--                writes the request here and the orchestrator picks it up on its
+--                next loop turn. A Start clicked while the session is busy (or
+--                gone entirely) queues rather than being lost.
+--   started    — the orchestrator dispatched the subagent for it
+--   done       — the human finished
+--   abandoned  — the human consciously gave up on it
+--
+-- A task in any of the first three states keeps its run out of a terminal state.
+-- Nothing here is ever timed out: a human pausing to think, walking away, or
+-- stopping to file a bug is a normal condition, and absence must never be
+-- inferred from elapsed time.
+CREATE TABLE IF NOT EXISTS interactive_tasks (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id             INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  job_id             INTEGER          REFERENCES jobs(id) ON DELETE CASCADE,
+  project_path       TEXT    NOT NULL,
+  project_name       TEXT    NOT NULL,
+  skill_name         TEXT    NOT NULL,
+  title              TEXT    NOT NULL,               -- what the human is being asked to do
+  priority           INTEGER NOT NULL DEFAULT 0,     -- display order in the app's interactive bar
+  status             TEXT    NOT NULL DEFAULT 'discovered', -- discovered | requested | started | done | abandoned
+  start_requested_at TEXT,                            -- when Start was clicked
+  started_at         TEXT,
+  finished_at        TEXT,
+  summary            TEXT,
+  error              TEXT,
+  created_at         TEXT    NOT NULL,                -- ISO-8601 UTC
+  UNIQUE(run_id, project_path, skill_name)
 );
 
 -- Followup "tickets": items a run surfaced that need human attention. Each row's
@@ -102,6 +166,17 @@ CREATE TABLE IF NOT EXISTS project_issues (
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_run   ON jobs(run_id);
+-- Uniqueness lives in an index, not a table constraint, because it had to be
+-- widened (run_id, project_path) -> (run_id, project_path, skill_name) once
+-- interactive tasks could inject a second job for the same project, and SQLite
+-- cannot drop a table constraint. IFNULL keeps legacy --skill-less rows deduping:
+-- SQLite treats NULLs in a UNIQUE index as distinct, so a bare skill_name column
+-- would silently stop enforcing anything for them. `maintenance-db.sh init`
+-- rebuilds older `jobs` tables into this shape; the index name is the marker that
+-- says the rebuild already happened.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_unique_v2
+  ON jobs(run_id, project_path, IFNULL(skill_name, ''));
+CREATE INDEX IF NOT EXISTS idx_interactive_run ON interactive_tasks(run_id, priority, id);
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_followups_run        ON followups(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_followup_comments_fk ON followup_comments(followup_id, id);
