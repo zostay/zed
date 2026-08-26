@@ -70,6 +70,18 @@
           <ol class="stage-rail" id="stage-rail" aria-label="run stage"></ol>
         </section>
 
+        <!-- Interactive queue — work that needs you. Sits outside both faces
+             because it matters on the live face (start it while the automated
+             queue runs) and on the debrief (a parked run is waiting on it). -->
+        <section class="ix-bar" id="ix-bar" aria-label="work that needs you" hidden>
+          <div class="pane-head">
+            <span class="pane-title">NEEDS YOU</span>
+            <span class="pane-hint" id="ix-hint"></span>
+          </div>
+          <div class="ix-rows" id="ix-rows"></div>
+          <p class="ix-foot" id="ix-foot"></p>
+        </section>
+
         <!-- ---------------------------------------------------------- -->
         <!-- FACE A — LIVE FOCUS                                        -->
         <!-- ---------------------------------------------------------- -->
