@@ -15,7 +15,7 @@ across all your repositories at a glance.
 ## Argument & flags
 
 ```
-/zed:maintenance <tag> [--now] [--fast] [--headless]
+/zed:maintenance <tag> [--now] [--fast] [--headless] [--resume [run_id]]
 ```
 
 - `<tag>` (required) — discover and run the `maintenance-<tag>` skill in each
@@ -24,6 +24,9 @@ across all your repositories at a glance.
 - `--now` — explicitly select the methodical, serial execution path (see batch note).
 - `--fast` — dispatch the per-project subagents in parallel (faster, more tokens).
 - `--headless` — do not start or open the observability web app.
+- `--resume [run_id]` — re-attach to a run that parked at `awaiting_interactive`
+  and drain what is left, instead of starting a new sweep. See **Resuming a
+  parked run**. With no `run_id`, takes the newest parked run for this tag.
 
 ### Batch note (be honest about this)
 
@@ -41,6 +44,50 @@ of subagents and await them" API to call. Consequently:
 
 Do not pretend a batch API exists. Pick serial (default / `--now`) or parallel
 (`--fast`) and follow the corresponding execution path in Step 5.
+
+## Two queues, running at different paces
+
+A sweep has **two** queues, and they are not the same kind of thing.
+
+- The **automated queue** is the jobs. It proceeds unattended, exactly as it
+  always has.
+- The **interactive queue** is work that needs Sterling — approving photos,
+  okaying a rollout, reading something before it ships. He starts each task from
+  the observability app and works it **at his own pace, in parallel**, without
+  ever blocking the automated queue.
+
+The rule that makes this work, and the one every other rule here serves:
+
+> **A human pausing to think, walking away, or stopping to file a bug is a
+> normal condition, not a fault. Never infer absence from elapsed time. Never
+> kill a task that is waiting on a person.**
+
+This exists because of a real failure. In run #20 a project's weekly pipeline
+reached an image picker that correctly waits forever for a human. The sweep ran
+it in the foreground, hit the 10-minute Bash ceiling, restarted the whole
+pipeline from scratch (fresh inputs, a second round of paid API calls, a second
+picker), then ten minutes later concluded "no human present" and killed it.
+Sterling *was* present — he had paused mid-pick to file a bug about the
+suggestions. The kill fired an `EXIT` trap that deleted the state a resume would
+have needed. The pipeline started twice, completed zero times, and that week's
+content did not ship.
+
+Image selection cannot be automated: rejection rates run 10%–90% with very high
+variance, so the human judgement gate is load-bearing and stays. As maintenance
+grows, **more** tasks will need him, not fewer. The answer is not to make the
+human less blocking or to route around them — it is to give them their own queue.
+
+Three consequences that shape the steps below:
+
+1. A project with an interactive task that is unstarted or unfinished **cannot
+   reach a terminal state**. Its automated job ends at `awaiting_interactive`,
+   never `success`.
+2. An interactive task can **inject work back into the automated queue** when the
+   human finishes — typically the automated stage that follows it. That work is
+   picked up even if the automated queue has otherwise drained, which is why the
+   orchestrator polls for work instead of iterating a list fixed at discovery.
+3. The run reaches `completed` only when **both** queues have drained. Until
+   then it sits at `awaiting_interactive`, which is *not* a finish.
 
 ## Helper scripts
 
@@ -201,17 +248,23 @@ can start it later (and revisit history) with the same command:
 a `maintenance-<tag>` skill (at `<project>/.claude/skills/maintenance-<tag>/SKILL.md`
 or `<project>/skills/maintenance-<tag>/SKILL.md`), applies the blocklist, reads
 each skill's execution `priority` (see **Ordering** below), and prints **JSONL**,
-one object per line, sorted by `(priority ascending, project_path)`:
+one object per line, sorted by `(priority ascending, project_path, kind)`:
 
 ```json
-{"project_path":"...","project_name":"...","skill_name":"maintenance-<tag>","skill_path":"...","priority":0}
+{"project_path":"...","project_name":"...","skill_name":"maintenance-<tag>","skill_path":"...","kind":"automated","title":"...","priority":0}
+{"project_path":"...","project_name":"...","skill_name":"maintenance-<tag>-select-images","skill_path":"...","kind":"interactive","title":"Approve this week's 7 photos.","priority":0}
 ```
+
+It also emits a line for each sibling `maintenance-<tag>-*` skill a project ships
+that declares `interactive: true` in its front matter. **Read the `kind` field on
+every line** — it decides which queue the line belongs to. A project's
+`automated` line always precedes its `interactive` ones.
 
 The orchestrator must preserve this emitted order: register jobs and (for serial
 runs) dispatch subagents in the exact sequence the lines arrive, so the priority
 ordering is honored end to end.
 
-For each line, register a job and capture its `job_id`:
+For each `"kind":"automated"` line, register a job and capture its `job_id`:
 
 ```bash
 JOB_ID=$("${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
@@ -219,8 +272,24 @@ JOB_ID=$("${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
   --path "<project_path>" --name "<project_name>" --skill "<skill_name>")
 ```
 
+For each `"kind":"interactive"` line, register an interactive task instead, and
+link it to that project's job when the project has one (pass `--job` only if you
+registered a job for the same `project_path`; a project may ship an interactive
+skill and no `maintenance-<tag>` skill at all):
+
+```bash
+TASK_ID=$("${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+  add-interactive-task --run "$RUN_ID" [--job "$JOB_ID"] \
+  --path "<project_path>" --name "<project_name>" --skill "<skill_name>" \
+  --title "<title>" --priority <priority>)
+```
+
+Registering a task does **not** start it — it puts a Start button in front of
+Sterling in the app, which he presses when he is ready. Do not dispatch it here.
+
 Keep an ordered list of `(JOB_ID, project_path, project_name, skill_name,
-priority)`. Log how many projects were found:
+priority)` and, separately, of the interactive tasks you registered. Log how many
+projects were found:
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
@@ -289,6 +358,42 @@ pre-created grant), so the history never claims it ran elevated when it didn't:
 The grant is run-scoped: **revoke it when the run finishes** (Step 6) so it cannot
 carry over to a later sweep — the generous default TTL is only a backstop if the
 run dies before it can revoke (see **Authorization** for that orphan window).
+
+#### The drain loop (do not iterate a fixed list)
+
+Work is **not** a snapshot taken at discovery. An interactive task can inject a
+job at any point — including long after the automated queue has otherwise
+drained — so ask the database what to do next, every time:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" next-work --run "$RUN_ID"
+```
+
+It prints exactly one JSON object. Act on its `kind`, then loop:
+
+- **`interactive_start`** — Sterling pressed Start. Mark it started, **dispatch
+  its subagent, and immediately continue the loop.** Do not wait for it; running
+  in parallel with the automated queue is the entire point.
+  ```bash
+  "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" start-interactive --task "<task>"
+  ```
+  Then dispatch per **Dispatching an interactive task** below.
+- **`job`** — run it exactly as the per-job sub-steps below describe. This covers
+  injected jobs too; there is nothing special to do for them.
+- **`idle`** — nothing runnable, but interactive work is still outstanding. Wait:
+  ```bash
+  "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" wait-for-work --run "$RUN_ID"
+  ```
+  It returns the moment something becomes runnable, or after ~8 minutes (chosen
+  to sit under the Bash ceiling) with another `idle`. After **two** consecutive
+  idle windows, stop waiting and **park** the run (Step 6). Parking is not
+  giving up and it is not a failure — it hands the run back to Sterling's own
+  pace and lets a later session finish it.
+- **`drained`** — both queues are empty. Go to Step 6.
+
+Under `--fast`, run the discovered priority groups as described below, and let
+injected jobs land in the drain loop after all of them. `--fast` is not used in
+practice and does not warrant a bespoke mechanism.
 
 For each job, you (the orchestrator) own the job lifecycle in the DB, and the
 subagent does the project work and logs its own progress events.
@@ -498,6 +603,13 @@ subagent does the project work and logs its own progress events.
      only if the failure additionally means the sweep itself cannot function
      until Sterling personally acts before the next run.
    - `skipped` — there was nothing to do.
+   - **`awaiting_interactive`** — the automated half is done, but this project
+     has an interactive task that is unstarted or unfinished, so the job may not
+     claim success yet. Use it **in place of `success` or `skipped`** whenever
+     that is true. A job that earned `failure` or `followup` keeps its own
+     status — those say something more informative, and the run is held open by
+     the task regardless. You do not need to revisit the job later:
+     `finish-interactive` promotes it when the task closes.
 
    Log a closing event for the job and append the result to your action log.
 5. **Followups — the default is _not_ to file.** A followup ticket is not a
@@ -669,6 +781,48 @@ If a subagent crashes or returns nothing usable, mark that job
 `--status failure --error "<reason>"`, log an `error` event, and keep going with
 the remaining projects. One project's failure must not abort the others.
 
+#### Dispatching an interactive task
+
+When the drain loop hands you an `interactive_start`, dispatch a subagent to run
+that project's interactive skill. Its prompt gets the same three coordinates a
+job subagent gets (`run_id`, `job_id`, `$DB_SCRIPT`) plus the `task` id, the same
+`PATH` bootstrap instruction, and these rules **verbatim** — they are the whole
+point of the interactive queue, and every one of them is a lesson from run #20:
+
+- **Run the blocking command in the background and poll it.** Use the Bash tool's
+  `run_in_background`, never the foreground. A picker that waits for a human will
+  outlive the 10-minute foreground ceiling, and a foreground call that hits the
+  ceiling looks exactly like a hang.
+- **Never infer that the human is absent from elapsed time.** No timeout means
+  "nobody is there". A `/status` endpoint reporting zero progress is telling you
+  about *progress*, not *presence* — in run #20 it said `approved_count: 0` while
+  Sterling sat in front of it, having paused to file a bug.
+- **Never SIGTERM, `kill`, or otherwise terminate a task that is waiting on a
+  person.** If it looks idle, escalate attention instead: refocus the browser tab
+  (`open <url>`), then an OS notification, then a bell. If he is genuinely away,
+  the task simply stays open in the interactive queue. That is a correct outcome.
+- **A stopped or timed-out command is a liveness question, not a failure.**
+  Establish where the run actually got to before doing anything. A full restart
+  is almost never the right recovery, and against a non-idempotent script it is
+  destructive — in run #20 it burned a second round of paid API calls and threw
+  away the first picker session.
+- **Hand the trailing automated stage back to the automated queue** rather than
+  doing it inline, so it is recorded, ordered, and resumable like any other job:
+  ```bash
+  export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "<DB_SCRIPT>" add-job --run <RUN_ID> --path "<project_path>" --name "<project_name>" --skill "<follow-on-skill>" --origin injected --source-task <task>
+  ```
+- **Close the task when the human is done**, with a summary of what they decided:
+  ```bash
+  export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "<DB_SCRIPT>" finish-interactive --task <task> --status done --summary "<what was decided>"
+  ```
+  Use `--status abandoned` (with `--error`) only when Sterling has actually said
+  he is leaving it — never as a stand-in for "I waited a while and nothing
+  happened". `finish-interactive` promotes the project's parked job on its own
+  (`done` → `success`, `abandoned` → `followup`); you do not re-finish it.
+
+An interactive subagent may run for hours. That is expected. Nothing about the
+sweep should treat it as a problem.
+
 ### 6. Summarize
 
 ```bash
@@ -740,6 +894,42 @@ Omit the section **entirely** when the tag is not `weekly` or when the command
 prints nothing. An empty or near-empty table is worse than no table — this
 section only earns its space when it is telling the operator something.
 
+#### Parking instead of finishing
+
+**Before anything else in this step, check whether the run still owes interactive
+work.** If any task is `discovered`, `requested` or `started`, the run is **not
+over** and must not be finished:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" list-interactive --run "$RUN_ID" --status discovered
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" list-interactive --run "$RUN_ID" --status requested
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" list-interactive --run "$RUN_ID" --status started
+```
+
+If any of those print anything, write your roll-up as usual and **park** rather
+than finish:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
+  park-run --run "$RUN_ID" --summary-file "$RUN_SUMMARY_TMP"
+```
+
+`park-run` sets `awaiting_interactive` and deliberately leaves `finished_at`
+NULL. (`finish-run` refuses the status outright, so this is not a choice you can
+get wrong silently.) Then:
+
+- **Do NOT revoke the whole-sweep grant.** Revoke only on a true terminal finish
+  — a resumed session would otherwise be left un-elevated. The TTL remains the
+  backstop.
+- Tell Sterling plainly what is waiting for him, that it is his to start whenever
+  he likes, and how to pick the run back up:
+  > Two tasks are waiting on you in the app (openscripture.today: approve this
+  > week's 7 photos; qubling.cloud: approve the production rollout). Press Start
+  > on either whenever you're ready — there's no clock on them. When you're
+  > done, `/zed:maintenance weekly --resume` finishes the run.
+
+If nothing is outstanding, finish normally as below.
+
 Write it to a temp file and finish the run; `finish-run` sets the stage to `done`
 implicitly. **Choose the run status from whether any followup tickets are open:**
 
@@ -779,6 +969,8 @@ what keeps that window from ever opening in normal operation.
   on its own when the last ticket is resolved (the orchestrator does **not** need
   to revisit it).
 - Use **`completed`** when there are no open tickets.
+- **`awaiting_interactive`** is never passed to `finish-run` — it is not a
+  finish. Use `park-run`, per **Parking instead of finishing** above.
 - Use **`failed`** only if the orchestration itself broke (individual project
   failures do not by themselves fail the run — they are reported in the summary,
   their causes are filed as GitHub issues on the projects, and only one that
@@ -798,6 +990,36 @@ Tell the user they can:
 - stop the app anytime with `maintenance-monitor.sh stop`, and
 - start it again later with `maintenance-monitor.sh start` to revisit this run
   and all past runs (the database persists across runs and plugin updates).
+
+## Resuming a parked run
+
+`/zed:maintenance <tag> --resume [run_id]` re-attaches to a run that parked at
+`awaiting_interactive` and drains what is left. This is what makes an interactive
+queue workable at all: Sterling may take three hours over the pickers, and no
+session should have to sit open for them. His Start clicks are recorded in the
+database whether or not anything is listening, so nothing is lost in between.
+
+Do **not** re-run discovery — both queues already live in the DB.
+
+1. Find the run. With an explicit `run_id`, use it; otherwise take the newest:
+   ```bash
+   "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" list-parked --tag "<tag>"
+   ```
+   If it prints nothing, there is no parked run for this tag — say so and stop.
+   Do not silently start a fresh sweep instead; that is not what was asked.
+2. Start the monitor if it isn't running (Step 3), so he can still press Start.
+3. Re-authorize the sweep (Step 5's grant), since the parked run kept no grant
+   alive for you.
+4. `set-stage --run "$RUN_ID" --stage executing`, log an event saying the run was
+   resumed, and re-enter the **drain loop** exactly as in Step 5. Everything
+   behaves identically from there — a `requested` task gets dispatched, injected
+   jobs get run, and `drained` leads to Step 6.
+5. Finish (or park again — a resumed run that still has untouched tasks parks a
+   second time, which is fine and not a failure).
+
+A parked run also finishes itself in one narrow case: if a session closed the
+last interactive task and both queues were already drained, `finish-interactive`
+graduates the run on the spot. You will find such a run already `completed`.
 
 ## Ordering
 
@@ -839,6 +1061,55 @@ paths honor it:
   themselves. If a project must run strictly before or after *every* other —
   including others at the same rank — give it its own distinct priority, or use
   the serial path.
+
+An interactive skill's `priority` orders it in the app's interactive bar rather
+than in the execution sequence — interactive tasks are dispatched when Sterling
+presses Start, not in queue order.
+
+## Declaring interactive work (for project skill authors)
+
+A project splits work that needs a human out of work that does not by shipping a
+sibling skill next to its `maintenance-<tag>` skill:
+
+```
+<project>/.claude/skills/
+  maintenance-weekly/SKILL.md                 # the automated job
+  maintenance-weekly-select-images/SKILL.md   # an interactive task
+```
+
+with `interactive: true` in the sub-skill's front matter:
+
+```yaml
+---
+name: maintenance-weekly-select-images
+description: Approve this week's 7 photos.
+interactive: true
+---
+```
+
+The `description` becomes the label beside its Start button, so write it as the
+thing you are asking for, not as a description of a skill.
+
+**Split at the seam, not at the skill.** Marking the whole `maintenance-<tag>`
+skill interactive would strand everything else behind the human step — the
+project's Dependabot sweep would sit behind a photo picker for no reason. Split
+along where the human is actually needed: automated stage → interactive stage →
+automated stage, with the trailing automated stage **injected by the interactive
+task** when the human is done (see **Dispatching an interactive task**).
+
+A `maintenance-<tag>-*` skill **without** the flag is invisible to discovery — it
+is just a helper the main skill invokes, which is how such skills behaved before
+any of this existed. A project may also ship an interactive skill and no
+`maintenance-<tag>` skill at all.
+
+Two things a project's interactive skill must get right, because the sweep cannot
+do them for it:
+
+- **Persist the human's judgement as it is made**, to a durable path — not
+  `/tmp`, and never deleted by an `EXIT` trap. Their attention is the only
+  irreplaceable artifact; everything else recomputes.
+- **Be resumable.** Give the work named resume points and skip to the first
+  incomplete one, so re-entry never redoes what a human already decided.
 
 ## Authorization
 
@@ -1031,3 +1302,9 @@ Consequences worth knowing:
   and proceed (Step 3).
 - A single project's failure is recorded on its job and reported in the summary;
   it never aborts the rest of the sweep (Step 5).
+- A run that owes interactive work parks rather than finishing, and a later
+  session resumes it. A session ending — deliberately or otherwise — costs a
+  parked run nothing: both queues are in the database, and a Start pressed while
+  no session is listening is queued, not lost.
+- Nothing in the sweep times a human out. There is no path that infers absence
+  from elapsed time and no path that kills a task waiting on a person.

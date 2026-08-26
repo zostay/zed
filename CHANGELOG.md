@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.13.0 — 2026-08-26
+
+### Added
+
+- `maintenance`: **a sweep now has two queues, running at different paces.** The
+  orchestrator assumed every unit of work was automatable, so anything needing a
+  human blocked inside a subagent's Bash call, competed with the 10-minute
+  ceiling, and — when it lost — was indistinguishable from a hang.
+
+  Run #20 is the worked example. `openscripture.today`'s weekly pipeline reached
+  an image picker that correctly waits forever for a human. The sweep ran it in
+  the foreground, hit the ceiling, restarted the whole pipeline from scratch
+  (fresh references, a second round of paid API calls, a second picker), then ten
+  minutes later concluded "no human present" and SIGTERM'd it. Sterling *was*
+  present — he had paused mid-pick to file a bug about the suggestions. The kill
+  fired an `EXIT` trap that deleted exactly the state a resume needed. The
+  pipeline started twice, completed zero times, and the week's content did not
+  ship. Run #16 shared the root cause.
+
+  The fix is not to make the human less blocking, and not to remove them: image
+  selection cannot be automated (rejection rates run 10%–90% with very high
+  variance), so the judgement gate is load-bearing and stays. Instead there are
+  now two queues — an **automated** one that proceeds unattended exactly as
+  before, and an **interactive** one the human starts and paces themselves, in
+  parallel, never blocking the automated half.
+
+  - **Declaring it.** A project ships a sibling `maintenance-<tag>-*` skill with
+    `interactive: true` in its front matter. Splitting at the seam matters:
+    flagging the whole `maintenance-<tag>` skill would strand a project's entire
+    Dependabot sweep behind a photo picker. A `maintenance-<tag>-*` skill without
+    the flag stays invisible to discovery, exactly as before.
+  - **Starting it.** The app grows a **NEEDS YOU** bar with a Start button per
+    task. It is a viewer with no channel to the Claude Code session, so Start
+    records intent as a row and the orchestrator picks it up — a click while the
+    session is busy, or after it has parked, is queued rather than lost. This is
+    the app's first and only write path; everything else stays read-only, and it
+    refuses cross-origin requests.
+  - **A dynamic queue.** Step 5 no longer iterates a job list fixed at discovery.
+    It asks `next-work` what to do on every turn, so an interactive task can
+    **inject** its trailing automated stage back into the automated queue and
+    have it picked up even after that queue has otherwise drained.
+  - **New states.** `runs.status` and `jobs.status` gain `awaiting_interactive`,
+    shown as **Awaiting You**. It is distinct from `needs_followup`: that means
+    the run is over and a human owes it something, this means the run is *not
+    over*. A parked run keeps `finished_at` NULL, and `finish-run` refuses the
+    status outright so it cannot be set by accident. Interactive tasks have their
+    own lifecycle: `discovered → requested → started → done | abandoned`.
+  - **Session lifetime.** A run that outlives its session parks instead of
+    finishing, and `/zed:maintenance <tag> --resume` re-attaches later to drain
+    the rest. Taking three hours over the pickers costs nothing.
+  - **No path infers absence from elapsed time, and no path kills a task waiting
+    on a human.** Interactive commands run backgrounded and polled; an idle
+    picker is nudged (refocus the tab, then a notification), never terminated; a
+    timeout is treated as a liveness question rather than a failure, because a
+    blind restart of a non-idempotent script is destructive. The UI carries no
+    timers or countdowns, and the awaiting health pill does not blink — a run
+    waiting on a person is not an alarm state.
+  - New `maintenance-db.sh` subcommands: `add-interactive-task`,
+    `request-interactive`, `start-interactive`, `finish-interactive`,
+    `list-interactive`, `next-work`, `wait-for-work`, `park-run`, `list-parked`.
+    `finish-interactive` promotes the project's parked job (`done` → `success`,
+    `abandoned` → `followup`) and graduates a parked run whose queues have both
+    drained, mirroring how `update-followup` already graduates `needs_followup`.
+  - `add-job` takes `--origin discovered|injected` and `--source-task`, and the
+    `jobs` uniqueness key widens to include `skill_name` so one project can hold
+    more than one job in a run. SQLite cannot drop a table constraint, so `init`
+    rebuilds `jobs`; row ids, counts and every foreign key are preserved, and the
+    rebuild runs before the schema so the new index cannot plant its own
+    already-migrated marker on the old table.
+
+### Fixed
+
+- `maintenance`: the app's SSE handler hand-copied payload keys, so any newly
+  added section only ever reflected page-load state. Threading the new keys
+  through fixes it for the interactive bar.
+- `maintenance`: static assets were served with no cache directive, so browsers
+  applied heuristic caching and could keep running a stale `app.js` against a new
+  server. They now go out `no-store`.
+- `maintenance`: the `runs.status` schema comment documented
+  `running | completed | failed | cancelled`, omitting `needs_followup`, which
+  had been in use since 0.3.0.
+
 ## 0.12.0 — 2026-08-10
 
 ### Added

@@ -72,7 +72,7 @@ web app renders live so you can watch progress and results across all your
 repositories at a glance.
 
 ```
-/zed:maintenance <tag> [--now] [--fast] [--headless]
+/zed:maintenance <tag> [--now] [--fast] [--headless] [--resume [run_id]]
 ```
 
 - `<tag>` (required) — discover and run the `maintenance-<tag>` skill in each
@@ -83,6 +83,9 @@ repositories at a glance.
   serial path; `--now` states that intent explicitly.
 - `--fast` — dispatch the per-project subagents in parallel (faster, more tokens).
 - `--headless` — do not start or open the observability web app.
+- `--resume [run_id]` — re-attach to a run parked at **Awaiting You** and drain
+  what is left (see **Interactive work**). Defaults to the newest parked run for
+  the tag.
 
 **Configuration.** Search roots and a blocklist live in a `config.json` managed
 by `scripts/maintenance-config.sh` (defaults to `{ "searchRoots": ["~/projects"],
@@ -97,6 +100,7 @@ matter (alongside the standard `name`/`description` every skill carries):
 | Flag | Type | Default | Effect |
 | ---- | ---- | ------- | ------ |
 | `priority` | integer | `0` | Where the project runs in the sweep — lower runs earlier, higher later, ties broken by path. See **Ordering**. |
+| `interactive` | boolean | `false` | Only on a `maintenance-<tag>-*` sub-skill: marks it work that needs *you*, put in the interactive queue with a Start button instead of run unattended. See **Interactive work**. |
 
 It is read from the leading `---`…`---` block only; signed and quoted forms
 (`priority: '-100'`) parse fine, and anything missing or unparseable falls back to
@@ -117,6 +121,55 @@ in strict order; with `--fast` they run in priority **groups** (each group
 concurrent, groups in order). Use a negative priority for a project that needs
 up-front interaction (runs first) and a positive one for a project that
 redeploys centrally-shared apps (runs last).
+
+**Interactive work.** Some maintenance genuinely needs *you* — approving photos,
+okaying a rollout, reading something before it ships — and that is not going to
+change: as the sweep grows, more tasks will need you, not fewer. So a run has
+**two queues at different paces**. The automated queue proceeds unattended as it
+always has. The interactive queue is yours: you press **Start** in the app and
+work each task at your own pace, in parallel, never blocking the automated half.
+
+The governing rule, and the reason the rest of it is shaped this way: *pausing to
+think, walking away, or stopping to file a bug is normal.* Nothing infers your
+absence from elapsed time, nothing kills a task that is waiting on you, and the
+app shows no timers or countdowns against you.
+
+A project declares interactive work by shipping a sibling skill beside its
+`maintenance-<tag>` skill — splitting at the seam where a human is actually
+needed, rather than flagging the whole skill and stranding its dependency sweep
+behind a photo picker:
+
+```
+<project>/.claude/skills/
+  maintenance-weekly/SKILL.md                 # automated job
+  maintenance-weekly-select-images/SKILL.md   # interactive: true
+```
+
+The sub-skill's `description` becomes the label beside its Start button. An
+undeclared `maintenance-<tag>-*` skill stays invisible to discovery, exactly as
+before.
+
+How a run flows through it:
+
+1. Automated jobs run unattended. A project with an interactive task still
+   outstanding ends its job at **`awaiting_interactive`**, never `success`.
+2. The app lists each task in a **NEEDS YOU** bar with a Start button. The app is
+   a viewer with no channel to the Claude Code session, so Start records your
+   intent as a row and the sweep picks it up — a click while the session is busy,
+   or after it has parked entirely, is queued rather than lost.
+3. The sweep dispatches a subagent for it, running **in parallel** with whatever
+   automated work is in flight.
+4. An interactive task can **inject a job back into the automated queue** when
+   you finish — typically the automated stage that follows it. Injected work is
+   picked up even after the automated queue has otherwise drained.
+5. The run reaches **Completed** only when both queues drain. Until then it sits
+   at **Awaiting You**, which is *not* a finish: `finished_at` stays empty.
+
+If you are still working when the automated queue runs dry, the run **parks** and
+the session lets go. Take as long as you like; `/zed:maintenance <tag> --resume`
+re-attaches later and drains the rest. Distinct from **Needs Followup**, which
+means the run is over and owes you something afterwards — Awaiting You means the
+run is not over.
 
 **Authorization.** The model is **"assume elevated permission for the whole
 sweep"**: you authorize **once, up front, for the entire run** rather than per
@@ -164,12 +217,15 @@ sentence. When the last open ticket of a run is resolved, that run flips from
 Python 3 HTTP server (`app/server.py`, default port 7373, probing upward if
 busy) that serves a vanilla-JS UI from `app/static/`. The UI shows a sidebar of
 runs, a per-run stage stepper, live per-project job cards (pending / running /
-success / followup / failure / skipped) with health indicators, a **followups
+success / followup / failure / skipped / awaiting you) with health indicators, a
+**NEEDS YOU bar** with Start buttons for interactive tasks, a **followups
 ticket table** (number, project, what's needed, status, latest update), and
 rendered Markdown summaries — updated live via Server-Sent Events with a polling
 fallback. It opens the database **read-only** (WAL mode lets readers never block
-the subagent writers) and uses only the Python 3 standard library — no `pip`,
-no npm, no build step, no external CDN. Control it directly with:
+the subagent writers) apart from a single narrow write path — the Start button,
+which records your intent for the sweep to pick up, refuses cross-origin
+requests, and touches nothing else. It uses only the Python 3 standard library —
+no `pip`, no npm, no build step, no external CDN. Control it directly with:
 
 ```bash
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" start    # start + open browser
