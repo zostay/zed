@@ -27,9 +27,13 @@
 # its basename matches an entry.
 #
 # Results are also deduped by git `origin` remote: when two local checkouts map to
-# the same remote, only the first (in priority/path order) is emitted and a warning
-# is printed to stderr for the other, so the sweep does not run two redundant,
-# racing passes against the same GitHub repo. Projects with no remote are unaffected.
+# the same remote, only one is emitted and a warning is printed to stderr for the
+# other, so the sweep does not run two redundant, racing passes against the same
+# GitHub repo. The winner is decided per *project*, ranked by what the checkout can
+# contribute — one supplying an automated job beats one that does not, then lowest
+# priority, then path — so a secondary checkout offering only an interactive
+# sub-skill can never displace the checkout that carries the sweep. Projects with
+# no remote are unaffected.
 #
 # Each discovered skill may declare an integer `priority:` in its YAML front
 # matter to control execution order: lower runs earlier, higher runs later, and
@@ -38,8 +42,10 @@
 # needs up-front user interaction sets a negative priority to run first; one that
 # redeploys centrally-shared apps sets a positive priority to run last.
 #
-# Output: JSONL, one object per line, sorted by (priority asc, project_path, kind
-# — so a project's automated line precedes its interactive ones):
+# Output: JSONL, one object per line, sorted by (priority asc, project_path, kind).
+# `kind` is the last key, so a project's automated line precedes its interactive
+# ones only at equal priority; a sub-skill declaring a lower priority sorts ahead
+# of its own project's automated line:
 #   {"project_path","project_name","skill_name","skill_path","kind","title","priority"}
 # `kind` is "automated" (register it as a job) or "interactive" (register it as an
 # interactive task). `title` is the skill's `description:`, used as the label
@@ -117,7 +123,7 @@ is_blocked() {
 # Deliberately does NOT strip trailing `# comments`: a `description:` is prose
 # that may legitimately contain a `#`. The one key that wants comment-stripping
 # is `priority:`, which does it itself below.
-read_fm_scalar() {
+read_fm_raw() {
   local skill_md="$1" key="$2"
   awk -v key="$key" '
     NR==1 && $0 ~ /^---[[:space:]]*$/ { infm=1; next }
@@ -126,8 +132,6 @@ read_fm_scalar() {
       pat = "^[[:space:]]*" key "[[:space:]]*:"
       if ($0 ~ pat) {
         sub(pat "[[:space:]]*", "")
-        gsub(/^["'\'']|["'\'']$/, "")
-        sub(/^[[:space:]]+/, "")
         sub(/[[:space:]]+$/, "")
         print
         exit
@@ -136,15 +140,48 @@ read_fm_scalar() {
   ' "$skill_md" 2>/dev/null
 }
 
+# As above, then strip one matching pair of surrounding quotes.
+#
+# The trim has to happen on both sides of the unquoting, which is the whole
+# reason this is not one pass: trimming only first leaves `"true" ` as `true"`
+# (a trailing space defeats the closing-quote match, so the value silently stops
+# meaning what it says), and trimming only afterwards leaves `" -100 "` as
+# ` -100 `. Neither is hypothetical — the first silently dropped an interactive
+# skill from discovery and the second broke a documented `priority` form.
+#
+# Deliberately does NOT strip trailing `# comments`: a `description:` is prose
+# that may contain a `#`. The one key that wants comment-stripping is
+# `priority:`, which does it itself below — and must, because the comment sits
+# *outside* the closing quote, where unquoting cannot see it.
+read_fm_scalar() {
+  local val
+  val="$(read_fm_raw "$1" "$2")"
+  val="${val#"${val%%[![:space:]]*}"}"
+  case "$val" in
+    \"*\") val="${val#\"}"; val="${val%\"}" ;;
+    \'*\') val="${val#\'}"; val="${val%\'}" ;;
+  esac
+  val="${val#"${val%%[![:space:]]*}"}"
+  val="${val%"${val##*[![:space:]]}"}"
+  printf '%s' "$val"
+}
+
 # Read the integer `priority:` from a SKILL.md's YAML front matter, strip a
 # trailing comment, and validate it as an optionally-signed integer. So
 # `priority: '-100'`, `priority: " -100 "`, and `priority: -100  # runs first`
 # all parse to -100. Anything missing or unparseable yields the default of 0.
 read_priority() {
   local skill_md="$1" val
-  val="$(read_fm_scalar "$skill_md" priority)"
+  # Read raw and strip the comment *before* touching quotes: in
+  # `priority: '-100'  # runs first` the comment follows the closing quote, so
+  # any unquoting done first sees an unterminated value and gives up. An integer
+  # cannot legitimately contain a quote or a space, so both are simply removed
+  # wherever they appear — the same thing the pre-0.13.0 parser did.
+  val="$(read_fm_raw "$skill_md" priority)"
   val="${val%%#*}"
-  val="${val%"${val##*[![:space:]]}"}"
+  val="${val//\"/}"
+  val="${val//\'/}"
+  val="${val//[[:space:]]/}"
   if printf '%s' "$val" | grep -Eq '^-?[0-9]+$'; then
     printf '%s' "$val"
   else
@@ -202,7 +239,11 @@ results_file="$(mktemp)"
 # Tracks "<normalized_remote><TAB><project_path>" for the first checkout seen of
 # each remote, so later checkouts of the same remote can be deduped (Problem 5).
 seen_remotes="$(mktemp)"
-trap 'rm -f "$results_file" "$seen_remotes"' EXIT
+# Skills that survived the blocklist, one line each, in emission order.
+ranked_file="$(mktemp)"
+# Projects that lost a git-remote contest, one path per line.
+blocked_remote="$(mktemp)"
+trap 'rm -f "$results_file" "$seen_remotes" "$ranked_file" "$blocked_remote"' EXIT
 
 # For each configured root, search for matching SKILL.md files in both layouts.
 while IFS= read -r root; do
@@ -260,44 +301,63 @@ done < <(bash "${SCRIPT_DIR}/maintenance-config.sh" roots 2>/dev/null || true)
 
 # Dedupe by (project_path, skill_name) — a project now contributes one line per
 # participating skill, not one line total — apply the blocklist, read each
-# skill's priority, sort by (priority asc, project_path, kind), and emit JSONL.
-# The intermediate line is
+# skill's priority, and sort by (priority asc, project_path, kind). The
+# intermediate line is
 # "priority<TAB>project_path<TAB>kind<TAB>skill_path<TAB>skill_name"; `sort
 # -k1,1n` orders numerically by priority, `-k2,2` breaks ties by path
 # deterministically, and `-k3,3` puts a project's `automated` line ahead of its
-# `interactive` ones ('a' sorts before 'i').
+# `interactive` ones at equal priority ('a' sorts before 'i').
+sort -u "$results_file" | awk -F'\t' '!seen[$1 "\t" $3]++' | \
+while IFS=$'\t' read -r project skill_md found kind; do
+  [ -n "$project" ] || continue
+  if is_blocked "$project"; then
+    continue
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$(read_priority "$skill_md")" "$project" "$kind" "$skill_md" "$found"
+done | sort -t$'\t' -k1,1n -k2,2 -k3,3 >"$ranked_file"
+
+# Dedupe by git remote, at *project* granularity and before anything is emitted.
+#
+# Two local checkouts of one GitHub repo must not both sweep it — that is a
+# redundant, racing pass against the same remote. Deciding this per skill line
+# would be wrong in two ways: a project would contest its own claim (its
+# automated skill taking the remote, then its interactive tasks being dropped as
+# duplicates of it), and the winner would be whichever *line* sorted first, so a
+# secondary checkout offering nothing but a low-priority interactive sub-skill
+# could beat the checkout that actually carries the automated job.
+#
+# The contest is therefore ranked by what a checkout can contribute: one that
+# supplies an automated job wins over one that does not, then lowest priority,
+# then path. Projects with no remote never contest. One decision, one warning,
+# per project.
+while IFS= read -r project; do
+  [ -n "$project" ] || continue
+  remote="$(normalize_remote "$project")"
+  [ -n "$remote" ] || continue
+  prior="$(awk -F'\t' -v r="$remote" '$1==r{print $2; exit}' "$seen_remotes")"
+  if [ -n "$prior" ]; then
+    printf 'Warning: %s shares git remote (%s) with already-selected %s; skipping duplicate checkout.\n' \
+      "$project" "$remote" "$prior" >&2
+    printf '%s\n' "$project" >>"$blocked_remote"
+  else
+    printf '%s\t%s\n' "$remote" "$project" >>"$seen_remotes"
+  fi
+done < <(
+  awk -F'\t' '
+    { if (!($2 in minp) || $1+0 < minp[$2]) minp[$2] = $1+0
+      if ($3 == "automated") auto[$2] = 1
+      seen[$2] = 1 }
+    END { for (pp in seen) printf "%d\t%d\t%s\n", (auto[pp] ? 0 : 1), minp[pp], pp }
+  ' "$ranked_file" | sort -t$'\t' -k1,1n -k2,2n -k3,3 | cut -f3-
+)
+
 emitted=0
 output="$(
-  sort -u "$results_file" | awk -F'\t' '!seen[$1 "\t" $3]++' | \
-  while IFS=$'\t' read -r project skill_md found kind; do
-    [ -n "$project" ] || continue
-    if is_blocked "$project"; then
-      continue
-    fi
-    printf '%s\t%s\t%s\t%s\t%s\n' \
-      "$(read_priority "$skill_md")" "$project" "$kind" "$skill_md" "$found"
-  done | sort -t$'\t' -k1,1n -k2,2 -k3,3 | \
   while IFS=$'\t' read -r priority project kind skill_md found; do
     [ -n "$project" ] || continue
-    # Dedupe by git remote: if an earlier-emitted checkout already maps to this
-    # project's `origin` remote, skip this one and warn (it would otherwise run a
-    # redundant, racing sweep against the same GitHub repo). Projects without a
-    # remote are never deduped. The first checkout in (priority, path) order wins.
-    #
-    # The claim is recorded against the *project*, and a project is allowed to
-    # match its own claim — otherwise a project's automated skill would take the
-    # remote and its own interactive tasks would be dropped as duplicates of it.
-    remote="$(normalize_remote "$project")"
-    if [ -n "$remote" ]; then
-      prior="$(awk -F'\t' -v r="$remote" '$1==r{print $2; exit}' "$seen_remotes")"
-      if [ -n "$prior" ] && [ "$prior" != "$project" ]; then
-        printf 'Warning: %s shares git remote (%s) with already-selected %s; skipping duplicate checkout.\n' \
-          "$project" "$remote" "$prior" >&2
-        continue
-      fi
-      if [ -z "$prior" ]; then
-        printf '%s\t%s\n' "$remote" "$project" >>"$seen_remotes"
-      fi
+    if [ -s "$blocked_remote" ] && grep -Fxq "$project" "$blocked_remote"; then
+      continue
     fi
     name="$(basename "$project")"
     jq -nc \
@@ -310,7 +370,7 @@ output="$(
       --arg pr "$priority" \
       '{project_path: $pp, project_name: $pn, skill_name: $sn, skill_path: $sp,
         kind: $kd, title: $ti, priority: ($pr|tonumber)}'
-  done
+  done < "$ranked_file"
 )"
 
 if [ -n "$output" ]; then
