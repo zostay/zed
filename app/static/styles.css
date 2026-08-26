@@ -36,6 +36,7 @@
   --skip:      #6b7280;
   --info:      #7dd3fc;
   --followup:  #c084fc;   /* needs human followup — distinct from run/fail/ok */
+  --await:     #38bdf8;   /* the human's turn: interactive work, run not over */
 
   /* type */
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code",
@@ -227,6 +228,7 @@ code, .mono { font-family: var(--mono); }
 .run-item[data-health="fail"]::before      { background: var(--fail); }
 .run-item[data-health="running"]::before   { background: var(--run); }
 .run-item[data-health="followup"]::before  { background: var(--followup); }
+.run-item[data-health="awaiting"]::before  { background: var(--await); }
 
 .ri-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .ri-tag {
@@ -245,6 +247,8 @@ code, .mono { font-family: var(--mono); }
 .health-pill[data-h="fail"]      { color: var(--fail); border-color: rgba(248,113,113,0.4); background: rgba(248,113,113,0.08); }
 .health-pill[data-h="running"]   { color: var(--run);  border-color: rgba(251,191,36,0.4);  background: rgba(251,191,36,0.08); animation: blink 1.6s infinite; }
 .health-pill[data-h="followup"]  { color: var(--followup); border-color: rgba(192,132,252,0.45); background: rgba(192,132,252,0.10); }
+/* No blink: a run waiting on a person is not an alarm state. */
+.health-pill[data-h="awaiting"]  { color: var(--await); border-color: rgba(56,189,248,0.45); background: rgba(56,189,248,0.10); }
 .health-pill[data-h="idle"]      { color: var(--ink-dim); border-color: var(--line); }
 
 .ri-bottom {
@@ -364,6 +368,7 @@ code, .mono { font-family: var(--mono); }
 .status-pill[data-status="running"]        { color: var(--run); border-color: rgba(251,191,36,0.4); background: rgba(251,191,36,0.08); }
 .status-pill[data-status="completed"]       { color: var(--ok);  border-color: rgba(74,222,128,0.4); background: rgba(74,222,128,0.08); }
 .status-pill[data-status="needs_followup"]  { color: var(--followup); border-color: rgba(192,132,252,0.45); background: rgba(192,132,252,0.10); }
+.status-pill[data-status="awaiting_interactive"] { color: var(--await); border-color: rgba(56,189,248,0.45); background: rgba(56,189,248,0.10); }
 .status-pill[data-status="failed"]          { color: var(--fail); border-color: rgba(248,113,113,0.4); background: rgba(248,113,113,0.08); }
 .status-pill[data-status="cancelled"]       { color: var(--ink-dim); border-color: var(--line); background: var(--panel); }
 
@@ -522,6 +527,8 @@ code, .mono { font-family: var(--mono); }
   box-shadow: 0 0 10px rgba(251,191,36,0.10);
 }
 .chip[data-s="pending"] .chip-glyph { color: var(--ink-faint); }
+.chip[data-s="awaiting_interactive"] { border-left-color: var(--await); background: rgba(56,189,248,0.05); }
+.chip[data-s="awaiting_interactive"] .chip-glyph { color: var(--await); }
 
 /* --------------------------------------------------------------------------- events (activity) */
 .events {
@@ -570,6 +577,82 @@ code, .mono { font-family: var(--mono); }
 .followup-strip .fs-label { flex: 1; }
 .followup-strip .fs-label b { color: var(--followup); font-weight: 700; }
 .followup-strip .fs-view { color: var(--followup); letter-spacing: 0.06em; }
+
+/* --------------------------------------------------------------------------- interactive queue
+   Work that needs a person. Sits between the shared header and both faces, so
+   it is reachable whether the automated queue is still running or the run has
+   parked waiting on it.
+
+   Note what is deliberately absent: no timers, no elapsed counters, no
+   "waiting Nm" text, no blinking. Someone pausing to think, walking away, or
+   stopping to file a bug is normal, and this panel must never imply they are
+   late. */
+.ix-bar {
+  flex: none;
+  margin: 12px 0 16px;
+  padding: 12px 14px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--await);
+  border-radius: var(--radius);
+  background: var(--rail);
+}
+/* Capped and scrollable: the live face is `overflow: hidden`, so an uncapped
+   bar with a dozen tasks would squeeze and then clip the NOW/QUEUE/activity grid
+   below it. */
+.ix-rows {
+  display: flex; flex-direction: column; gap: 6px; margin-top: 8px;
+  max-height: 34vh; overflow-y: auto;
+}
+.ix-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  background: var(--panel);
+  font-family: var(--mono); font-size: var(--fs-115);
+}
+.ix-row[data-status="done"],
+.ix-row[data-status="abandoned"] { opacity: 0.6; }
+.ix-project {
+  flex: none; min-width: 168px;
+  color: var(--ink); font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ix-title {
+  flex: 1;
+  color: var(--ink-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ix-state {
+  flex: none;
+  font-size: var(--fs-100); letter-spacing: 0.06em;
+  color: var(--ink-faint);
+}
+.ix-state[data-status="discovered"] { color: var(--await); }
+.ix-state[data-status="started"]    { color: var(--run); }
+.ix-state[data-status="done"]       { color: var(--ok); }
+.ix-start {
+  flex: none;
+  font-family: var(--mono); font-size: var(--fs-105); font-weight: 700;
+  letter-spacing: 0.10em; text-transform: uppercase;
+  color: var(--bg); background: var(--await);
+  border: 1px solid var(--await); border-radius: var(--radius);
+  padding: 5px 14px;
+  cursor: pointer;
+  transition: filter 0.12s;
+}
+.ix-start:hover { filter: brightness(1.12); }
+.ix-start:disabled {
+  cursor: default; filter: none;
+  color: var(--ink-faint); background: transparent;
+  border-color: var(--line); text-transform: none; letter-spacing: 0.04em;
+}
+.ix-foot {
+  margin: 9px 2px 0;
+  font-size: var(--fs-105); color: var(--ink-faint);
+}
+.ix-foot:empty { display: none; }
+.ix-foot[data-tone="error"] { color: var(--fail); }
 
 /* --------------------------------------------------------------------------- DEBRIEF: stoplight */
 .stoplight {
@@ -903,6 +986,7 @@ a.gt-row[data-new="1"]:hover { background: rgba(74,222,128,0.085); border-color:
 .result[data-status="followup"] { border-left-color: var(--followup); background: linear-gradient(90deg, rgba(192,132,252,0.05), var(--panel) 40%); }
 .result[data-status="failure"]  { border-left-color: var(--fail); background: linear-gradient(90deg, rgba(248,113,113,0.05), var(--panel) 40%); }
 .result[data-status="skipped"]  { border-left-color: var(--skip); opacity: 0.75; }
+.result[data-status="awaiting_interactive"] { border-left-color: var(--await); background: linear-gradient(90deg, rgba(56,189,248,0.05), var(--panel) 40%); }
 .result-top { display: flex; align-items: center; gap: 11px; }
 .result-name {
   font-family: var(--mono); font-size: var(--fs-135); font-weight: 600; color: var(--ink);

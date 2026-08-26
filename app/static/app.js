@@ -25,11 +25,15 @@
   // Terminal = the stream can close. 'needs_followup' is deliberately NOT
   // terminal: the sweep is done but tickets remain, so we keep streaming to
   // reflect tickets resolving live until the run graduates to 'completed'.
+  // 'awaiting_interactive' is likewise absent — a parked run is not over, and
+  // this page is where the human clicks Start, so the stream must stay open for
+  // as long as they take.
   var TERMINAL = { completed: 1, failed: 1, cancelled: 1 };
   var LEVEL_GLYPH = { info: "›", warn: "▲", error: "✕", success: "✓" };
   var CHIP_GLYPH = {
     success: "✓", skipped: "–", failure: "✕",
-    followup: "…", running: "⟳", pending: "○"
+    followup: "…", running: "⟳", pending: "○",
+    awaiting_interactive: "◆"
   };
   var TICKET_STATUS_LABEL = { open: "open", done: "done", wontdo: "won't do" };
   // GitHub triage: issue vs PR has to be readable at a glance, so it gets both
@@ -37,7 +41,7 @@
   var KIND_GLYPH = { issue: "◉", pr: "⇄" };
   var ACTION_LABEL = { opened: "opened", update: "update", done: "done", nope: "won't do" };
   // status → queue sort priority (what's left surfaces first)
-  var STATUS_PRIORITY = { running: 0, pending: 1, followup: 2, failure: 3, success: 4, skipped: 5 };
+  var STATUS_PRIORITY = { running: 0, awaiting_interactive: 1, pending: 2, followup: 3, failure: 4, success: 5, skipped: 6 };
 
   // ---- state --------------------------------------------------------------
   var state = {
@@ -53,6 +57,8 @@
     pollTimer: null,
     runsTimer: null,
     prevStatus: null,         // for the running -> done reveal
+    ixPending: {},            // interactive task id -> Start POST in flight
+    ixError: "",              // last Start failure, held until the next attempt
     expanded: {},             // result id -> summary expanded
     foldOpen: false,          // debrief: clean-projects fold
     logOpen: false,           // debrief: activity log
@@ -109,6 +115,11 @@
     logToggle: byId("log-toggle"),
     logCount: byId("log-count"),
     eventsDebrief: byId("events-debrief"),
+    // interactive queue
+    ixBar: byId("ix-bar"),
+    ixRows: byId("ix-rows"),
+    ixHint: byId("ix-hint"),
+    ixFoot: byId("ix-foot"),
     // followups page
     fpBack: byId("fp-back"),
     fpTitle: byId("fp-title"),
@@ -278,6 +289,9 @@
 
   function runHealth(run) {
     var c = run.counts || {};
+    // Checked before 'running': a parked run has no running jobs but is very
+    // much still open, and the sidebar should say whose turn it is.
+    if (run.status === "awaiting_interactive" || c.awaiting_interactive) return "awaiting";
     if (run.status === "running" || c.running) return "running";
     if (run.status === "completed") return "ok";
     if (run.status === "failed" || c.failure) return "fail";
@@ -287,6 +301,7 @@
   }
   function healthLabel(health, run) {
     if (health === "running") return "live";
+    if (health === "awaiting") return "your turn";
     if (health === "followup") return "followup";
     if (health === "fail") return "fail";
     if (health === "ok") return "ok";
@@ -351,6 +366,8 @@
         ingestDetail({
           run: payload.run, jobs: payload.jobs, counts: payload.counts,
           followups: payload.followups, followup_counts: payload.followup_counts,
+          interactive_tasks: payload.interactive_tasks,
+          interactive_counts: payload.interactive_counts,
           project_issues: payload.project_issues, top_issues: payload.top_issues
         });
         touched = true;
@@ -412,6 +429,10 @@
     // never sends these keys at all and the section must not blink out.
     if (detail.project_issues == null && prev) detail.project_issues = prev.project_issues;
     if (detail.top_issues == null && prev) detail.top_issues = prev.top_issues;
+    // Same again for the interactive queue: an older server never sends these
+    // keys, and the bar must not blink out on a jobs-only update.
+    if (detail.interactive_tasks == null && prev) detail.interactive_tasks = prev.interactive_tasks;
+    if (detail.interactive_counts == null && prev) detail.interactive_counts = prev.interactive_counts;
     state.detail = detail;
 
     // keep sidebar row fresh
@@ -466,11 +487,15 @@
 
   function renderRun(detail) {
     var run = detail.run;
-    var face = run.status === "running" ? "live" : "debrief";
+    // A parked run stays on the live face. It is not over — it is waiting on a
+    // human — and this is the page where they click Start and watch the rest.
+    var live = run.status === "running" || run.status === "awaiting_interactive";
+    var face = live ? "live" : "debrief";
     var faceChanged = el.runView.dataset.face !== face;
     el.runView.dataset.face = face;
 
     renderHeader(detail, face);
+    renderInteractiveBar(detail);
 
     if (face === "live") {
       renderLiveFace(detail);
@@ -482,11 +507,117 @@
       else state.mountedEventsEl = null;
     }
 
-    // one-time reveal when the agent finishes (running -> terminal/needs_followup)
-    if (state.prevStatus === "running" && run.status !== "running") {
+    // one-time reveal when the agent finishes (running -> terminal/needs_followup).
+    // Parking is not finishing, so it must not trigger the reveal.
+    if (state.prevStatus === "running" && !live) {
       playDebriefReveal();
     }
     state.prevStatus = run.status;
+  }
+
+  // -- interactive queue ----------------------------------------------------
+  //
+  // The human-paced half of the run. Everything here is deliberately free of
+  // timers and elapsed-time nagging: someone pausing to think, walking away, or
+  // stopping to file a bug is a normal condition, and this UI must not suggest
+  // otherwise.
+  function renderInteractiveBar(detail) {
+    var tasks = detail.interactive_tasks || [];
+    if (!tasks.length) { el.ixBar.hidden = true; return; }
+    el.ixBar.hidden = false;
+
+    var open = tasks.filter(isIxOpen).length;
+    el.ixHint.textContent = open
+      ? open + " of " + tasks.length + " " + plural(tasks.length, "task") + " outstanding"
+      : (tasks.length === 1 ? "done" : "all " + tasks.length + " tasks done");
+
+    el.ixRows.innerHTML = tasks.map(function (t) {
+      return ixRow(t, detail.run.id);
+    }).join("");
+
+    Array.prototype.forEach.call(
+      el.ixRows.querySelectorAll("button[data-task]"),
+      function (btn) {
+        btn.addEventListener("click", onStartInteractive);
+        // A render triggered by the next SSE tick (~1s) would otherwise re-enable
+        // a button whose POST is still in flight, inviting a second click.
+        if (state.ixPending[btn.getAttribute("data-task")]) {
+          btn.disabled = true;
+          btn.textContent = "starting…";
+        }
+      }
+    );
+
+    // An error survives re-renders until the next successful click; otherwise the
+    // message is wiped by the following SSE tick and the user never reads it.
+    el.ixFoot.textContent = state.ixError ? state.ixError : (open
+      ? "Start one when you're ready. It runs alongside the automated work, at your pace — nothing here is on a clock."
+      : "");
+    el.ixFoot.dataset.tone = state.ixError ? "error" : "";
+  }
+
+  function isIxOpen(t) {
+    return t.status === "discovered" || t.status === "requested" || t.status === "started";
+  }
+
+  function ixRow(t, runId) {
+    var label = {
+      discovered: "ready when you are",
+      requested: "queued — the sweep will pick this up",
+      started: "running — take your time",
+      done: "done",
+      abandoned: "left for another day"
+    }[t.status] || t.status;
+
+    var action = t.status === "discovered"
+      ? '<button class="ix-start" type="button" data-task="' + esc(t.id) +
+        '" data-run="' + esc(runId) + '">Start</button>'
+      : '<span class="ix-state" data-status="' + esc(t.status) + '">' + esc(label) + "</span>";
+
+    return '<div class="ix-row" data-status="' + esc(t.status) + '">' +
+      '<span class="ix-project">' + esc(t.project_name) + "</span>" +
+      '<span class="ix-title">' + esc(t.title) + "</span>" +
+      (t.status === "discovered"
+        ? '<span class="ix-state" data-status="discovered">' + esc(label) + "</span>"
+        : "") +
+      action +
+      "</div>";
+  }
+
+  function onStartInteractive(ev) {
+    var btn = ev.currentTarget;
+    var taskId = btn.getAttribute("data-task");
+    var runId = btn.getAttribute("data-run");
+    // Optimistic disable only. The authoritative state comes back over SSE when
+    // the server has actually recorded the request.
+    state.ixPending[taskId] = 1;
+    state.ixError = "";
+    btn.disabled = true;
+    btn.textContent = "starting…";
+    fetch("/api/runs/" + encodeURIComponent(runId) +
+          "/interactive/" + encodeURIComponent(taskId) + "/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    }).then(function (res) {
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return res.json();
+    }).then(function (data) {
+      delete state.ixPending[taskId];
+      // Fold the server's answer straight in so the row updates now rather than
+      // on the next SSE tick.
+      if (data && data.task && state.detail) {
+        var list = state.detail.interactive_tasks || [];
+        for (var i = 0; i < list.length; i++) {
+          if (String(list[i].id) === String(data.task.id)) { list[i] = data.task; break; }
+        }
+        renderInteractiveBar(state.detail);
+      }
+    }).catch(function () {
+      delete state.ixPending[taskId];
+      state.ixError = "Could not record that — the sweep database may be busy. Try again.";
+      if (state.detail) renderInteractiveBar(state.detail);
+    });
   }
 
   // -- shared header --------------------------------------------------------
@@ -505,6 +636,8 @@
 
   function statusLabel(status) {
     if (status === "needs_followup") return "needs followup";
+    // Not "stalled", not "waiting too long" — the run is simply the human's turn.
+    if (status === "awaiting_interactive") return "awaiting you";
     return status || "";
   }
   function compactOptions(opts) {
