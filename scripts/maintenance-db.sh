@@ -20,8 +20,13 @@
 #   set-stage --run R --stage S
 #       Update runs.stage.
 #   add-job --run R --path P --name N [--skill S]
-#       Insert a job (idempotent via INSERT OR IGNORE on UNIQUE(run_id,path)).
-#       Prints the job_id (existing or new) on stdout.
+#           [--origin discovered|injected] [--source-task T]
+#       Insert a job (idempotent via INSERT OR IGNORE on the unique index
+#       (run_id, project_path, skill_name)). Prints the job_id (existing or new)
+#       on stdout. --origin injected marks work an interactive task queued back
+#       into the automated queue, with --source-task naming the task; that is
+#       why skill_name is part of the key, since one project can then hold more
+#       than one job in a run.
 #   start-job --job J
 #       Set status='running', started_at=now.
 #   finish-job --job J --status STATUS [--summary MD] [--summary-file PATH]
@@ -32,7 +37,52 @@
 #       Insert an event. level defaults to info.
 #   finish-run --run R --status STATUS [--summary MD] [--summary-file PATH]
 #       Set status (completed|needs_followup|failed|cancelled), finished_at=now,
-#       stage='done', summary.
+#       stage='done', summary. Rejects 'awaiting_interactive' — that is not a
+#       finish; see park-run.
+#
+# Interactive queue (the second queue: work that needs a human, run in parallel
+# with the automated jobs and paced by the human, never timed out):
+#   add-interactive-task --run R [--job J] --path P --name N --skill S --title T
+#                        [--priority N]
+#       Register a discovered interactive task. Idempotent on
+#       (run_id, project_path, skill_name). Prints the task id.
+#   request-interactive --task T
+#       Record that the human clicked Start: status 'discovered' -> 'requested',
+#       stamping start_requested_at. This row IS the intent record the app
+#       writes; the orchestrator dispatches when it next polls. A no-op once the
+#       task is past 'discovered'. Prints the resulting task as JSON.
+#   start-interactive --task T
+#       The orchestrator dispatched a subagent for it: -> 'started'.
+#   finish-interactive --task T --status done|abandoned [--summary MD]
+#                      [--summary-file PATH] [--error MSG]
+#       Close the task. Also promotes that project's parked job ('done' ->
+#       success, 'abandoned' -> followup) and, if the run is parked and both
+#       queues have drained, graduates the run. Prints a JSON receipt.
+#   reset-interactive --run R
+#       Return every 'started' task of a run to 'requested' so a resuming session
+#       re-dispatches it. Run this at attach time only: a task is otherwise
+#       strandable, since next-work selects only 'requested', request-interactive
+#       no-ops past 'discovered', and the app offers Start only for 'discovered'.
+#   list-interactive [--run R] [--status S]
+#       Print interactive tasks as JSONL (newest run first, then priority).
+#   next-work --run R
+#       Print one JSON object saying what the sweep should do next, answered
+#       from the database rather than from a list fixed at discovery time:
+#         {"kind":"interactive_start",...} a Start request to dispatch (checked
+#                                          first so a click is acted on promptly)
+#         {"kind":"job",...}               the next pending job, injected or not
+#         {"kind":"idle",...}              nothing runnable, work still open
+#         {"kind":"drained"}               both queues empty
+#   wait-for-work --run R [--timeout 480] [--interval 5]
+#       Sleep-poll next-work until it returns something other than 'idle', or
+#       until the timeout. The default window sits under Claude Code's 10-minute
+#       Bash ceiling so a wait always returns rather than being killed.
+#   park-run --run R [--summary MD] [--summary-file PATH]
+#       Park a run that has drained its automated queue but still owes
+#       interactive work: status='awaiting_interactive', stage='awaiting-
+#       interactive', finished_at left NULL. The run is not over.
+#   list-parked [--tag T]
+#       Print parked runs as JSONL, newest first (how --resume finds its run).
 #   add-followup --run R [--job J] [--project N] --title T [--detail D]
 #       Open a followup ticket. Prints the new ticket number (bare integer).
 #       Also logs a warn event so the ticket appears live in the activity feed.
@@ -90,6 +140,7 @@ Subcommands:
   start-run       --tag T [--mode M] [--options JSON] [--options-file PATH]
   set-stage       --run R --stage S
   add-job         --run R --path P --name N [--skill S]
+                  [--origin discovered|injected] [--source-task T]
   start-job       --job J
   finish-job      --job J --status STATUS [--summary MD] [--summary-file PATH] [--error MSG]
   log             --run R [--job J] [--level L] --message M
@@ -106,6 +157,20 @@ Subcommands:
   add-project-issues  --run R [--job J] --project N [--repo OWNER/REPO]
                       [--origin triage|created] --file PATH
   list-project-issues [--run R] [--project N] [--origin triage|created] [--limit N]
+
+Interactive queue:
+  add-interactive-task --run R [--job J] --path P --name N --skill S --title T
+                       [--priority N]
+  request-interactive  --task T
+  start-interactive    --task T
+  reset-interactive    --run R
+  finish-interactive   --task T --status done|abandoned [--summary MD]
+                       [--summary-file PATH] [--error MSG]
+  list-interactive     [--run R] [--status S]
+  next-work            --run R
+  wait-for-work        --run R [--timeout 480] [--interval 5]
+  park-run             --run R [--summary MD] [--summary-file PATH]
+  list-parked          [--tag T]
 EOF
 }
 
@@ -207,10 +272,92 @@ ALTER TABLE $table ADD COLUMN $column $decl;
 SQL
 }
 
+# Rebuild `jobs` so its uniqueness key is (run_id, project_path, skill_name)
+# instead of (run_id, project_path).
+#
+# Why a rebuild: the original table carried UNIQUE(run_id, project_path) as a
+# *table constraint*, which made a second job for the same project impossible —
+# and an interactive task injecting its trailing automated stage needs exactly
+# that. SQLite has no ALTER TABLE ... DROP CONSTRAINT, so the only way out is
+# create-copy-drop-rename.
+#
+# Idempotent: the presence of idx_jobs_unique_v2 is the marker that the rebuild
+# already ran, so this returns immediately on an already-migrated database (and
+# on a fresh one, where schema.sql created the index outright).
+#
+# Row ids are preserved so the foreign keys in events / followups /
+# project_issues keep pointing at the same jobs. foreign_keys=OFF is required to
+# drop a referenced table at all; legacy_alter_table=ON stops the RENAME from
+# rewriting other tables' REFERENCES clauses out from under us.
+migrate_jobs_unique_key() {
+  local present
+  present="$(sqlite3 "$DB" \
+    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_jobs_unique_v2';" \
+    2>/dev/null || echo 0)"
+  [ "${present:-0}" = "0" ] || return 0
+
+  # Nothing to migrate if there is no jobs table yet (schema.sql will make one).
+  local has_jobs
+  has_jobs="$(sqlite3 "$DB" \
+    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='jobs';" \
+    2>/dev/null || echo 0)"
+  [ "${has_jobs:-0}" = "0" ] && return 0
+
+  sqlite3 "$DB" >/dev/null <<'SQL'
+PRAGMA busy_timeout=10000;
+PRAGMA legacy_alter_table=ON;
+PRAGMA foreign_keys=OFF;
+BEGIN IMMEDIATE;
+CREATE TABLE jobs_migrate_v2 (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id         INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  project_path   TEXT    NOT NULL,
+  project_name   TEXT    NOT NULL,
+  skill_name     TEXT,
+  status         TEXT    NOT NULL DEFAULT 'pending',
+  started_at     TEXT,
+  finished_at    TEXT,
+  summary        TEXT,
+  error          TEXT,
+  origin         TEXT    NOT NULL DEFAULT 'discovered',
+  source_task_id INTEGER
+);
+INSERT INTO jobs_migrate_v2
+  (id, run_id, project_path, project_name, skill_name, status,
+   started_at, finished_at, summary, error, origin, source_task_id)
+SELECT id, run_id, project_path, project_name, skill_name, status,
+       started_at, finished_at, summary, error, 'discovered', NULL
+FROM jobs;
+DROP TABLE jobs;
+ALTER TABLE jobs_migrate_v2 RENAME TO jobs;
+CREATE INDEX IF NOT EXISTS idx_jobs_run ON jobs(run_id);
+CREATE UNIQUE INDEX idx_jobs_unique_v2
+  ON jobs(run_id, project_path, IFNULL(skill_name, ''));
+COMMIT;
+PRAGMA foreign_keys=ON;
+SQL
+
+  # A migration that silently corrupted the reference graph is worse than one
+  # that failed loudly, so check before declaring victory.
+  local fk_problems
+  fk_problems="$(sqlite3 "$DB" "PRAGMA foreign_key_check;" 2>/dev/null | head -n 5)"
+  if [ -n "$fk_problems" ]; then
+    die "jobs table migration left dangling foreign keys: $fk_problems"
+  fi
+}
+
 cmd_init() {
   local dir
   dir="$(mtnc_ensure_data_dir)"
   [ -f "$SCHEMA_PATH" ] || die "schema not found: $SCHEMA_PATH"
+
+  # 0.13.0 — this runs BEFORE the schema, deliberately. schema.sql now carries
+  # `CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_unique_v2`, and that index would
+  # build happily against the *old* jobs table — planting the very marker the
+  # migration uses to decide it has already run, while the old two-column UNIQUE
+  # constraint stayed in place. Migrating first keeps the marker honest.
+  migrate_jobs_unique_key
+
   # Applying the schema runs PRAGMA journal_mode=WAL, which emits 'wal'; send
   # all schema output to /dev/null so only the db path lands on stdout.
   sqlite3 "$DB" >/dev/null <<SQL
@@ -286,13 +433,15 @@ SQL
 }
 
 cmd_add_job() {
-  local run="" path="" name="" skill=""
+  local run="" path="" name="" skill="" origin="discovered" source_task=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --run)   run="$2";   shift 2 ;;
-      --path)  path="$2";  shift 2 ;;
-      --name)  name="$2";  shift 2 ;;
-      --skill) skill="$2"; shift 2 ;;
+      --run)         run="$2";         shift 2 ;;
+      --path)        path="$2";        shift 2 ;;
+      --name)        name="$2";        shift 2 ;;
+      --skill)       skill="$2";       shift 2 ;;
+      --origin)      origin="$2";      shift 2 ;;
+      --source-task) source_task="$2"; shift 2 ;;
       *) die "add-job: unknown option: $1" 2 ;;
     esac
   done
@@ -300,22 +449,35 @@ cmd_add_job() {
   [ -n "$path" ] || die "add-job: --path is required"
   [ -n "$name" ] || die "add-job: --name is required"
   require_int --run "$run"
+  case "$origin" in
+    discovered|injected) ;;
+    *) die "add-job: --origin must be discovered or injected (got: '$origin')" 2 ;;
+  esac
+  [ -n "$source_task" ] && require_int --source-task "$source_task"
 
-  local path_e name_e skill_v
+  local path_e name_e skill_v skill_key source_v
   path_e="$(mtnc_sql_escape "$path")"
   name_e="$(mtnc_sql_escape "$name")"
   if [ -n "$skill" ]; then
     skill_v="'$(mtnc_sql_escape "$skill")'"
+    skill_key="'$(mtnc_sql_escape "$skill")'"
   else
     skill_v="NULL"
+    skill_key="''"
   fi
+  if [ -n "$source_task" ]; then source_v="$source_task"; else source_v="NULL"; fi
 
-  # INSERT OR IGNORE keeps this idempotent on UNIQUE(run_id, project_path);
-  # then look up the id (the new row's or the pre-existing one's).
+  # INSERT OR IGNORE keeps this idempotent on the unique index
+  # (run_id, project_path, IFNULL(skill_name,'')); then look up the id (the new
+  # row's or the pre-existing one's). skill_name is part of the key because an
+  # interactive task can inject a *second* job for a project that already has
+  # one — matching on project_path alone would silently return the first job's
+  # id and drop the injected work on the floor.
   db_exec <<SQL
-INSERT OR IGNORE INTO jobs (run_id, project_path, project_name, skill_name)
-VALUES ($run, '$path_e', '$name_e', $skill_v);
-SELECT id FROM jobs WHERE run_id=$run AND project_path='$path_e';
+INSERT OR IGNORE INTO jobs (run_id, project_path, project_name, skill_name, origin, source_task_id)
+VALUES ($run, '$path_e', '$name_e', $skill_v, '$(mtnc_sql_escape "$origin")', $source_v);
+SELECT id FROM jobs
+ WHERE run_id=$run AND project_path='$path_e' AND IFNULL(skill_name,'')=$skill_key;
 SQL
 }
 
@@ -417,6 +579,13 @@ cmd_finish_run() {
   [ -n "$run" ]    || die "finish-run: --run is required"
   [ -n "$status" ] || die "finish-run: --status is required"
   require_int --run "$run"
+  # awaiting_interactive is not a finish. The run is still going — it is waiting
+  # on a human — so it must keep finished_at NULL and stage out of 'done'. Route
+  # it to park-run rather than let a caller stamp a completion time on a run that
+  # has not completed.
+  if [ "$status" = "awaiting_interactive" ]; then
+    die "finish-run: 'awaiting_interactive' is not a terminal status; use park-run instead" 2
+  fi
   if [ -n "$summary_file" ]; then
     summary="$(read_file "$summary_file")"
     have_summary=1
@@ -619,6 +788,533 @@ SQL
 )"
   [ -n "$out" ] || die "get-followup: no followup ticket #$id"
   printf '%s\n' "$out"
+}
+
+# ---- interactive queue ----------------------------------------------------
+#
+# The second of the two queues. Automated jobs run unattended; interactive tasks
+# are started by the human, from the observability app, and run in parallel at
+# whatever pace they take. Nothing in here times anything out.
+
+cmd_add_interactive_task() {
+  local run="" job="" path="" name="" skill="" title="" priority="0"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --run)      run="$2";      shift 2 ;;
+      --job)      job="$2";      shift 2 ;;
+      --path)     path="$2";     shift 2 ;;
+      --name)     name="$2";     shift 2 ;;
+      --skill)    skill="$2";    shift 2 ;;
+      --title)    title="$2";    shift 2 ;;
+      --priority) priority="$2"; shift 2 ;;
+      *) die "add-interactive-task: unknown option: $1" 2 ;;
+    esac
+  done
+  [ -n "$run" ]   || die "add-interactive-task: --run is required"
+  [ -n "$path" ]  || die "add-interactive-task: --path is required"
+  [ -n "$name" ]  || die "add-interactive-task: --name is required"
+  [ -n "$skill" ] || die "add-interactive-task: --skill is required"
+  [ -n "$title" ] || die "add-interactive-task: --title is required"
+  require_int --run "$run"
+  [ -n "$job" ] && require_int --job "$job"
+  # A glob class like *[!0-9-]* would accept a bare '-' and arithmetic such as
+  # '1-2', and the value is interpolated straight into the VALUES list — so
+  # '1-2' would be evaluated by SQLite and silently stored as -1. Match the
+  # exact shape instead.
+  printf '%s' "$priority" | grep -Eq '^-?[0-9]+$' \
+    || die "add-interactive-task: --priority must be an integer (got: '$priority')" 2
+
+  local now path_e skill_e job_v
+  now="$(mtnc_now)"
+  path_e="$(mtnc_sql_escape "$path")"
+  skill_e="$(mtnc_sql_escape "$skill")"
+  if [ -n "$job" ]; then job_v="$job"; else job_v="NULL"; fi
+
+  # Idempotent on UNIQUE(run_id, project_path, skill_name) so re-running
+  # discovery inside one run cannot duplicate a task (or reset one the human has
+  # already started).
+  db_exec <<SQL
+INSERT OR IGNORE INTO interactive_tasks
+  (run_id, job_id, project_path, project_name, skill_name, title, priority, status, created_at)
+VALUES ($run, $job_v, '$path_e', '$(mtnc_sql_escape "$name")', '$skill_e',
+        '$(mtnc_sql_escape "$title")', $priority, 'discovered', '$(mtnc_sql_escape "$now")');
+SELECT id FROM interactive_tasks
+ WHERE run_id=$run AND project_path='$path_e' AND skill_name='$skill_e';
+SQL
+}
+
+# Look up a task's run_id and current status, or die. Echoes "run_id|status".
+interactive_row() {
+  local id="$1" row
+  row="$(db_exec <<SQL
+SELECT run_id || '|' || status FROM interactive_tasks WHERE id=$id;
+SQL
+)"
+  [ -n "$row" ] || die "no interactive task #$id"
+  printf '%s' "$row"
+}
+
+# Print one task as a JSON object. Used as the receipt of every state change so
+# a caller (the app, the orchestrator) always gets the resulting state back.
+interactive_json() {
+  local id="$1"
+  db_exec <<SQL
+SELECT json_object(
+  'task', id, 'run_id', run_id, 'job_id', job_id,
+  'project_path', project_path, 'project_name', project_name,
+  'skill_name', skill_name, 'title', title, 'priority', priority,
+  'status', status, 'start_requested_at', start_requested_at,
+  'started_at', started_at, 'finished_at', finished_at,
+  'summary', summary, 'error', error, 'created_at', created_at
+) FROM interactive_tasks WHERE id=$id;
+SQL
+}
+
+# The human clicked Start. This only records the *intent*; the orchestrator
+# dispatches. Deliberately a no-op (exit 0) once the task is past 'discovered',
+# so a double-click, a page refresh, or the app retrying cannot disturb a task
+# that is already running or done.
+cmd_request_interactive() {
+  local task=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --task) task="$2"; shift 2 ;;
+      *) die "request-interactive: unknown option: $1" 2 ;;
+    esac
+  done
+  [ -n "$task" ] || die "request-interactive: --task is required"
+  require_int --task "$task"
+
+  local row run_id cur_status now now_e
+  row="$(interactive_row "$task")"
+  run_id="${row%%|*}"
+  cur_status="${row##*|}"
+
+  if [ "$cur_status" = "discovered" ]; then
+    now="$(mtnc_now)"
+    now_e="$(mtnc_sql_escape "$now")"
+    db_exec <<SQL
+UPDATE interactive_tasks
+   SET status='requested', start_requested_at='$now_e'
+ WHERE id=$task AND status='discovered';
+INSERT INTO events (run_id, job_id, ts, level, message)
+VALUES ($run_id, (SELECT job_id FROM interactive_tasks WHERE id=$task), '$now_e', 'info',
+        '$(mtnc_sql_escape "Interactive task #${task} start requested; queued for dispatch.")');
+SQL
+  fi
+  interactive_json "$task"
+}
+
+# The orchestrator picked the request up and is dispatching a subagent for it.
+cmd_start_interactive() {
+  local task=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --task) task="$2"; shift 2 ;;
+      *) die "start-interactive: unknown option: $1" 2 ;;
+    esac
+  done
+  [ -n "$task" ] || die "start-interactive: --task is required"
+  require_int --task "$task"
+
+  local row run_id now_e
+  row="$(interactive_row "$task")"
+  run_id="${row%%|*}"
+  now_e="$(mtnc_sql_escape "$(mtnc_now)")"
+
+  db_exec <<SQL
+UPDATE interactive_tasks
+   SET status='started', started_at='$now_e',
+       start_requested_at=COALESCE(start_requested_at, '$now_e')
+ WHERE id=$task AND status IN ('discovered','requested');
+INSERT INTO events (run_id, job_id, ts, level, message)
+VALUES ($run_id, (SELECT job_id FROM interactive_tasks WHERE id=$task), '$now_e', 'info',
+        '$(mtnc_sql_escape "Interactive task #${task} started.")');
+SQL
+  interactive_json "$task"
+}
+
+cmd_finish_interactive() {
+  local task="" status="" summary="" summary_file="" error="" \
+        have_summary=0 have_error=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --task)         task="$2";                      shift 2 ;;
+      --status)       status="$2";                    shift 2 ;;
+      --summary)      summary="$2";   have_summary=1; shift 2 ;;
+      --summary-file) summary_file="$2";              shift 2 ;;
+      --error)        error="$2";     have_error=1;   shift 2 ;;
+      *) die "finish-interactive: unknown option: $1" 2 ;;
+    esac
+  done
+  [ -n "$task" ]   || die "finish-interactive: --task is required"
+  [ -n "$status" ] || die "finish-interactive: --status is required"
+  require_int --task "$task"
+  case "$status" in
+    done|abandoned) ;;
+    *) die "finish-interactive: --status must be done or abandoned (got: '$status')" 2 ;;
+  esac
+  if [ -n "$summary_file" ]; then
+    summary="$(read_file "$summary_file")"
+    have_summary=1
+  fi
+  [ "$have_summary" -eq 1 ] && warn_if_blank_summary "interactive task #$task" "$summary"
+
+  local row run_id now_e sets
+  row="$(interactive_row "$task")"
+  run_id="${row%%|*}"
+  now_e="$(mtnc_sql_escape "$(mtnc_now)")"
+  sets="status='$(mtnc_sql_escape "$status")', finished_at='$now_e'"
+  [ "$have_summary" -eq 1 ] && sets="$sets, summary='$(mtnc_sql_escape "$summary")'"
+  [ "$have_error"   -eq 1 ] && sets="$sets, error='$(mtnc_sql_escape "$error")'"
+
+  # Promote the project's parked job in the same call rather than leaving it to
+  # the orchestrator to remember. A job only ever sits at 'awaiting_interactive'
+  # because of a task like this one: 'done' means the automated half's success
+  # now stands, 'abandoned' means a human consciously left work behind, which is
+  # precisely what 'followup' records. A job that earned 'failure' is untouched —
+  # its own status is the more informative one.
+  #
+  # Two things this has to get right, both of which a naive version gets wrong:
+  #
+  #   * The target is found by `job_id` when the task carries one, falling back
+  #     to `project_path` only for a task registered without a job. Matching on
+  #     path alone means any difference between the two rows (a trailing slash, a
+  #     symlinked vs. raw path) silently promotes nothing — and since the job
+  #     then sits at 'awaiting_interactive' forever, the run looks drained.
+  #
+  #   * `abandoned` is **sticky** across a project's tasks. The status is derived
+  #     from every task of the project, not just this one, because promotion only
+  #     fires when the last one closes: with two tasks, abandoning A and then
+  #     finishing B would otherwise promote the job to 'success' and erase the
+  #     abandonment entirely.
+  # Close the task first, so the stickiness check below sees this task's own
+  # final status rather than the state it was in a moment ago.
+  db_exec <<SQL
+UPDATE interactive_tasks SET $sets WHERE id=$task;
+SQL
+
+  local abandoned_any promoted
+  abandoned_any="$(db_exec <<SQL
+SELECT COUNT(*) FROM interactive_tasks t
+ WHERE t.run_id=$run_id
+   AND t.status='abandoned'
+   AND ( (SELECT job_id FROM interactive_tasks WHERE id=$task) IS NOT NULL
+         AND t.job_id=(SELECT job_id FROM interactive_tasks WHERE id=$task)
+       OR (SELECT job_id FROM interactive_tasks WHERE id=$task) IS NULL
+         AND t.project_path=(SELECT project_path FROM interactive_tasks WHERE id=$task) );
+SQL
+)"
+  if [ "${abandoned_any:-0}" = "0" ]; then promoted="success"; else promoted="followup"; fi
+
+  db_exec <<SQL
+UPDATE jobs
+   SET status='$promoted'
+ WHERE run_id=$run_id
+   AND status='awaiting_interactive'
+   AND CASE
+         WHEN (SELECT job_id FROM interactive_tasks WHERE id=$task) IS NOT NULL
+           THEN jobs.id=(SELECT job_id FROM interactive_tasks WHERE id=$task)
+         ELSE jobs.project_path=(SELECT project_path FROM interactive_tasks WHERE id=$task)
+       END
+   AND NOT EXISTS (
+     SELECT 1 FROM interactive_tasks t
+      WHERE t.run_id=$run_id
+        AND (t.job_id=jobs.id OR (t.job_id IS NULL AND t.project_path=jobs.project_path))
+        AND t.status IN ('discovered','requested','started')
+   );
+INSERT INTO events (run_id, job_id, ts, level, message)
+VALUES ($run_id, (SELECT job_id FROM interactive_tasks WHERE id=$task), '$now_e',
+        '$([ "$status" = "done" ] && echo success || echo warn)',
+        '$(mtnc_sql_escape "Interactive task #${task} ${status}.")');
+SQL
+
+  # Graduate a *parked* run whose queues have now both drained. Only a parked run
+  # is graduated here: while a session is attached the orchestrator owns the
+  # finish, because it is the one holding the roll-up summary. Mirrors the
+  # followup graduation in cmd_update_followup.
+  local run_completed="false" run_status pending open_tasks open_fups
+  run_status="$(db_exec <<SQL
+SELECT status FROM runs WHERE id=$run_id;
+SQL
+)"
+  if [ "$run_status" = "awaiting_interactive" ]; then
+    pending="$(db_exec <<SQL
+SELECT COUNT(*) FROM jobs WHERE run_id=$run_id AND status IN ('pending','running','awaiting_interactive');
+SQL
+)"
+    open_tasks="$(db_exec <<SQL
+SELECT COUNT(*) FROM interactive_tasks
+ WHERE run_id=$run_id AND status IN ('discovered','requested','started');
+SQL
+)"
+    if [ "${pending:-1}" = "0" ] && [ "${open_tasks:-1}" = "0" ]; then
+      open_fups="$(db_exec <<SQL
+SELECT COUNT(*) FROM followups WHERE run_id=$run_id AND status='open';
+SQL
+)"
+      local final="completed"
+      [ "${open_fups:-0}" != "0" ] && final="needs_followup"
+      db_exec <<SQL
+UPDATE runs SET status='$final', finished_at='$now_e', stage='done' WHERE id=$run_id;
+INSERT INTO events (run_id, ts, level, message)
+VALUES ($run_id, '$now_e', 'success',
+        '$(mtnc_sql_escape "Both queues drained; run marked ${final}.")');
+SQL
+      run_completed="true"
+    fi
+  fi
+
+  db_exec <<SQL
+SELECT json_object(
+  'task', $task,
+  'status', (SELECT status FROM interactive_tasks WHERE id=$task),
+  'run_id', $run_id,
+  'open_interactive', (SELECT COUNT(*) FROM interactive_tasks
+                        WHERE run_id=$run_id AND status IN ('discovered','requested','started')),
+  'run_status', (SELECT status FROM runs WHERE id=$run_id),
+  'run_finished', json('$run_completed')
+);
+SQL
+}
+
+# Return every 'started' task of a run to 'requested' so a resuming session
+# re-dispatches it.
+#
+# Without this a task is strandable beyond recovery. The orchestrator marks a
+# task 'started' *before* dispatching, so if that session dies — or the run parks
+# with a subagent still working — nothing can pick the task up again: `next-work`
+# only selects 'requested', `request-interactive` is a no-op past 'discovered',
+# and the app offers a Start button only for 'discovered'. A resume would find no
+# requested task and no pending job, sit idle forever, and park again on every
+# attempt.
+#
+# Safe precisely because it runs at attach time: a subagent from a previous
+# session cannot still be alive, so there is nothing to double-dispatch. Never
+# call it against a run with a live session.
+cmd_reset_interactive() {
+  local run=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --run) run="$2"; shift 2 ;;
+      *) die "reset-interactive: unknown option: $1" 2 ;;
+    esac
+  done
+  [ -n "$run" ] || die "reset-interactive: --run is required"
+  require_int --run "$run"
+
+  local now_e n
+  now_e="$(mtnc_sql_escape "$(mtnc_now)")"
+  n="$(db_exec <<SQL
+SELECT COUNT(*) FROM interactive_tasks WHERE run_id=$run AND status='started';
+SQL
+)"
+  if [ "${n:-0}" != "0" ]; then
+    db_exec <<SQL
+UPDATE interactive_tasks
+   SET status='requested', started_at=NULL,
+       start_requested_at=COALESCE(start_requested_at, '$now_e')
+ WHERE run_id=$run AND status='started';
+INSERT INTO events (run_id, ts, level, message)
+VALUES ($run, '$now_e', 'info',
+        '$(mtnc_sql_escape "Re-queued ${n} interactive task(s) left mid-flight by an earlier session.")');
+SQL
+  fi
+  printf '{"run_id":%s,"requeued":%s}\n' "$run" "${n:-0}"
+}
+
+cmd_list_interactive() {
+  local run="" status=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --run)    run="$2";    shift 2 ;;
+      --status) status="$2"; shift 2 ;;
+      *) die "list-interactive: unknown option: $1" 2 ;;
+    esac
+  done
+  local where=""
+  if [ -n "$run" ]; then
+    require_int --run "$run"
+    where="WHERE run_id=$run"
+  fi
+  if [ -n "$status" ]; then
+    local status_e
+    status_e="$(mtnc_sql_escape "$status")"
+    if [ -n "$where" ]; then where="$where AND status='$status_e'"; else where="WHERE status='$status_e'"; fi
+  fi
+
+  db_exec <<SQL
+SELECT json_object(
+  'task', id, 'run_id', run_id, 'job_id', job_id,
+  'project_path', project_path, 'project_name', project_name,
+  'skill_name', skill_name, 'title', title, 'priority', priority,
+  'status', status, 'start_requested_at', start_requested_at,
+  'started_at', started_at, 'finished_at', finished_at,
+  'summary', summary, 'error', error
+) FROM interactive_tasks $where ORDER BY run_id DESC, priority ASC, id ASC;
+SQL
+}
+
+# The orchestrator's queue oracle: what should the sweep do next, right now?
+#
+# It answers from the database on every call rather than from a list built at
+# discovery time, which is what lets an interactive task inject work that gets
+# picked up *after* the automated queue has otherwise drained.
+#
+# Requested interactive tasks are checked first so a Start click is acted on at
+# the next turn of the loop rather than behind the remaining automated backlog.
+cmd_next_work() {
+  local run=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --run) run="$2"; shift 2 ;;
+      *) die "next-work: unknown option: $1" 2 ;;
+    esac
+  done
+  [ -n "$run" ] || die "next-work: --run is required"
+  require_int --run "$run"
+
+  db_exec <<SQL
+SELECT COALESCE(
+  (SELECT json_object(
+     'kind', 'interactive_start', 'task', id, 'run_id', run_id, 'job_id', job_id,
+     'project_path', project_path, 'project_name', project_name,
+     'skill_name', skill_name, 'title', title)
+     FROM interactive_tasks
+    WHERE run_id=$run AND status='requested'
+    ORDER BY priority ASC, id ASC LIMIT 1),
+  (SELECT json_object(
+     'kind', 'job', 'job', id, 'run_id', run_id,
+     'project_path', project_path, 'project_name', project_name,
+     'skill_name', skill_name, 'origin', origin, 'source_task', source_task_id)
+     FROM jobs
+    WHERE run_id=$run AND status='pending'
+    ORDER BY id ASC LIMIT 1),
+  (SELECT json_object(
+     'kind', 'idle',
+     'pending_jobs', (SELECT COUNT(*) FROM jobs WHERE run_id=$run AND status IN ('pending','running','awaiting_interactive')),
+     'open_interactive', COUNT(*))
+     FROM interactive_tasks
+    WHERE run_id=$run AND status IN ('discovered','requested','started')
+   HAVING COUNT(*) > 0),
+  (SELECT json_object(
+     'kind', 'idle', 'pending_jobs', COUNT(*), 'open_interactive', 0)
+     FROM jobs
+    WHERE run_id=$run AND status IN ('running','awaiting_interactive')
+   HAVING COUNT(*) > 0),
+  json_object('kind', 'drained')
+);
+SQL
+}
+
+# Block until there is something to do, or until the timeout expires.
+#
+# The default 480s window sits deliberately under Claude Code's 10-minute Bash
+# ceiling, so a wait always returns an answer instead of being killed and
+# mistaken for a hang — the exact failure this whole feature exists to remove.
+# Returns the next-work payload either way: the caller loops.
+cmd_wait_for_work() {
+  local run="" timeout=480 interval=5
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --run)      run="$2";      shift 2 ;;
+      --timeout)  timeout="$2";  shift 2 ;;
+      --interval) interval="$2"; shift 2 ;;
+      *) die "wait-for-work: unknown option: $1" 2 ;;
+    esac
+  done
+  [ -n "$run" ] || die "wait-for-work: --run is required"
+  require_int --run "$run"
+  require_int --timeout "$timeout"
+  require_int --interval "$interval"
+  [ "$interval" -ge 1 ] || interval=1
+
+  local waited=0 payload kind
+  while :; do
+    payload="$(cmd_next_work --run "$run")"
+    kind="$(printf '%s' "$payload" | sed -n 's/.*"kind":"\([a-z_]*\)".*/\1/p')"
+    if [ "$kind" != "idle" ]; then
+      printf '%s\n' "$payload"
+      return 0
+    fi
+    [ "$waited" -ge "$timeout" ] && break
+    sleep "$interval"
+    waited=$((waited + interval))
+  done
+  printf '%s\n' "$payload"
+}
+
+# Park a run that has run out of automated work but still owes interactive work.
+#
+# This is NOT a finish: finished_at stays NULL and the status says so. The run is
+# waiting on a human, who may be minutes or hours away, and a later session
+# re-attaches with `/zed:maintenance <tag> --resume` to drain the rest.
+cmd_park_run() {
+  local run="" summary="" summary_file="" have_summary=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --run)          run="$2";                     shift 2 ;;
+      --summary)      summary="$2"; have_summary=1; shift 2 ;;
+      --summary-file) summary_file="$2";            shift 2 ;;
+      *) die "park-run: unknown option: $1" 2 ;;
+    esac
+  done
+  [ -n "$run" ] || die "park-run: --run is required"
+  require_int --run "$run"
+  if [ -n "$summary_file" ]; then
+    summary="$(read_file "$summary_file")"
+    have_summary=1
+  fi
+  [ "$have_summary" -eq 1 ] && warn_if_blank_summary "run #$run" "$summary"
+
+  local now_e sets
+  now_e="$(mtnc_sql_escape "$(mtnc_now)")"
+  # finished_at is cleared, not merely left alone: parking is not a finish, and a
+  # run can reach this having previously been stamped (a graduated run that later
+  # gained work, or a second park after a resume). The invariant "a parked run
+  # has no finish time" then holds unconditionally rather than by luck.
+  sets="status='awaiting_interactive', stage='awaiting-interactive', finished_at=NULL"
+  [ "$have_summary" -eq 1 ] && sets="$sets, summary='$(mtnc_sql_escape "$summary")'"
+
+  db_exec <<SQL
+UPDATE runs SET $sets WHERE id=$run;
+INSERT INTO events (run_id, ts, level, message)
+VALUES ($run, '$now_e', 'info',
+        '$(mtnc_sql_escape "Automated queue drained; run parked awaiting interactive work.")');
+SELECT json_object(
+  'run_id', $run,
+  'status', (SELECT status FROM runs WHERE id=$run),
+  'open_interactive', (SELECT COUNT(*) FROM interactive_tasks
+                        WHERE run_id=$run AND status IN ('discovered','requested','started')),
+  'pending_jobs', (SELECT COUNT(*) FROM jobs WHERE run_id=$run AND status IN ('pending','running','awaiting_interactive'))
+);
+SQL
+}
+
+# Parked runs, newest first — how `--resume` finds the run to re-attach to.
+cmd_list_parked() {
+  local tag=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --tag) tag="$2"; shift 2 ;;
+      *) die "list-parked: unknown option: $1" 2 ;;
+    esac
+  done
+  local where="WHERE r.status='awaiting_interactive'"
+  if [ -n "$tag" ]; then
+    where="$where AND r.tag='$(mtnc_sql_escape "$tag")'"
+  fi
+
+  db_exec <<SQL
+SELECT json_object(
+  'run_id', r.id, 'tag', r.tag, 'mode', r.mode, 'stage', r.stage,
+  'started_at', r.started_at,
+  'pending_jobs', (SELECT COUNT(*) FROM jobs j
+                    WHERE j.run_id=r.id AND j.status IN ('pending','running','awaiting_interactive')),
+  'open_interactive', (SELECT COUNT(*) FROM interactive_tasks t
+                        WHERE t.run_id=r.id AND t.status IN ('discovered','requested','started'))
+) FROM runs r $where ORDER BY r.id DESC;
+SQL
 }
 
 # ---- GitHub triage --------------------------------------------------------
@@ -994,6 +1690,16 @@ case "$SUBCMD" in
   add-project-issue)   cmd_add_project_issue "$@" ;;
   add-project-issues)  cmd_add_project_issues "$@" ;;
   list-project-issues) cmd_list_project_issues "$@" ;;
+  add-interactive-task) cmd_add_interactive_task "$@" ;;
+  request-interactive)  cmd_request_interactive "$@" ;;
+  start-interactive)    cmd_start_interactive "$@" ;;
+  reset-interactive)    cmd_reset_interactive "$@" ;;
+  finish-interactive)   cmd_finish_interactive "$@" ;;
+  list-interactive)     cmd_list_interactive "$@" ;;
+  next-work)            cmd_next_work "$@" ;;
+  wait-for-work)        cmd_wait_for_work "$@" ;;
+  park-run)             cmd_park_run "$@" ;;
+  list-parked)          cmd_list_parked "$@" ;;
   *)
     printf 'Error: unknown subcommand: %s\n' "$SUBCMD" >&2
     usage
