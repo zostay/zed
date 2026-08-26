@@ -58,6 +58,11 @@
 #       Close the task. Also promotes that project's parked job ('done' ->
 #       success, 'abandoned' -> followup) and, if the run is parked and both
 #       queues have drained, graduates the run. Prints a JSON receipt.
+#   reset-interactive --run R
+#       Return every 'started' task of a run to 'requested' so a resuming session
+#       re-dispatches it. Run this at attach time only: a task is otherwise
+#       strandable, since next-work selects only 'requested', request-interactive
+#       no-ops past 'discovered', and the app offers Start only for 'discovered'.
 #   list-interactive [--run R] [--status S]
 #       Print interactive tasks as JSONL (newest run first, then priority).
 #   next-work --run R
@@ -158,6 +163,7 @@ Interactive queue:
                        [--priority N]
   request-interactive  --task T
   start-interactive    --task T
+  reset-interactive    --run R
   finish-interactive   --task T --status done|abandoned [--summary MD]
                        [--summary-file PATH] [--error MSG]
   list-interactive     [--run R] [--status S]
@@ -811,9 +817,12 @@ cmd_add_interactive_task() {
   [ -n "$title" ] || die "add-interactive-task: --title is required"
   require_int --run "$run"
   [ -n "$job" ] && require_int --job "$job"
-  case "$priority" in
-    ''|*[!0-9-]*) die "add-interactive-task: --priority must be an integer (got: '$priority')" 2 ;;
-  esac
+  # A glob class like *[!0-9-]* would accept a bare '-' and arithmetic such as
+  # '1-2', and the value is interpolated straight into the VALUES list — so
+  # '1-2' would be evaluated by SQLite and silently stored as -1. Match the
+  # exact shape instead.
+  printf '%s' "$priority" | grep -Eq '^-?[0-9]+$' \
+    || die "add-interactive-task: --priority must be an integer (got: '$priority')" 2
 
   local now path_e skill_e job_v
   now="$(mtnc_now)"
@@ -965,20 +974,53 @@ cmd_finish_interactive() {
   # now stands, 'abandoned' means a human consciously left work behind, which is
   # precisely what 'followup' records. A job that earned 'failure' is untouched —
   # its own status is the more informative one.
-  local promoted
-  if [ "$status" = "done" ]; then promoted="success"; else promoted="followup"; fi
-
+  #
+  # Two things this has to get right, both of which a naive version gets wrong:
+  #
+  #   * The target is found by `job_id` when the task carries one, falling back
+  #     to `project_path` only for a task registered without a job. Matching on
+  #     path alone means any difference between the two rows (a trailing slash, a
+  #     symlinked vs. raw path) silently promotes nothing — and since the job
+  #     then sits at 'awaiting_interactive' forever, the run looks drained.
+  #
+  #   * `abandoned` is **sticky** across a project's tasks. The status is derived
+  #     from every task of the project, not just this one, because promotion only
+  #     fires when the last one closes: with two tasks, abandoning A and then
+  #     finishing B would otherwise promote the job to 'success' and erase the
+  #     abandonment entirely.
+  # Close the task first, so the stickiness check below sees this task's own
+  # final status rather than the state it was in a moment ago.
   db_exec <<SQL
 UPDATE interactive_tasks SET $sets WHERE id=$task;
+SQL
+
+  local abandoned_any promoted
+  abandoned_any="$(db_exec <<SQL
+SELECT COUNT(*) FROM interactive_tasks t
+ WHERE t.run_id=$run_id
+   AND t.status='abandoned'
+   AND ( (SELECT job_id FROM interactive_tasks WHERE id=$task) IS NOT NULL
+         AND t.job_id=(SELECT job_id FROM interactive_tasks WHERE id=$task)
+       OR (SELECT job_id FROM interactive_tasks WHERE id=$task) IS NULL
+         AND t.project_path=(SELECT project_path FROM interactive_tasks WHERE id=$task) );
+SQL
+)"
+  if [ "${abandoned_any:-0}" = "0" ]; then promoted="success"; else promoted="followup"; fi
+
+  db_exec <<SQL
 UPDATE jobs
    SET status='$promoted'
  WHERE run_id=$run_id
    AND status='awaiting_interactive'
-   AND project_path=(SELECT project_path FROM interactive_tasks WHERE id=$task)
+   AND CASE
+         WHEN (SELECT job_id FROM interactive_tasks WHERE id=$task) IS NOT NULL
+           THEN jobs.id=(SELECT job_id FROM interactive_tasks WHERE id=$task)
+         ELSE jobs.project_path=(SELECT project_path FROM interactive_tasks WHERE id=$task)
+       END
    AND NOT EXISTS (
      SELECT 1 FROM interactive_tasks t
       WHERE t.run_id=$run_id
-        AND t.project_path=jobs.project_path
+        AND (t.job_id=jobs.id OR (t.job_id IS NULL AND t.project_path=jobs.project_path))
         AND t.status IN ('discovered','requested','started')
    );
 INSERT INTO events (run_id, job_id, ts, level, message)
@@ -998,7 +1040,7 @@ SQL
 )"
   if [ "$run_status" = "awaiting_interactive" ]; then
     pending="$(db_exec <<SQL
-SELECT COUNT(*) FROM jobs WHERE run_id=$run_id AND status IN ('pending','running');
+SELECT COUNT(*) FROM jobs WHERE run_id=$run_id AND status IN ('pending','running','awaiting_interactive');
 SQL
 )"
     open_tasks="$(db_exec <<SQL
@@ -1034,6 +1076,51 @@ SELECT json_object(
   'run_finished', json('$run_completed')
 );
 SQL
+}
+
+# Return every 'started' task of a run to 'requested' so a resuming session
+# re-dispatches it.
+#
+# Without this a task is strandable beyond recovery. The orchestrator marks a
+# task 'started' *before* dispatching, so if that session dies — or the run parks
+# with a subagent still working — nothing can pick the task up again: `next-work`
+# only selects 'requested', `request-interactive` is a no-op past 'discovered',
+# and the app offers a Start button only for 'discovered'. A resume would find no
+# requested task and no pending job, sit idle forever, and park again on every
+# attempt.
+#
+# Safe precisely because it runs at attach time: a subagent from a previous
+# session cannot still be alive, so there is nothing to double-dispatch. Never
+# call it against a run with a live session.
+cmd_reset_interactive() {
+  local run=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --run) run="$2"; shift 2 ;;
+      *) die "reset-interactive: unknown option: $1" 2 ;;
+    esac
+  done
+  [ -n "$run" ] || die "reset-interactive: --run is required"
+  require_int --run "$run"
+
+  local now_e n
+  now_e="$(mtnc_sql_escape "$(mtnc_now)")"
+  n="$(db_exec <<SQL
+SELECT COUNT(*) FROM interactive_tasks WHERE run_id=$run AND status='started';
+SQL
+)"
+  if [ "${n:-0}" != "0" ]; then
+    db_exec <<SQL
+UPDATE interactive_tasks
+   SET status='requested', started_at=NULL,
+       start_requested_at=COALESCE(start_requested_at, '$now_e')
+ WHERE run_id=$run AND status='started';
+INSERT INTO events (run_id, ts, level, message)
+VALUES ($run, '$now_e', 'info',
+        '$(mtnc_sql_escape "Re-queued ${n} interactive task(s) left mid-flight by an earlier session.")');
+SQL
+  fi
+  printf '{"run_id":%s,"requeued":%s}\n' "$run" "${n:-0}"
 }
 
 cmd_list_interactive() {
@@ -1105,7 +1192,7 @@ SELECT COALESCE(
     ORDER BY id ASC LIMIT 1),
   (SELECT json_object(
      'kind', 'idle',
-     'pending_jobs', (SELECT COUNT(*) FROM jobs WHERE run_id=$run AND status IN ('pending','running')),
+     'pending_jobs', (SELECT COUNT(*) FROM jobs WHERE run_id=$run AND status IN ('pending','running','awaiting_interactive')),
      'open_interactive', COUNT(*))
      FROM interactive_tasks
     WHERE run_id=$run AND status IN ('discovered','requested','started')
@@ -1113,7 +1200,7 @@ SELECT COALESCE(
   (SELECT json_object(
      'kind', 'idle', 'pending_jobs', COUNT(*), 'open_interactive', 0)
      FROM jobs
-    WHERE run_id=$run AND status='running'
+    WHERE run_id=$run AND status IN ('running','awaiting_interactive')
    HAVING COUNT(*) > 0),
   json_object('kind', 'drained')
 );
@@ -1182,7 +1269,11 @@ cmd_park_run() {
 
   local now_e sets
   now_e="$(mtnc_sql_escape "$(mtnc_now)")"
-  sets="status='awaiting_interactive', stage='awaiting-interactive'"
+  # finished_at is cleared, not merely left alone: parking is not a finish, and a
+  # run can reach this having previously been stamped (a graduated run that later
+  # gained work, or a second park after a resume). The invariant "a parked run
+  # has no finish time" then holds unconditionally rather than by luck.
+  sets="status='awaiting_interactive', stage='awaiting-interactive', finished_at=NULL"
   [ "$have_summary" -eq 1 ] && sets="$sets, summary='$(mtnc_sql_escape "$summary")'"
 
   db_exec <<SQL
@@ -1195,7 +1286,7 @@ SELECT json_object(
   'status', (SELECT status FROM runs WHERE id=$run),
   'open_interactive', (SELECT COUNT(*) FROM interactive_tasks
                         WHERE run_id=$run AND status IN ('discovered','requested','started')),
-  'pending_jobs', (SELECT COUNT(*) FROM jobs WHERE run_id=$run AND status IN ('pending','running'))
+  'pending_jobs', (SELECT COUNT(*) FROM jobs WHERE run_id=$run AND status IN ('pending','running','awaiting_interactive'))
 );
 SQL
 }
@@ -1219,7 +1310,7 @@ SELECT json_object(
   'run_id', r.id, 'tag', r.tag, 'mode', r.mode, 'stage', r.stage,
   'started_at', r.started_at,
   'pending_jobs', (SELECT COUNT(*) FROM jobs j
-                    WHERE j.run_id=r.id AND j.status IN ('pending','running')),
+                    WHERE j.run_id=r.id AND j.status IN ('pending','running','awaiting_interactive')),
   'open_interactive', (SELECT COUNT(*) FROM interactive_tasks t
                         WHERE t.run_id=r.id AND t.status IN ('discovered','requested','started'))
 ) FROM runs r $where ORDER BY r.id DESC;
@@ -1602,6 +1693,7 @@ case "$SUBCMD" in
   add-interactive-task) cmd_add_interactive_task "$@" ;;
   request-interactive)  cmd_request_interactive "$@" ;;
   start-interactive)    cmd_start_interactive "$@" ;;
+  reset-interactive)    cmd_reset_interactive "$@" ;;
   finish-interactive)   cmd_finish_interactive "$@" ;;
   list-interactive)     cmd_list_interactive "$@" ;;
   next-work)            cmd_next_work "$@" ;;
