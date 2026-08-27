@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Documentation is now written for a stranger, not for the maintainer.** This
+  plugin is published and installable by anyone, but it is developed by
+  dogfooding it against the maintainer's own machine, and that had leaked
+  steadily into everything public: the changelog, the `maintenance` skill, and a
+  design spec named private repositories, quoted findings from real sweeps,
+  referenced runs by number from a local database, and addressed the operator by
+  name. That is both a disclosure of private detail and meaningless to a reader
+  who has never seen that database.
+  - `CHANGELOG.md`, `skills/maintenance/SKILL.md`, `specs/`, and a stray CSS
+    comment are reframed: real repository names become neutral placeholders,
+    run numbers become descriptions of the failure, and the operator is "you"
+    or "the operator" rather than a named individual. The worked examples that
+    justify each rule are kept — they are what makes the rules land — but
+    anonymized.
+  - New `CLAUDE.md` states the rule for future work: every committed or
+    published artifact (changelog, README, skills, code comments, issues, pull
+    requests, review comments, commit messages) is written for a public
+    audience and checked for private detail before it lands. Keep the mechanism
+    of a real failure; drop the identifiers.
+
 ## 0.13.0 — 2026-08-26
 
 ### Added
@@ -9,19 +33,19 @@
   human blocked inside a subagent's Bash call, competed with the 10-minute
   ceiling, and — when it lost — was indistinguishable from a hang.
 
-  Run #20 is the worked example. `openscripture.today`'s weekly pipeline reached
-  an image picker that correctly waits forever for a human. The sweep ran it in
-  the foreground, hit the ceiling, restarted the whole pipeline from scratch
-  (fresh references, a second round of paid API calls, a second picker), then ten
-  minutes later concluded "no human present" and SIGTERM'd it. Sterling *was*
-  present — he had paused mid-pick to file a bug about the suggestions. The kill
-  fired an `EXIT` trap that deleted exactly the state a resume needed. The
-  pipeline started twice, completed zero times, and the week's content did not
-  ship. Run #16 shared the root cause.
+  The worked example: a project whose weekly pipeline opens a picker and waits —
+  correctly, with no timeout — for a person to approve a batch of images. The
+  sweep ran it in the foreground, hit the ceiling, restarted the whole pipeline
+  from scratch (fresh inputs, a second round of paid API calls, a second picker),
+  then ten minutes later concluded "no human present" and SIGTERM'd it. Someone
+  *was* present; they had paused mid-task. The picker's status endpoint reported
+  zero approvals, which was true and said nothing about presence. The kill fired
+  an `EXIT` trap that deleted exactly the state a resume needed. The pipeline
+  started twice, completed zero times, and that week's output did not ship.
 
-  The fix is not to make the human less blocking, and not to remove them: image
-  selection cannot be automated (rejection rates run 10%–90% with very high
-  variance), so the judgement gate is load-bearing and stays. Instead there are
+  The fix is not to make the human less blocking, and not to remove them: a
+  judgement gate like image selection cannot be automated when acceptance rates
+  swing wildly between batches, so it is load-bearing and stays. Instead there are
   now two queues — an **automated** one that proceeds unattended exactly as
   before, and an **interactive** one the human starts and paces themselves, in
   parallel, never blocking the automated half.
@@ -163,9 +187,9 @@
 ### Changed
 
 - `maintenance`, `maint-followup`, `maint-followup-do`: **followup tickets are
-  now deliberately scarce.** Run #11 opened ten tickets where roughly one was
-  warranted, so Step 5 now runs a three-way disposition — **punt → GitHub issue
-  → ticket** — with the real run #11 tickets quoted as worked examples:
+  now deliberately scarce.** A single sweep was observed opening ten tickets
+  where roughly one was warranted, so Step 5 now runs a three-way disposition —
+  **punt → GitHub issue → ticket** — with worked examples of each:
   - **Punt** anything next week's routine picks up on its own, unless it is
     urgent (harm accrues first) or blocks the sweep from functioning.
   - **File a GitHub issue** for anything describing a bug, misconfiguration, or
@@ -283,7 +307,7 @@
   project. This retires the per-project `requiresAuthorization` opt-in gate and the
   per-(tag, project) grant + TTL + one-time-consume machinery, which were fragile:
   on a long serial sweep an up-front grant could expire before the run reached the
-  last privileged project, silently skipping it (run #6). A deliberate trade-off —
+  last privileged project, silently skipping it. A deliberate trade-off —
   less granular containment for a far simpler, more robust model.
   - `maintenance-authorize.sh` now manages a **single whole-sweep grant per tag**
     (`sweep__<tag>.json`). Subcommands reduced to `grant`/`check`/`revoke`/`list`/
@@ -319,7 +343,7 @@
   time. Merging interdependent PRs individually re-conflicts every remaining open
   PR after each merge, forcing a `@dependabot rebase` + full CI wait per PR — an
   O(N) conflict/rebase/CI cascade that dominated sweep wall-clock in multi-module
-  repos (gobert, arrest-go) and blew authorization-grant TTLs mid-run.
+  repositories and blew authorization-grant TTLs mid-run.
   - `dependabot-merge` now **combines all ready PRs onto a single integration
     branch** and merges once: one CI run, one merge. A lone ready PR still merges
     directly; a PR that conflicts when folded in is **punted** (silent skip, left

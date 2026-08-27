@@ -61,9 +61,9 @@ A sweep has **two** queues, and they are not the same kind of thing.
 
 - The **automated queue** is the jobs. It proceeds unattended, exactly as it
   always has.
-- The **interactive queue** is work that needs Sterling — approving photos,
-  okaying a rollout, reading something before it ships. He starts each task from
-  the observability app and works it **at his own pace, in parallel**, without
+- The **interactive queue** is work that needs **you** — approving photos,
+  okaying a rollout, reading something before it ships. You start each task from
+  the observability app and work it **at your own pace, in parallel**, without
   ever blocking the automated queue.
 
 The rule that makes this work, and the one every other rule here serves:
@@ -72,19 +72,19 @@ The rule that makes this work, and the one every other rule here serves:
 > normal condition, not a fault. Never infer absence from elapsed time. Never
 > kill a task that is waiting on a person.**
 
-This exists because of a real failure. In run #20 a project's weekly pipeline
+This exists because of a real failure. A project's weekly pipeline
 reached an image picker that correctly waits forever for a human. The sweep ran
 it in the foreground, hit the 10-minute Bash ceiling, restarted the whole
 pipeline from scratch (fresh inputs, a second round of paid API calls, a second
 picker), then ten minutes later concluded "no human present" and killed it.
-Sterling *was* present — he had paused mid-pick to file a bug about the
+The person *was* present — they had paused mid-task to file a bug about the
 suggestions. The kill fired an `EXIT` trap that deleted the state a resume would
 have needed. The pipeline started twice, completed zero times, and that week's
 content did not ship.
 
 Image selection cannot be automated: rejection rates run 10%–90% with very high
 variance, so the human judgement gate is load-bearing and stays. As maintenance
-grows, **more** tasks will need him, not fewer. The answer is not to make the
+grows, **more** tasks will need a person, not fewer. The answer is not to make the
 human less blocking or to route around them — it is to give them their own queue.
 
 Three consequences that shape the steps below:
@@ -295,7 +295,7 @@ TASK_ID=$("${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" \
 ```
 
 Registering a task does **not** start it — it puts a Start button in front of
-Sterling in the app, which he presses when he is ready. Do not dispatch it here.
+you in the app, which you press when you are ready. Do not dispatch it here.
 
 Keep an ordered list of `(JOB_ID, project_path, project_name, skill_name,
 priority)` and, separately, of the interactive tasks you registered. Log how many
@@ -381,7 +381,7 @@ drained — so ask the database what to do next, every time:
 
 It prints exactly one JSON object. Act on its `kind`, then loop:
 
-- **`interactive_start`** — Sterling pressed Start. Mark it started, **dispatch
+- **`interactive_start`** — the operator pressed Start. Mark it started, **dispatch
   its subagent, and immediately continue the loop.** Do not wait for it; running
   in parallel with the automated queue is the entire point.
   ```bash
@@ -400,7 +400,7 @@ It prints exactly one JSON object. Act on its `kind`, then loop:
   queued (e.g. `maintenance-weekly-publish`). Re-running `maintenance-<tag>`
   there would repeat the project's whole sweep — a second dependency pass, a
   second round of paid API calls, a second triage — which is precisely the
-  duplicate-work failure of run #20.
+  duplicate-work failure described under **Two queues** above.
 - **`idle`** — nothing is runnable right now. Look at `open_interactive` before
   deciding what that means:
   - **`open_interactive` > 0** — a human owes the run something. Wait:
@@ -412,7 +412,7 @@ It prints exactly one JSON object. Act on its `kind`, then loop:
     an explicit timeout an 8-minute wait is killed at two minutes and reads as a
     hang. After **two** consecutive idle windows, stop waiting and **park** the
     run (Step 6). Parking is not giving up and it is not a failure — it hands
-    the run back to Sterling's own pace and lets a later session finish it.
+    the run back to the operator's own pace and lets a later session finish it.
   - **`open_interactive` == 0** — nobody is pending; `pending_jobs` counts work
     that is `running` or stuck at `awaiting_interactive`. Do **not** park: there
     is no human to wait for. Reconcile instead — finish any job whose subagent
@@ -546,7 +546,7 @@ subagent does the project work and logs its own progress events.
    used to be excluded here; they are now recorded deliberately, with
    `--origin created`, so the app can badge them **NEW** — see *"Then record it
    — on every tag"* in sub-step 5, which is where that recording happens. An
-   issue the sweep opened is precisely work Sterling has not seen — burying it
+   issue the sweep opened is precisely work the operator has not seen — burying it
    in summary prose was the gap this replaces.
 
    **d. Rank what survives and keep at most 5.** `rank` is 0..100 and **lower
@@ -563,8 +563,8 @@ subagent does the project work and logs its own progress events.
    **e. Record them in one batch.** Build a JSONL file — one compact JSON object
    per line, at most five lines:
    ```json
-   {"kind":"pr","number":850,"title":"Bump mysql 9.7.1 to 26.7.0","url":"https://github.com/zostay/gobert/pull/850","state":"open","author":"zostay","labels":"database","age_days":23,"triage":"Green but a major jump; needs a go/no-go from you.","rank":10,"updated_at":"2026-08-02T14:05:00Z"}
-   {"kind":"issue","number":31,"title":"Import drops trailing whitespace","url":"https://github.com/zostay/gobert/issues/31","state":"open","author":"someone","labels":"bug","age_days":61,"triage":"Reproducible; fix is small but unowned.","rank":30,"updated_at":"2026-07-19T09:12:00Z"}
+   {"kind":"pr","number":850,"title":"Bump the database driver 9.7.1 to 26.7.0","url":"https://github.com/example-org/example-app/pull/850","state":"open","author":"someone","labels":"database","age_days":23,"triage":"Green but a major jump; needs a go/no-go from you.","rank":10,"updated_at":"2026-08-02T14:05:00Z"}
+   {"kind":"issue","number":31,"title":"Import drops trailing whitespace","url":"https://github.com/example-org/example-app/issues/31","state":"open","author":"someone","labels":"bug","age_days":61,"triage":"Reproducible; fix is small but unowned.","rank":30,"updated_at":"2026-07-19T09:12:00Z"}
    ```
    Write it with the **Write tool** to a path of your own (e.g.
    `/tmp/triage-<project_name>.jsonl`), not with a shell heredoc — the JSON is
@@ -626,7 +626,7 @@ subagent does the project work and logs its own progress events.
    - `success` — the project's maintenance completed cleanly with nothing left
      for a human to do.
    - **`followup`** — the project at least **partially** succeeded but left work
-     that needs **Sterling personally**, i.e. work you opened a ticket for under
+     that needs **the operator personally**, i.e. work you opened a ticket for under
      sub-step 5. Leftovers that were punted to next week's run, or filed as a
      GitHub issue on the project, do **not** make a job `followup` — they are
      ordinary sweep output and belong in the summary prose of a `success` job.
@@ -635,7 +635,7 @@ subagent does the project work and logs its own progress events.
      broken lint, a migration-ordering bug — is a defect and goes to the
      project's **issue tracker** (sub-step 5), not to a ticket. Open a ticket
      only if the failure additionally means the sweep itself cannot function
-     until Sterling personally acts before the next run.
+     until the operator personally acts before the next run.
    - `skipped` — there was nothing to do.
    - **`awaiting_interactive`** — the automated half is done, but this project
      has an interactive task that is unstarted or unfinished, so the job may not
@@ -648,9 +648,9 @@ subagent does the project work and logs its own progress events.
    Log a closing event for the job and append the result to your action log.
 5. **Followups — the default is _not_ to file.** A followup ticket is not a
    general issue tracker and not a to-do list. It means one thing: *the weekly
-   maintenance routine needs Sterling personally, before the next run.* Run #11
-   opened ten tickets and should have opened roughly one; the rules below exist
-   to stop that from recurring, so apply them literally.
+   maintenance routine needs the operator personally, before the next run.* A real
+   sweep once opened ten tickets where roughly one was warranted; the rules below
+   exist to stop that from recurring, so apply them literally.
 
    For each outstanding item this project left behind, pick exactly one of three
    dispositions, and prefer them in this order: **punt → GitHub issue → ticket.**
@@ -660,15 +660,16 @@ subagent does the project work and logs its own progress events.
    nothing at all. The only exceptions are items that are genuinely **urgent**
    (harm accrues before the next run — an actively exploited vulnerability, a
    broken production deploy, data at risk) or **important** (it blocks the sweep
-   itself from functioning). Real run #11 tickets that should have been punted:
-   - *"Rebase/land the 3 open aws-sdk-go-v2 PRs"* — next week's sweep rebases them.
-   - *"Verify the fontawesome PRs went green after rebase"* — next week re-verifies.
-   - *"Decide how to resolve unfixable imaging alert #4"* — no deadline, blocks
-     nothing; it will be in front of him again in seven days.
-   - *"Decide on held PR #850 — mysql 9.7.1 to 26.7.0"* — a version-bump go/no-go
+   itself from functioning). Real tickets that should have been punted:
+   - *"Rebase/land the 3 open PRs for one dependency"* — next week's sweep rebases
+     them.
+   - *"Verify those PRs went green after rebase"* — next week re-verifies.
+   - *"Decide how to resolve an unfixable vulnerability alert"* — no deadline, blocks
+     nothing; it will be in front of the operator again in seven days.
+   - *"Decide on a held PR jumping a major version"* — a version-bump go/no-go
      has no deadline and the sweep works fine without it. Yes, it is a decision
-     only he can make; that is not sufficient. Punt it, mention it in the job
-     summary, and let the weekly GitHub triage table put it back in front of him
+     only they can make; that is not sufficient. Punt it, mention it in the job
+     summary, and let the weekly GitHub triage table put it back in front of them
      (or file a GitHub issue if the hold needs a written rationale). Never a
      ticket.
 
@@ -697,13 +698,13 @@ subagent does the project work and logs its own progress events.
    Both verbs carry standing allow rules, so they run bare in an unattended
    sweep — but do not assume it: if either comes back **permission-denied**,
    the finding is **not** downgraded to a followup ticket. Report it to
-   Sterling in your final roll-up message, exactly as for a project with no
+   the operator in your final roll-up message, exactly as for a project with no
    GitHub remote. Whichever way it was filed, don't file it twice, and put the
    resulting issue URL in the job summary.
 
    **Then record it — on every tag, not just `weekly`.** An issue the sweep
-   opened is work it *created for Sterling*, and a line of prose in a job
-   summary is not a signal he will see. Immediately after `gh issue create`
+   opened is work it *created for the operator*, and a line of prose in a job
+   summary is not a signal they will see. Immediately after `gh issue create`
    succeeds, in the same breath, record the issue with `--origin created`:
    ```bash
    export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "<DB_SCRIPT>" add-project-issue --run <RUN_ID> --job <JOB_ID> --project "<project_name>" --repo "<owner/repo>" --origin created --kind issue --number <n> --title "<issue title>" --url "<the https:// url gh printed>" --state open --age-days 0 --rank 20 --triage "<why this run filed it, one sentence>"
@@ -724,7 +725,7 @@ subagent does the project work and logs its own progress events.
 
    `--triage` here answers "why did the sweep open this?", not "why does it
    deserve attention" — e.g. *"Filed because `npm run build` fails on the pinned
-   vue-tsc; the sweep could not complete the frontend check."* Keep `--rank`
+   a pinned build tool; the sweep could not complete the frontend check."* Keep `--rank`
    low enough that the item reads as live (10–30 suits something the sweep hit
    head-on); the app sorts run-filed items ahead of the backlog regardless.
 
@@ -732,7 +733,7 @@ subagent does the project work and logs its own progress events.
    and named in the job summary, which is still the durable record. Never fail a
    job over a missing triage row.
 
-   Real run #11 tickets that should have been GitHub issues:
+   Real tickets that should have been GitHub issues:
    - *"Dockerfile base image drifting: alpine not covered by Dependabot"* — a
      defect in the project's Dependabot config.
    - *"Add a gomod Dependabot entry for gin/examples/polymorphic"* — same.
@@ -742,17 +743,17 @@ subagent does the project work and logs its own progress events.
      field, i.e. a defect.
 
    If the project has **no** GitHub remote (`gh repo view` fails), report the
-   finding to Sterling in your final roll-up message instead — still never as a
+   finding to the operator in your final roll-up message instead — still never as a
    followup ticket.
 
-   **Followup ticket (rare).** Reserve tickets for work only Sterling can do, that
+   **Followup ticket (rare).** Reserve tickets for work only the operator can do, that
    cannot wait for the next run:
-   - a **decision only he can make** without which the sweep **itself cannot
+   - a **decision only they can make** without which the sweep **itself cannot
      function** next week — not merely: one PR was left unmerged, one alert left
      unresolved, one version bump left undecided. That is punt.
-   - a **credential / access / 2FA step** only he can perform,
-   - a **manual deploy or rollout he must approve**,
-   - something **he explicitly asked to be told about**,
+   - a **credential / access / 2FA step** only they can perform,
+   - a **manual deploy or rollout they must approve**,
+   - something **the operator explicitly asked to be told about**,
    - a hard `failure` that stops the sweep itself from working until a human
      chases it (the underlying defect still goes to the issue tracker).
 
@@ -778,7 +779,7 @@ subagent does the project work and logs its own progress events.
 
    Note that a sweep is the **only** thing that ever opens a followup ticket:
    `/zed:maint-followup` and `/zed:maint-followup-do` are forbidden from filing
-   new ones (they file GitHub issues or report to Sterling instead). So do not
+   new ones (they file GitHub issues or report to the operator instead). So do not
    decline to file something on the assumption that a later session will file it —
    punt it deliberately, or file the GitHub issue yourself now.
 
@@ -830,7 +831,8 @@ literal `null` fails `require_int` and exits 2 on *every* progress log, leaving
 that task invisible in the live view for its whole run.
 
 The rules — they are the whole
-point of the interactive queue, and every one of them is a lesson from run #20:
+point of the interactive queue, and every one is a lesson from the failure
+described under **Two queues** above:
 
 - **Run the blocking command in the background and poll it.** Use the Bash tool's
   `run_in_background`, never the foreground. A picker that waits for a human will
@@ -838,17 +840,17 @@ point of the interactive queue, and every one of them is a lesson from run #20:
   ceiling looks exactly like a hang.
 - **Never infer that the human is absent from elapsed time.** No timeout means
   "nobody is there". A `/status` endpoint reporting zero progress is telling you
-  about *progress*, not *presence* — in run #20 it said `approved_count: 0` while
-  Sterling sat in front of it, having paused to file a bug.
+  about *progress*, not *presence* — in the failure above it reported zero
+  approvals while the operator sat in front of it, having paused to file a bug.
 - **Never SIGTERM, `kill`, or otherwise terminate a task that is waiting on a
   person.** If it looks idle, escalate attention instead: refocus the browser tab
-  (`open <url>`), then an OS notification, then a bell. If he is genuinely away,
+  (`open <url>`), then an OS notification, then a bell. If they are genuinely away,
   the task simply stays open in the interactive queue. That is a correct outcome.
 - **A stopped or timed-out command is a liveness question, not a failure.**
   Establish where the run actually got to before doing anything. A full restart
   is almost never the right recovery, and against a non-idempotent script it is
-  destructive — in run #20 it burned a second round of paid API calls and threw
-  away the first picker session.
+  destructive — in the failure above it burned a second round of paid API calls
+  and threw away the first picker session.
 - **Hand the trailing automated stage back to the automated queue** rather than
   doing it inline, so it is recorded, ordered, and resumable like any other job.
   **Do this before closing the task, always** — the order is load-bearing, not
@@ -864,8 +866,8 @@ point of the interactive queue, and every one of them is a lesson from run #20:
   ```bash
   export PATH="/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"; "<DB_SCRIPT>" finish-interactive --task <task> --status done --summary "<what was decided>"
   ```
-  Use `--status abandoned` (with `--error`) only when Sterling has actually said
-  he is leaving it — never as a stand-in for "I waited a while and nothing
+  Use `--status abandoned` (with `--error`) only when the operator has actually
+  said they are leaving it — never as a stand-in for "I waited a while and nothing
   happened". `finish-interactive` promotes the project's parked job on its own
   (`done` → `success`, `abandoned` → `followup`); you do not re-finish it.
 
@@ -885,8 +887,8 @@ number**, e.g.:
 
 ```markdown
 ## Needs attention
-- **#7** qubling.cloud — rotate the API token in prod (manual)
-- **#8** openscripture.today — confirm the import looks right
+- **#7** example-service — rotate the API token in prod (manual)
+- **#8** example-app — confirm the import looks right
 
 Resolve each with `/zed:maint-followup <number> done|nope|update [comment]`.
 When the last ticket is closed, this run flips from **Needs Followup** to
@@ -911,10 +913,10 @@ here just as a `weekly` sweep does. Read back what the run recorded with
 ## Issues filed by this run
 | project | issue | why |
 |---|---|---|
-| go-ignite | [#118](https://github.com/zostay/go-ignite/issues/118) | `npm run build` fails on the pinned vue-tsc; the sweep could not complete the frontend check. |
+| example-app | [#118](https://github.com/example-org/example-app/issues/118) | `npm run build` fails on a pinned build tool; the sweep could not complete the frontend check. |
 ```
 
-These are work the run **created for Sterling**, so say so plainly — do not bury
+These are work the run **created for the operator**, so say so plainly — do not bury
 them among the items it merely noticed. Omit the section when the command prints
 nothing.
 
@@ -935,8 +937,8 @@ row per line of output, in the order printed:
 ## Top 10 pending GitHub items across all projects
 | # | project | item | title | triage |
 |---|---|---|---|---|
-| 1 | gobert | [PR #850](https://github.com/zostay/gobert/pull/850) | Bump mysql 9.7.1 to 26.7.0 | Green but a major jump; needs a go/no-go from you. |
-| 2 | arrest-go | [issue #31](https://github.com/zostay/arrest-go/issues/31) | Import drops trailing whitespace | Reproducible; fix is small but unowned. |
+| 1 | example-app | [PR #850](https://github.com/example-org/example-app/pull/850) | Bump the database driver 9.7.1 to 26.7.0 | Green but a major jump; needs a go/no-go from you. |
+| 2 | example-lib | [issue #31](https://github.com/example-org/example-lib/issues/31) | Import drops trailing whitespace | Reproducible; fix is small but unowned. |
 ```
 
 Omit the section **entirely** when the tag is not `weekly` or when the command
@@ -976,10 +978,10 @@ get wrong silently.) Then:
 - **Do NOT revoke the whole-sweep grant.** Revoke only on a true terminal finish
   — a resumed session would otherwise be left un-elevated. The TTL remains the
   backstop.
-- Tell Sterling plainly what is waiting for him, that it is his to start whenever
-  he likes, and how to pick the run back up:
-  > Two tasks are waiting on you in the app (openscripture.today: approve this
-  > week's 7 photos; qubling.cloud: approve the production rollout). Press Start
+- Tell the operator plainly what is waiting for them, that it is theirs to start
+  whenever they like, and how to pick the run back up:
+  > Two tasks are waiting on you in the app (example-app: approve this week's
+  > images; example-service: approve the production rollout). Press Start
   > on either whenever you're ready — there's no clock on them. When you're
   > done, `/zed:maintenance weekly --resume` finishes the run.
 
@@ -1031,7 +1033,7 @@ what keeps that window from ever opening in normal operation.
 - Use **`failed`** only if the orchestration itself broke (individual project
   failures do not by themselves fail the run — they are reported in the summary,
   their causes are filed as GitHub issues on the projects, and only one that
-  stops the sweep itself from working until Sterling acts has a followup ticket).
+  stops the sweep itself from working until the operator acts has a followup ticket).
 
 ### 7. Report & observe
 
@@ -1052,7 +1054,7 @@ Tell the user they can:
 
 `/zed:maintenance <tag> --resume [run_id]` re-attaches to a run that parked at
 `awaiting_interactive` and drains what is left. This is what makes an interactive
-queue workable at all: Sterling may take three hours over the pickers, and no
+queue workable at all: the operator may take hours over an interactive task, and no
 session should have to sit open for them. His Start clicks are recorded in the
 database whether or not anything is listening, so nothing is lost in between.
 
@@ -1064,7 +1066,7 @@ Do **not** re-run discovery — both queues already live in the DB.
    ```
    If it prints nothing, there is no parked run for this tag — say so and stop.
    Do not silently start a fresh sweep instead; that is not what was asked.
-2. Start the monitor if it isn't running (Step 3), so he can still press Start.
+2. Start the monitor if it isn't running (Step 3), so Start is still clickable.
 3. Re-authorize the sweep (Step 5's grant), since the parked run kept no grant
    alive for you.
 4. **Re-queue any task the previous session left mid-flight.** This is not
@@ -1133,7 +1135,7 @@ paths honor it:
   the serial path.
 
 An interactive skill's `priority` orders it in the app's interactive bar rather
-than in the execution sequence — interactive tasks are dispatched when Sterling
+than in the execution sequence — interactive tasks are dispatched when the operator
 presses Start, not in queue order.
 
 ## Declaring interactive work (for project skill authors)
@@ -1266,8 +1268,8 @@ the model accepts in exchange for simplicity. Two consequences to keep bounded:
 
 ## Followups
 
-A sweep occasionally leaves something only Sterling can finish — a manual deploy
-step, a decision that blocks the sweep, a credential he alone can rotate. Rather
+A sweep occasionally leaves something only the operator can finish — a manual deploy
+step, a decision that blocks the sweep, a credential only they can rotate. Rather
 than burying those in prose, the run records them as numbered **followup
 tickets** and surfaces a distinct status for them.
 
@@ -1310,7 +1312,7 @@ Dependabot work is the part of maintenance a machine can finish. The part it
 cannot finish is everything *else* piling up on GitHub: a PR that has been green
 for three weeks waiting on a review, an issue nobody has looked at since March.
 Those never surface anywhere, because nothing routinely asks "what is waiting on
-me across all my repos?" The weekly sweep already walks every project, so it is
+me across all my repositories?" The weekly sweep already walks every project, so it is
 the cheapest possible place to ask that question.
 
 So a **`weekly`** run adds one cursory pass per project: list the open issues and
@@ -1346,7 +1348,7 @@ instead (Step 5, sub-step 5), it records that issue with `--origin created`.
 
 This is **not** weekly-gated, and that asymmetry is deliberate. Triage is a
 weekly nudge about work that was already there; a filed issue is work *this run
-just created for Sterling*, on whatever tag it happened to run under. Before
+just created for the operator*, on whatever tag it happened to run under. Before
 this existed the only trace of such an issue was a line of prose in a job
 summary — filed, reported once, and effectively invisible thereafter. Now the
 app shows it under **FILED BY THIS RUN**, badged **NEW**, and Step 6 lists it in

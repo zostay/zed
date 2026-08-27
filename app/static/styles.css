@@ -759,7 +759,7 @@ code, .mono { font-family: var(--mono); }
 }
 .tk-num a:hover { color: #d8b4fe; border-bottom-color: #d8b4fe; }
 /* Nowrap keeps the project name on one line; ellipsis keeps a long one (say
-   periodic-s3-sync) from painting over the adjacent title cell. */
+   a long hyphenated project name) from painting over the adjacent title cell. */
 .tk-proj {
   font-family: var(--mono); color: var(--ink); white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis;
