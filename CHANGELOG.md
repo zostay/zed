@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `maintenance`: **a Start on an interactive task is acted on promptly, instead
+  of waiting for the current project to finish.**
+
+  The observability app cannot launch anything itself — it has no channel to the
+  Claude Code session — so Start records the click and the sweep dispatches it on
+  its next loop turn. But on the serial path the orchestrator dispatches a
+  project subagent and *waits* for it, so while any project was mid-sweep the
+  loop could not turn at all. A Start pressed at the wrong moment sat at "queued"
+  for eight minutes and was picked up eight seconds after the job returned.
+  Nothing was broken, but "the sweep will get to it when it happens to be between
+  projects" is not what a button labelled Start implies.
+
+  - The drain loop now dispatches **job** subagents without awaiting them
+    **whenever the run has outstanding interactive work**, so the loop keeps
+    turning and a Start is acted on within one poll. When there is no interactive
+    work — the common case, including every plain dependency sweep — the serial
+    path is untouched and still dispatches and waits.
+  - Serial still means **one job in flight at a time**; only the waiting changes.
+    The job is finished from its completion notification, and the `idle` branch
+    is where a job whose summary was never collected gets reconciled.
+  - While a job is in flight the idle wait uses a short window (60s rather than
+    480s) and does not count toward the park threshold, so the loop comes back
+    promptly both to notice a Start and to collect the job's result.
+  - The queued state now reads **"queued — the sweep starts it at its next
+    check"** and carries a tooltip explaining where the delay comes from, rather
+    than the previous vaguer "the sweep will pick this up".
+
 ## 0.14.0 — 2026-08-28
 
 ### Added

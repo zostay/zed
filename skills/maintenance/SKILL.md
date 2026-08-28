@@ -401,12 +401,42 @@ It prints exactly one JSON object. Act on its `kind`, then loop:
   there would repeat the project's whole sweep — a second dependency pass, a
   second round of paid API calls, a second triage — which is precisely the
   duplicate-work failure described under **Two queues** above.
+
+  **Do not block on the job while interactive work is outstanding.** If the run
+  has any task still `discovered`, `requested` or `started`, dispatch the job
+  subagent **without awaiting it** — exactly as you do for an interactive task —
+  and carry on round the loop. Otherwise dispatch and wait, as the serial path
+  has always done.
+
+  The reason is a real complaint: a Start pressed while a project was mid-sweep
+  sat at "queued" for eight minutes, because the orchestrator was blocked inside
+  that project's Task call and could not poll. Nothing was broken — the click was
+  picked up eight seconds after the job returned — but "the sweep will get to it
+  when it happens to be between projects" is not what a button that says Start
+  implies. With the job dispatched in the background the loop keeps turning, and
+  a Start is acted on within one poll.
+
+  Two invariants to hold while doing this:
+  - **One job in flight at a time.** `next-work` will keep offering the next
+    `pending` job; do not dispatch it while another job is still running, or the
+    serial path silently becomes parallel. Wait for the in-flight one first.
+  - **Finish the job when its subagent returns.** You are notified when it
+    completes; at that point work its disposition and call `finish-job` exactly
+    as the per-job sub-steps describe. A job left `running` because its summary
+    was never collected is the one real hazard of not blocking — the `idle`
+    branch below is where you notice and reconcile it.
 - **`idle`** — nothing is runnable right now. Look at `open_interactive` before
   deciding what that means:
   - **`open_interactive` > 0** — a human owes the run something. Wait:
     ```bash
     "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-db.sh" wait-for-work --run "$RUN_ID" --timeout 480
     ```
+    **If a job is in flight, use a short window instead** (`--timeout 60`), and
+    do not count these toward the park threshold. A long wait is right when the
+    run is genuinely idle and only a human can move it; while automated work is
+    still running you want to come back promptly — both to notice a Start and to
+    collect the job's result. Reconcile any job whose subagent has returned
+    before waiting again.
     **Pass `timeout: 600000` to the Bash tool for this call.** The tool's
     *default* timeout is 120s — the 10-minute figure is its maximum — so without
     an explicit timeout an 8-minute wait is killed at two minutes and reads as a
@@ -785,7 +815,10 @@ subagent does the project work and logs its own progress events.
 
 **Serial (default / `--now`):** dispatch one subagent, wait for it to return,
 finish its job, then move to the next — in the discovery order (priority
-ascending, then path). This is the path that honors per-project `priority`: a
+ascending, then path). The one exception is a run with outstanding interactive
+work, where the job is dispatched in the background instead so the loop stays
+responsive to a Start (see the `job` branch of the drain loop). Serial still
+means **one job in flight at a time**; only the waiting changes. This is the path that honors per-project `priority`: a
 project that needs up-front user interaction runs before the rest, and one that
 redeploys centrally-shared apps runs after them.
 

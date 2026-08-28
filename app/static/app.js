@@ -563,16 +563,29 @@
   function ixRow(t, runId) {
     var label = {
       discovered: "ready when you are",
-      requested: "queued — the sweep will pick this up",
+      requested: "queued — the sweep starts it at its next check",
       started: "running — take your time",
       done: "done",
       abandoned: "left for another day"
     }[t.status] || t.status;
 
+    // "Queued" is the state people ask about, because the app cannot launch
+    // anything itself — it records the click and the sweep dispatches it. Say
+    // where the delay comes from, so a wait reads as expected rather than broken.
+    var tip = {
+      requested: "Your click is recorded. The app has no way to launch work " +
+        "itself, so the sweep picks this up on its next check — within seconds " +
+        "if it is between projects, otherwise when the project it is currently " +
+        "running finishes.",
+      started: "Dispatched. Work it at your pace; nothing here times out.",
+      abandoned: "Closed without finishing. The sweep recorded it as left for another day."
+    }[t.status] || "";
+
     var action = t.status === "discovered"
       ? '<button class="ix-start" type="button" data-task="' + esc(t.id) +
         '" data-run="' + esc(runId) + '">Start</button>'
-      : '<span class="ix-state" data-status="' + esc(t.status) + '">' + esc(label) + "</span>";
+      : '<span class="ix-state" data-status="' + esc(t.status) + '"' +
+        (tip ? ' title="' + esc(tip) + '"' : "") + ">" + esc(label) + "</span>";
 
     return '<div class="ix-row" data-status="' + esc(t.status) + '">' +
       '<span class="ix-project">' + esc(t.project_name) + "</span>" +

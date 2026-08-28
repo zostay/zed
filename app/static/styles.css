@@ -629,6 +629,9 @@ code, .mono { font-family: var(--mono); }
   color: var(--ink-faint);
 }
 .ix-state[data-status="discovered"] { color: var(--await); }
+/* Mark the states that carry an explanation, so the tooltip is discoverable
+   rather than something you find by accident. */
+.ix-state[title] { cursor: help; border-bottom: 1px dotted currentColor; }
 .ix-state[data-status="started"]    { color: var(--run); }
 .ix-state[data-status="done"]       { color: var(--ok); }
 .ix-start {
