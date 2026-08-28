@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Added
+
+- `maintenance-monitor.sh start` **restarts the observability app when it is
+  serving a different build than the plugin**, instead of attaching to it.
+
+  The monitor is a long-lived process holding a snapshot of `app/server.py` and
+  `app/static/` from whenever it started, and upgrading the plugin does not touch
+  it. A monitor started before an upgrade therefore kept serving the previous
+  release forever, while `start` cheerfully handed back its URL. Every symptom of
+  that is baffling in isolation: a feature added in the new version is simply
+  absent from the page, an endpoint the new UI calls returns 404, and nothing
+  anywhere mentions that the two halves are different versions.
+
+  - `start` records a **build stamp** — plugin version plus the resolved
+    `app/server.py` path — in `monitor.version`, and compares it on every later
+    `start`. Version alone is insufficient: the plugin cache keeps each release
+    in its own directory, and a local checkout can sit at the same version as an
+    installed copy while being entirely different code.
+  - A monitor with **no stamp** (started by a plugin predating this feature)
+    reads as not-current and is restarted — which is exactly the upgrade case
+    that motivated this.
+  - `--headless`, `--port` and `--no-open` are honoured across the restart, and
+    `start`'s stdout stays just the URL; the explanation of what changed goes to
+    stderr.
+  - `status` reports the running build and flags it as stale, naming what the
+    plugin now provides.
+  - A monitor already on the current build is attached to exactly as before, so
+    repeated `start` calls never churn the process — including when the version
+    cannot be read at all, where two "unknown"s compare equal rather than
+    restarting on every call.
+  - New `mtnc_plugin_root` / `mtnc_plugin_version` helpers in
+    `maintenance-common.sh`.
+
 ### Changed
 
 - **Documentation is now written for a stranger, not for the maintainer.** This

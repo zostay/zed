@@ -13,6 +13,8 @@
 #   mtnc_now             — echo current UTC time ISO-8601 (e.g. 2026-06-01T17:04:05Z)
 #   mtnc_sql_escape <s>  — echo string with single quotes doubled for inline SQL literals
 #   mtnc_require <cmd>   — error to stderr and exit 1 if <cmd> is not on PATH
+#   mtnc_plugin_root     — echo the plugin's root directory
+#   mtnc_plugin_version  — echo the plugin version from .claude-plugin/plugin.json
 
 # Resolve the data directory in priority order:
 #   1. $MAINTENANCE_DATA_DIR if set (test/override hook)
@@ -61,6 +63,43 @@ mtnc_sql_escape() {
   local s="${1:-}"
   local q="'"
   printf '%s\n' "${s//$q/$q$q}"
+}
+
+# Echo the plugin's root directory — the one holding .claude-plugin/ and app/.
+#
+# Derived from this file's own location (scripts/../) rather than from
+# CLAUDE_PLUGIN_ROOT, so it is correct even when a script is invoked directly
+# with that variable unset. CLAUDE_PLUGIN_ROOT still wins when it is set, since
+# the harness knows which copy of the plugin it actually loaded — which matters
+# when several versions are installed side by side in the plugin cache.
+mtnc_plugin_root() {
+  if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+    printf '%s\n' "$CLAUDE_PLUGIN_ROOT"
+    return 0
+  fi
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+  printf '%s\n' "${here:-.}"
+}
+
+# Echo the plugin version recorded in .claude-plugin/plugin.json, or the literal
+# string "unknown" when it cannot be read.
+#
+# Parsed with grep/sed rather than jq: this is consumed by the monitor, which
+# otherwise needs no JSON tooling, and plugin.json's version is a plain string
+# field. "unknown" is deliberately a value rather than an error — callers compare
+# versions for equality, and two unknowns comparing equal is the right outcome
+# (it must not look like a version *change* on every single call).
+mtnc_plugin_version() {
+  local manifest version
+  manifest="$(mtnc_plugin_root)/.claude-plugin/plugin.json"
+  if [ ! -r "$manifest" ]; then
+    printf 'unknown\n'
+    return 0
+  fi
+  version="$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$manifest" 2>/dev/null \
+    | head -n1 | sed 's/.*"\([^"]*\)"[[:space:]]*$/\1/')"
+  printf '%s\n' "${version:-unknown}"
 }
 
 # Error to stderr and exit 1 if the named command is not available on PATH.

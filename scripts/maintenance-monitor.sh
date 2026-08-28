@@ -7,8 +7,16 @@
 # on monitor.pid. The server itself owns port probing and writes the actual
 # bound port to monitor.port; this script only reads it.
 #
+# The monitor is long-lived and holds a snapshot of app/ from whenever it
+# started, so a plugin upgrade leaves it serving the previous release. `start`
+# records a build stamp (plugin version + server path) in monitor.version and
+# compares it on every subsequent call, restarting rather than attaching when
+# they differ.
+#
 # Subcommands:
-#   start [--headless] [--port N] [--no-open]  — start (or attach to) the server
+#   start [--headless] [--port N] [--no-open]  — start (or attach to) the server;
+#                                                 restarts it if the running one
+#                                                 is serving a different build
 #   stop                                        — stop the running server (idempotent)
 #   status                                      — print running/stopped, PID, port, URL
 #   url                                         — print URL if running, else exit 1
@@ -34,6 +42,8 @@ Usage: maintenance-monitor.sh <subcommand> [options]
 
 Subcommands:
   start [--headless] [--port N] [--no-open]  Start (or attach to) the web app.
+                                              Restarts it when the running
+                                              monitor is a different build.
   stop                                        Stop the running web app (idempotent).
   status                                      Print running/stopped, PID, port, URL.
   url                                         Print the URL if running, else exit 1.
@@ -44,9 +54,44 @@ EOF
 # --- helpers ---------------------------------------------------------------
 
 # Path helpers (resolved against the data dir).
-monitor_pid_path()  { echo "$(mtnc_data_dir)/monitor.pid"; }
-monitor_port_path() { echo "$(mtnc_data_dir)/monitor.port"; }
-monitor_log_path()  { echo "$(mtnc_data_dir)/monitor.log"; }
+monitor_pid_path()     { echo "$(mtnc_data_dir)/monitor.pid"; }
+monitor_port_path()    { echo "$(mtnc_data_dir)/monitor.port"; }
+monitor_log_path()     { echo "$(mtnc_data_dir)/monitor.log"; }
+monitor_version_path() { echo "$(mtnc_data_dir)/monitor.version"; }
+
+# The identity of the code a monitor is serving: "<plugin version>\t<server.py>".
+#
+# Version alone is not enough. The plugin cache keeps each release in its own
+# directory, so an upgrade changes the path as well; and a local checkout can
+# sit at the same version as an installed copy while being entirely different
+# code. Recording both means either kind of change is noticed.
+build_stamp() {
+  printf '%s\t%s\n' "$(mtnc_plugin_version)" "$(server_path)"
+}
+
+# Echo the stamp recorded when the running monitor was launched, or nothing if
+# no stamp was recorded. A monitor started by a plugin version predating this
+# feature has no stamp file — which correctly reads as "not the current build".
+read_stamp() {
+  local f
+  f="$(monitor_version_path)"
+  if [ -s "$f" ]; then
+    head -n1 "$f"
+  fi
+}
+
+# Render a stamp for humans: "0.13.0 (/path/to/app/server.py)". An empty stamp
+# is the pre-stamp case — say so plainly rather than printing a blank.
+format_stamp() {
+  local stamp="$1" version path
+  if [ -z "$stamp" ]; then
+    printf 'unrecorded (started before this plugin tracked versions)'
+    return 0
+  fi
+  version="${stamp%%$'\t'*}"
+  path="${stamp#*$'\t'}"
+  printf '%s (%s)' "$version" "$path"
+}
 
 # Echo the PID recorded in monitor.pid (empty if no/empty file).
 read_pid() {
@@ -102,9 +147,14 @@ open_browser() {
   return 0
 }
 
-# Remove the pid/port state files.
+# Remove the pid/port/version state files.
 clear_state() {
-  rm -f "$(monitor_pid_path)" "$(monitor_port_path)"
+  rm -f "$(monitor_pid_path)" "$(monitor_port_path)" "$(monitor_version_path)"
+}
+
+# Absolute path to the server this invocation would launch.
+server_path() {
+  printf '%s\n' "$(mtnc_plugin_root)/app/server.py"
 }
 
 # --- subcommands -----------------------------------------------------------
@@ -149,19 +199,40 @@ cmd_start() {
     do_open=false
   fi
 
-  # If already running, attach to it: print URL, optionally open, exit.
+  # If already running, attach to it — unless it is serving *different code*
+  # than the plugin now provides, in which case restart instead.
+  #
+  # A monitor is a long-lived process holding a snapshot of app/server.py and
+  # app/static/ from whenever it started. Upgrading the plugin does not touch
+  # it, so a monitor started before an upgrade keeps serving the previous
+  # release's UI and API indefinitely, and `start` used to cheerfully hand back
+  # its URL. Every symptom of that is baffling: a feature added in the new
+  # version is simply absent, an endpoint the new UI calls 404s, and nothing
+  # anywhere says the two halves are different versions.
   if is_running; then
-    local url
-    url="$(monitor_url)"
-    if [ -n "$url" ]; then
-      echo "$url"
-      if [ "$do_open" = true ]; then
-        open_browser "$url"
+    local want have
+    want="$(build_stamp)"
+    have="$(read_stamp)"
+    if [ "$have" = "$want" ]; then
+      local url
+      url="$(monitor_url)"
+      if [ -n "$url" ]; then
+        echo "$url"
+        if [ "$do_open" = true ]; then
+          open_browser "$url"
+        fi
+      else
+        echo "Monitor is running (PID $(read_pid)) but no port recorded yet." >&2
       fi
-    else
-      echo "Monitor is running (PID $(read_pid)) but no port recorded yet." >&2
+      return 0
     fi
-    return 0
+
+    # Stale build — report exactly what changed, then replace it. The stop
+    # message goes to stderr so `start`'s stdout stays just the URL.
+    printf 'Monitor is serving a different build than the plugin; restarting it.\n' >&2
+    printf '  was: %s\n' "$(format_stamp "$have")" >&2
+    printf '  now: %s\n' "$(format_stamp "$want")" >&2
+    cmd_stop >&2
   fi
 
   # Not running (or stale state) — clean up any leftover state and launch.
@@ -173,7 +244,7 @@ cmd_start() {
   pid_file="$(monitor_pid_path)"
   port_file="$(monitor_port_path)"
   log_file="$(monitor_log_path)"
-  server="${CLAUDE_PLUGIN_ROOT:-}/app/server.py"
+  server="$(server_path)"
 
   mtnc_require python3
 
@@ -193,6 +264,13 @@ cmd_start() {
     --pid-file "$pid_file" \
     >> "$log_file" 2>&1 &
   disown || true
+
+  # Stamp the build this process is serving, immediately after launching it, so
+  # a later `start` can tell whether the running monitor is still current. Write
+  # it now rather than after the port poll: if the launch half-fails the stamp
+  # still describes the process that is actually running, and a stale stamp is
+  # cleared by clear_state on the next start regardless.
+  printf '%s\n' "$(build_stamp)" >| "$(monitor_version_path)"
 
   # Poll until the server records its bound port (or we time out).
   # 20 iterations * 0.5s = ~10s timeout, using integer iteration counting.
@@ -253,14 +331,23 @@ cmd_stop() {
 
 cmd_status() {
   if is_running; then
-    local pid port url
+    local pid port url want have
     pid="$(read_pid)"
     port="$(read_port)"
     url="$(monitor_url)"
+    want="$(build_stamp)"
+    have="$(read_stamp)"
     echo "Status: running"
     echo "PID:    ${pid}"
     echo "Port:   ${port:-unknown}"
     echo "URL:    ${url:-unknown}"
+    echo "Build:  $(format_stamp "$have")"
+    if [ "$have" != "$want" ]; then
+      # Say it plainly here too: someone checking status after an upgrade should
+      # not have to infer it from two paths that differ in one path component.
+      echo "        ^ stale — the plugin is now $(format_stamp "$want")"
+      echo "        run 'maintenance-monitor.sh start' to pick it up"
+    fi
   else
     echo "Status: stopped"
   fi

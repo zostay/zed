@@ -235,6 +235,15 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" status
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/maintenance-monitor.sh" stop
 ```
 
+The monitor is a long-lived process holding a snapshot of the app from whenever
+it started, so upgrading the plugin does not touch a monitor that is already
+running — it keeps serving the previous release's UI and API indefinitely.
+`start` guards against that: it records a build stamp (plugin version plus the
+resolved `app/server.py` path) and, on any later `start`, **restarts the monitor
+instead of attaching when that stamp has changed**. `status` shows the running
+build and says so when it is stale. A monitor already running the current build
+is attached to as before, so repeated `start` calls never churn the process.
+
 All runtime state (the SQLite database, config, and monitor pid/port/log) lives
 in `${CLAUDE_PLUGIN_DATA}/maintenance` (or
 `${XDG_DATA_HOME:-$HOME/.local/share}/zed-maintenance`), so history persists
