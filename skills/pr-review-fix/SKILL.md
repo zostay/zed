@@ -21,10 +21,11 @@ Every run of this skill satisfies both of these. They are independent:
    this requirement — humans and review agents miss different things. If no
    current automated review exists, you generate one (Step 3c) and post it.
 
-This skill does **not** request or wait for a GitHub-hosted review agent.
-Automated reviews are run **locally** — the `copilot` CLI is the primary path.
-If the timeline happens to show a hosted review in flight, note it in the report,
-but do not block on it.
+This skill does **not** request or wait for a GitHub-hosted review agent, and it
+does not inspect the PR timeline for one. Automated reviews are run **locally** —
+the `copilot` CLI is the primary path. A hosted review that has *already posted*
+is read like any other agent review in 3a; one that has not is simply not waited
+for.
 
 ## Steps
 
@@ -71,15 +72,17 @@ gh api graphql -F owner=<owner> -F repo=<repo> -F number=<number> -f query='
 query($owner:String!, $repo:String!, $number:Int!) {
   repository(owner:$owner, name:$repo) {
     pullRequest(number:$number) {
-      headRefOid
       commits(last:1) { nodes { commit { committedDate } } }
       reviews(first:50) {
+        pageInfo { hasNextPage endCursor }
         nodes { author { login __typename } state body submittedAt }
       }
       reviewThreads(first:100) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           id isResolved isOutdated path line
           comments(first:50) {
+            pageInfo { hasNextPage endCursor }
             nodes { databaseId author { login __typename } body diffHunk createdAt }
           }
         }
@@ -88,6 +91,11 @@ query($owner:String!, $repo:String!, $number:Int!) {
   }
 }'
 ```
+
+**Check every `hasNextPage`.** Requirement 1 says *every* review is evaluated, and
+a page cap that silently drops the 101st thread breaks that quietly — the report
+would look complete. Wherever `hasNextPage` is true, re-query that connection with
+`after: "<endCursor>"` until it is false.
 
 Top-level comments are not in `reviewThreads`, so fetch them too — reviewers
 often leave feedback there:
@@ -106,9 +114,10 @@ so make it explicitly for each finding:
   skill posted itself, recognisable by its `## Automated review (<tool>)` header.
 - **human** — everything else.
 
-Note that a bot's login differs per surface — Copilot appears as `Copilot` in
-timeline events but `copilot-pull-request-reviewer` as a review or comment
-author — so match case-insensitively on substrings rather than exact logins.
+Note that a review agent's login differs by surface — the same GitHub reviewer
+appears as `Copilot` in some places and `copilot-pull-request-reviewer` as the
+author of a review or comment — so match case-insensitively on substrings rather
+than on exact logins.
 
 Skip comments authored by `$me`, **except** an `## Automated review (<tool>)`
 comment, which is an agent finding regardless of who posted it.
@@ -134,14 +143,24 @@ system other than Claude when one is available — an independent model gives a
 genuine second opinion. Select the first available tool:
 
 1. **`command -v copilot`** → the GitHub Copilot CLI, run non-interactively.
-   `--allow-all-tools` is required for non-interactive mode; the review prompt
-   tells it to read and report only, never to edit:
+   `--allow-all-tools` is required for non-interactive mode, but a review has no
+   business editing the checkout, so deny the file-editing tool outright rather
+   than trusting the prompt to hold:
 
    ```bash
    out=$(mktemp)
    copilot -p "<review-prompt>" \
-     --allow-all-tools --no-color --log-level none >| "$out"
+     --allow-all-tools --deny-tool='write' \
+     --no-color --log-level none >| "$out"
    ```
+
+   `--deny-tool='write'` narrows the write path rather than closing it — the
+   reviewer still needs `shell` for `git` and `gh`, and a shell can redirect — but
+   it removes the direct one. Note also that `--allow-all-tools` grants *tools*,
+   not *paths*: the CLI stays confined to its working directory, so a reviewer's
+   attempt to stash scratch output under `/tmp` is denied. That is harmless for a
+   review, which only needs to read and print; pass `--add-dir` only if you
+   genuinely need otherwise.
 
    Confirm the flags with `copilot --help` if the invocation errors — the CLI
    changes. Add `-C <repo-path>` if the cwd is not the checkout. This spends the
@@ -262,16 +281,34 @@ The two rules the table encodes:
   nobody is waiting on an answer. When you resolve an ambiguous agent finding,
   leave a reply saying what was unclear and how you read it, so the resolution is
   not silent.
-- **A human thread stays open whenever the human is the only one who can settle
-  it** — you could not confirm the finding, or you need information they have.
-  Every other human thread is answered and resolved.
+- **A human thread stays open whenever a human is the only one who can close it**
+  — you could not confirm the finding, you need information only they have, or the
+  finding is out-of-scope and nothing was filed to carry it forward. Every other
+  human thread is answered and resolved.
+
+**Filing the follow-up.** Two cells above turn on whether a follow-up exists, so
+decide deliberately rather than leaving it implicit. File one when the finding is
+real, worth doing, and would otherwise be lost:
+
+```bash
+gh issue create --title "<the finding, in a line>" \
+  --body "Deferred from #<number>. <What, where, and why it is out of scope here.>"
+```
+
+One issue per finding, linked in the reply. Do not file when the repository
+tracks work somewhere else, when the finding is speculative, or when the user has
+said not to open issues — in those cases leave a human thread open instead of
+resolving it, and say so in the report.
 
 **Reply to an inline thread** using the `databaseId` of its first comment:
 
 ```bash
+reply=$(mktemp)
+printf '%s\n' "<reply text>" >| "$reply"
 gh api --method POST \
   "repos/{owner}/{repo}/pulls/<number>/comments/<first-comment-databaseId>/replies" \
-  -f body="$(cat reply.md)"
+  -f body="$(cat "$reply")"
+rm -f "$reply"
 ```
 
 **Resolve a thread** with the GraphQL mutation, using the thread node `id`:
@@ -286,7 +323,10 @@ resolve and no inline reply endpoint. Answer them in a **single** consolidated P
 comment rather than one comment per finding:
 
 ```bash
-gh pr comment <number> --body-file responses.md
+responses=$(mktemp)
+printf '%s\n' "<consolidated responses>" >| "$responses"
+gh pr comment <number> --body-file "$responses"
+rm -f "$responses"
 ```
 
 That comment should list each such finding, its disposition, and a one-line

@@ -29,6 +29,13 @@
   - A generated review is **posted to the PR** whichever tool produced it,
     including the `code-review` fallback, and its findings are triaged and fixed
     by the skill rather than handed back to the operator as a list to sort out.
+  - The copilot CLI is invoked with the file-editing tool denied. Non-interactive
+    mode needs broad tool permission, but a review has no business rewriting the
+    checkout it is reading, and an instruction not to edit is not an enforcement.
+  - The review inventory pages through every connection instead of reading one
+    page of each. A page cap that drops the hundred-and-first thread would break
+    the "every review is evaluated" guarantee silently, leaving a report that
+    still looked complete.
 
 ### Added
 
