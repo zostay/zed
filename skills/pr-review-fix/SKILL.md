@@ -1,11 +1,30 @@
 ---
 name: pr-review-fix
-description: Check out a PR, read its GitHub review comments, evaluate each for validity, fix the good recommendations, and report on what was done. If the PR has no review and none is pending, always generate one (codex, copilot CLI, or a Claude subagent) and post it before fixing.
+description: Check out a PR, gather every review on it — human and automated — evaluate each finding for validity, fix the good ones, then reply to and resolve the threads on GitHub. If no current automated review exists, always generate one locally (copilot CLI, codex CLI, or Claude's code-review skill) and post it before fixing.
 ---
 
 # PR Review Fix
 
-Address reviewer feedback on a pull request: check out the right branch, read the review comments, judge each one, apply the fixes that are warranted, and report.
+Address reviewer feedback on a pull request: check out the right branch, gather
+every review the PR has, judge each finding, apply the fixes that are warranted,
+answer and resolve the threads on GitHub, and report — leaving open only the
+things a human actually has to decide.
+
+## Two standing requirements
+
+Every run of this skill satisfies both of these. They are independent:
+
+1. **Every review on the PR is evaluated** — not just reviews from agents. A
+   human reviewer's comments go through the same evaluation and get the same
+   fixes as an agent's.
+2. **The PR has a current automated review.** A human review does *not* remove
+   this requirement — humans and review agents miss different things. If no
+   current automated review exists, you generate one (Step 3c) and post it.
+
+This skill does **not** request or wait for a GitHub-hosted review agent.
+Automated reviews are run **locally** — the `copilot` CLI is the primary path.
+If the timeline happens to show a hosted review in flight, note it in the report,
+but do not block on it.
 
 ## Steps
 
@@ -35,159 +54,121 @@ Then pull the latest commits for that branch so review comments line up with cur
 git pull --ff-only
 ```
 
-### 3. Establish the review
+### 3. Establish the reviews
 
-**Invariant — this skill never proceeds without a review to act on.** Every run of
-this skill must end with Steps 4–8 operating on a concrete review. There are
-exactly three ways to obtain one, and one of them *always* applies:
+**Invariant — this skill never proceeds without a review to act on.** Steps 4–9
+always operate on a concrete set of findings. "The PR has no feedback yet" is not
+a stopping point: it is the trigger to generate a review in 3c. Do not ask the
+user whether to generate one; just generate it.
 
-1. **Use existing feedback** if any exists.
-2. Otherwise **watch for a pending Copilot review** if one is requested/in-progress.
-3. Otherwise **generate one yourself** — this is mandatory, not optional.
+#### 3a. Inventory every review surface
 
-You may **never** stop, skip ahead, or report "no review found" because a PR has
-no feedback yet. "No existing review and nothing pending" is not a dead end — it is
-the explicit trigger to generate a review in 3c. Do **not** ask the user whether to
-generate one in this case; just generate it. The only place a question is allowed
-is the ~15-minute watch timeout in 3b-watch.
-
-Before fixing anything, make sure the PR actually has a review to act on. The
-skill sources feedback in the priority order above.
-
-#### 3a. Inventory the current review state
-
-Gather every feedback surface, plus the PR **timeline** — the timeline is the
-reliable signal for a Copilot review that is *requested or in progress*:
+One GraphQL query gets the reviews, the inline threads, their resolution state,
+and — critically — whether each author is a **human or a bot**:
 
 ```bash
-me=$(gh api user --jq .login)
+gh api graphql -F owner=<owner> -F repo=<repo> -F number=<number> -f query='
+query($owner:String!, $repo:String!, $number:Int!) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      headRefOid
+      commits(last:1) { nodes { commit { committedDate } } }
+      reviews(first:50) {
+        nodes { author { login __typename } state body submittedAt }
+      }
+      reviewThreads(first:100) {
+        nodes {
+          id isResolved isOutdated path line
+          comments(first:50) {
+            nodes { databaseId author { login __typename } body diffHunk createdAt }
+          }
+        }
+      }
+    }
+  }
+}'
+```
 
-# Reviews, inline review comments, and top-level issue comments
-gh pr view <number> --json reviews
-gh api "repos/{owner}/{repo}/pulls/<number>/comments" --paginate
+Top-level comments are not in `reviewThreads`, so fetch them too — reviewers
+often leave feedback there:
+
+```bash
 gh api "repos/{owner}/{repo}/issues/<number>/comments" --paginate
-
-# Timeline — needed to detect an in-flight Copilot review (see below)
-gh api "repos/{owner}/{repo}/issues/<number>/timeline" --paginate
+me=$(gh api user --jq .login)
 ```
 
-Match Copilot case-insensitively with `test("copilot")` on **every** surface —
-its login differs per surface: `Copilot` in the timeline `review_requested` /
-`reviewed` events, but `copilot-pull-request-reviewer` as a review or comment
-author.
+**Classify every author as `agent` or `human`.** The distinction drives Step 8,
+so make it explicitly for each finding:
 
-**Has Copilot already posted?** Check both a review summary *and* inline review
-comments — Copilot often posts inline comments only:
+- **agent** — GraphQL `__typename` is `Bot`; or the login ends in `[bot]`; or the
+  login matches a known review agent case-insensitively (`copilot`,
+  `coderabbit`, `sonar`, `codex`, `github-actions`); or the comment is one this
+  skill posted itself, recognisable by its `## Automated review (<tool>)` header.
+- **human** — everything else.
 
-```bash
-gh pr view <number> --json reviews \
-  --jq '[.reviews[] | select(.author.login | ascii_downcase | test("copilot"))] | length'
-gh api "repos/{owner}/{repo}/pulls/<number>/comments" \
-  --jq '[.[] | select(.user.login | ascii_downcase | test("copilot"))] | length'
-```
+Note that a bot's login differs per surface — Copilot appears as `Copilot` in
+timeline events but `copilot-pull-request-reviewer` as a review or comment
+author — so match case-insensitively on substrings rather than exact logins.
 
-**Is a Copilot review requested or in progress but not yet posted?** Do **not**
-rely on `reviewRequests` from `gh pr view`: GitHub drops a bot reviewer from that
-list the moment it *starts* working, so an actively-running Copilot review shows
-an **empty** `reviewRequests` (this is the trap that makes naive detection report
-"no Copilot" and wrongly fall through to generating a review). Read the timeline
-instead — a `copilot_work_started` event, or a `review_requested` event naming
-Copilot, means a Copilot review is on its way:
+Skip comments authored by `$me`, **except** an `## Automated review (<tool>)`
+comment, which is an agent finding regardless of who posted it.
 
-```bash
-gh api "repos/{owner}/{repo}/issues/<number>/timeline" --paginate --jq '
-  [ .[]
-    | select(
-        .event == "copilot_work_started"
-        or (.event == "review_requested"
-            and ((.requested_reviewer.login // "") | ascii_downcase | test("copilot")))
-      )
-  ] | length'
-```
+#### 3b. Decide whether to generate an automated review
 
-From this, determine:
+An automated review counts as **current** when an agent-authored review, agent
+inline thread, or `## Automated review` comment exists **and** was posted at or
+after the newest commit on the branch (`commits.nodes[0].commit.committedDate`
+from 3a). An automated review that predates the latest push was written against
+code that no longer exists — regenerate.
 
-- **Does any actionable feedback already exist?** — a Copilot review or Copilot
-  inline comments; unresolved inline review comments from any human; **or any
-  top-level issue comment from someone other than the current user** (`$me`).
-  Steps 4–5 act on all three, so all three count as existing feedback here.
-- **Is a Copilot review pending?** — the timeline shows it requested/in-progress
-  (above) **and** Copilot has not yet posted a review or inline comments.
+- **A current automated review exists** → go to Step 4 and evaluate everything
+  found in 3a, human and agent alike.
+- **No current automated review** → go to 3c. This applies *even when human
+  review comments are present*: a human review never satisfies requirement 2.
 
-#### 3b. Decide how to source the review
+#### 3c. Generate the automated review
 
-Exactly one of these three branches applies — pick the first that matches and act:
+Run the review from a **fresh context** that bases its judgment solely on the code
+changes and the PR's own description, which it discovers itself. Prefer a model
+system other than Claude when one is available — an independent model gives a
+genuine second opinion. Select the first available tool:
 
-- **Actionable feedback already exists** → proceed straight to Step 4 and use it.
-- **A Copilot review is pending** (requested/in-progress, nothing posted yet) →
-  **watch** for it (3b-watch below).
-- **No Copilot pending/present and no other feedback** → you have reached the
-  generate trigger. **Go to 3c now and generate a review.** This branch is not
-  optional and is not a stopping point: do **not** end the skill here, do **not**
-  ask the user whether to generate, and do **not** request Copilot. Generating the
-  review yourself is the required action.
+1. **`command -v copilot`** → the GitHub Copilot CLI, run non-interactively.
+   `--allow-all-tools` is required for non-interactive mode; the review prompt
+   tells it to read and report only, never to edit:
 
-**3b-watch — wait for a pending Copilot review.** Poll until Copilot posts
-**either a review summary or inline review comments** (checking reviews alone
-misses an inline-only review). Sleep ~30s between checks, bounded to ~15 minutes
-of wall-clock total. Track the elapsed time in the loop itself so the bound holds
-even if a single call hangs, and wrap each network call in `gtimeout` when
-available as an extra guard — falling back to bare `gh` when it is absent (never
-let a missing `gtimeout` crash the skill):
+   ```bash
+   out=$(mktemp)
+   copilot -p "<review-prompt>" \
+     --allow-all-tools --no-color --log-level none >| "$out"
+   ```
 
-```bash
-deadline=$(( $(date +%s) + 15*60 ))
-run() { if command -v gtimeout >/dev/null 2>&1; then gtimeout 30 "$@"; else "$@"; fi; }
-while [ "$(date +%s)" -lt "$deadline" ]; do
-  reviews=$(run gh pr view <number> --json reviews \
-    --jq '[.reviews[] | select(.author.login | ascii_downcase | test("copilot"))] | length')
-  inline=$(run gh api "repos/{owner}/{repo}/pulls/<number>/comments" \
-    --jq '[.[] | select(.user.login | ascii_downcase | test("copilot"))] | length')
-  if [ "${reviews:-0}" -gt 0 ] || [ "${inline:-0}" -gt 0 ]; then break; fi
-  sleep 30
-done
-```
+   Confirm the flags with `copilot --help` if the invocation errors — the CLI
+   changes. Add `-C <repo-path>` if the cwd is not the checkout. This spends the
+   operator's own Copilot quota, so run it once per review, not per finding.
 
-Stop the moment Copilot posts, then proceed to Step 4. If the ~15-minute bound
-elapses with nothing from Copilot, **ask the user** how to proceed — wait longer,
-or generate a review now (3c). Do **not** loop indefinitely, and do **not**
-proceed without a review: the Step 3 invariant still holds, so "skip the review"
-is not on the table here — if the user does not want to keep waiting, fall through
-to generating one in 3c.
+2. **else `command -v codex`** → `codex exec "<review-prompt>"`, capturing stdout.
 
-#### 3c. Generate the review
-
-You are here because no review exists and none is pending. **Generating a review
-now is required** — produce one and post it; never finish the skill without it.
-
-Run the review from a **fresh context** that bases its judgment **solely on the
-code changes and the PR's own description, which it discovers itself**. Prefer a
-**different agent/model system** over Claude when one is available — codex and the
-copilot CLI are independent models and give a genuine second opinion; the Claude
-subagent is the always-available fallback so that this step can never fail to
-produce a review. Select the first available tool:
-
-1. `command -v codex` → run codex non-interactively: `codex exec "<review-prompt>"`,
-   capturing stdout.
-2. else `command -v copilot` → run the copilot CLI in non-interactive/print mode
-   (confirm the exact flag with `copilot --help`; representative form
-   `copilot -p "<review-prompt>"`), capturing stdout.
-3. else → dispatch a **Claude Code subagent** (Task/Agent tool, `general-purpose`)
-   in a fresh context that performs the review and returns the review text.
+3. **else** → fall back to **Claude's `code-review` skill** (invoke the skill with
+   the PR number as its target). This is the last resort because it is not an
+   independent model, but it must never be skipped — the invariant holds. If that
+   skill is unavailable, dispatch a `general-purpose` Claude Code subagent in a
+   fresh context that performs the review and returns the review text.
 
 Give every path the **same review prompt**, instructing the reviewer to discover
-its inputs on its own and review based **only** on them:
+its inputs itself and review based only on them:
 
 - The code changes — `gh pr diff <number>` (or `git diff <baseRef>...HEAD`).
 - The PR's claims — `gh pr view <number> --json title,body`.
 
 Ask for concrete, file/line-anchored findings on correctness, security, clarity,
-and consistency — not praise. The codex/copilot CLIs run in the checked-out repo
-cwd, so they already have the diff locally; tell the Claude subagent the PR
-number and repo so it can fetch both itself.
+and consistency — not praise. The copilot and codex CLIs run in the checked-out
+repo cwd and already have the diff locally; tell a Claude subagent the PR number
+and repo so it can fetch both itself.
 
-**Post the generated review as a PR comment**, with a short header naming the
-tool that produced it:
+**Post the generated review to the PR** — always, including when it came from the
+`code-review` fallback. The ticket is the record of what was reviewed, and a
+review that exists only in this session is invisible to everyone else:
 
 ```bash
 tmp=$(mktemp)
@@ -196,53 +177,61 @@ gh pr comment <number> --body-file "$tmp"
 rm -f "$tmp"
 ```
 
-**Hold the generated review text in this session** and carry it forward into
-Step 5. Step 4 skips comments authored by the current `gh` user, and the review
-you just posted *is* authored by that user — so it will not be re-fetched and
-must be passed forward explicitly. Record which tool produced it for the report.
+**Triage a generated review yourself.** Its findings are agent findings: split
+them into discrete items, evaluate each in Step 5, and fix the ones you judge
+important. Do not hand the raw output to the user and ask which to act on.
 
-### 4. Fetch review comments
+**Hold the generated review text in this session** and carry it into Step 4 —
+Step 4 skips comments authored by `$me`, and the review you just posted is
+authored by `$me`. Record which tool produced it for the report.
 
-Retrieve both review-level summaries and inline review comments:
+### 4. Assemble the findings
 
-```bash
-# Inline review comments (file/line-anchored)
-gh api "repos/{owner}/{repo}/pulls/<number>/comments" --paginate
+Build one list of findings from every surface, and tag each with its provenance
+(`agent` or `human`) from 3a. Sources:
 
-# Review summaries (approve/request-changes/comment bodies)
-gh api "repos/{owner}/{repo}/pulls/<number>/reviews" --paginate
-```
+- **Inline review threads** (from the 3a GraphQL query) — capture the thread node
+  `id`, the `databaseId` of the thread's *first* comment (needed to reply), the
+  author, `path:line`, the diff hunk, the body, and `isResolved` / `isOutdated`.
+- **Review summaries** — the `reviews` nodes with a non-empty `body`.
+- **Top-level issue comments** from anyone other than `$me`.
+- **The review generated in Step 3c**, if any — a single prose body; split it into
+  discrete findings.
 
-Also check top-level issue comments on the PR, since reviewers sometimes leave feedback there:
+Skip threads already resolved or outdated unless the user asks otherwise.
 
-```bash
-gh api "repos/{owner}/{repo}/issues/<number>/comments" --paginate
-```
+A review summary or issue comment may contain several distinct findings. Split
+those, too — each gets its own evaluation and disposition.
 
-For each inline comment capture: author, file path, line, the diff hunk, the comment body, the comment id, whether it is part of a resolved thread, and any in_reply_to chain. Group replies into threads.
+### 5. Evaluate each finding
 
-Skip comments authored by the current user (`gh api user`) and skip threads that are already marked resolved/outdated unless the user asks otherwise. **Exception:** if Step 3 generated a review, treat its findings as input here even though that comment is authored by the current user.
+For every finding, read the referenced file at the cited lines to see the current
+code (it may have changed since the comment was written). Then judge it on:
 
-### 5. Evaluate each comment
-
-For every unresolved comment thread, read the referenced file at the cited lines to see the current code (it may have changed since the comment was written). Then judge the comment on:
-
-- **Still applicable?** Does the code the comment refers to still exist in that form?
-- **Correct?** Is the reviewer's claim actually true given the surrounding code and project conventions?
+- **Still applicable?** Does the code the finding refers to still exist in that form?
+- **Correct?** Is the claim actually true given the surrounding code and project conventions?
 - **Useful?** Would acting on it improve correctness, security, clarity, or consistency — versus being purely stylistic noise, out of scope, or a matter of taste the author already decided?
 - **Actionable here?** Can it be fixed in this PR, or is it follow-up work?
 
-Classify each thread as one of: `fix`, `reject` (with reason), `already-addressed`, `out-of-scope`, or `needs-user-input` (ambiguous / requires a judgment call the user should make).
+Classify each finding as exactly one of:
 
-A review generated in Step 3 arrives as a single prose body rather than threaded inline comments. Split it into discrete findings and evaluate each one against the same criteria.
+- **`fix`** — correct and worth doing here.
+- **`already-addressed`** — the current code already satisfies it.
+- **`incorrect`** — the claim is wrong, or no longer applies. You can say *why*.
+- **`out-of-scope`** — real, but belongs in separate work.
+- **`unclear`** — you cannot confirm or refute it without information you do not
+  have: the reviewer's intent, a product decision, or context outside the repo.
+
+Judge human and agent findings by the same standard. Provenance changes what you
+*do with the thread* in Step 8, never whether the finding is correct.
 
 ### 6. Apply the fixes
 
-For each thread classified `fix`, make the change. Group related fixes into coherent edits rather than touching the same file repeatedly. After edits:
+For each finding classified `fix`, make the change. Group related fixes into coherent edits rather than touching the same file repeatedly. After edits:
 
 - Run the project's formatter/linter and test suite if they exist
 - If a fix breaks tests, investigate the root cause before moving on
-- Do not expand scope beyond what the comment asked for
+- Do not expand scope beyond what the finding asked for
 
 ### 7. Commit and push the fixes
 
@@ -252,16 +241,76 @@ If any fixes were applied, commit them to the PR branch and push:
 - Write a commit message that summarizes the reviewer feedback being addressed
 - Push to the PR's branch with `git push`
 
-Do **not** reply to or resolve the review comments on GitHub automatically — leave that to the user unless they explicitly ask.
+Push **before** Step 8, so the replies you post can point at a commit that exists.
 
-### 8. Report
+### 8. Reply and resolve on GitHub
+
+Close the loop on the ticket. What you do depends on the classification **and the
+provenance**:
+
+| Classification | Agent finding | Human finding |
+| --- | --- | --- |
+| `fix` | Resolve. Reply only if the fix differs from what was suggested. | Resolve. Reply only if the fix differs from what was suggested. |
+| `already-addressed` | Reply naming where it is handled, resolve. | Reply naming where it is handled, resolve. |
+| `incorrect` | Reply explaining why, resolve. | Reply explaining why, resolve. |
+| `out-of-scope` | Reply naming the deferral (link a follow-up issue if you filed one), resolve. | Reply naming the deferral. Resolve **only** if you filed a follow-up issue; otherwise leave open and flag it. |
+| `unclear` | Reply saying what was ambiguous and what you assumed, resolve. | Reply asking the specific question. **Leave unresolved** and flag it in the report. |
+
+The two rules the table encodes:
+
+- **An agent thread may always be resolved**, including when it is ambiguous —
+  nobody is waiting on an answer. When you resolve an ambiguous agent finding,
+  leave a reply saying what was unclear and how you read it, so the resolution is
+  not silent.
+- **A human thread stays open whenever the human is the only one who can settle
+  it** — you could not confirm the finding, or you need information they have.
+  Every other human thread is answered and resolved.
+
+**Reply to an inline thread** using the `databaseId` of its first comment:
+
+```bash
+gh api --method POST \
+  "repos/{owner}/{repo}/pulls/<number>/comments/<first-comment-databaseId>/replies" \
+  -f body="$(cat reply.md)"
+```
+
+**Resolve a thread** with the GraphQL mutation, using the thread node `id`:
+
+```bash
+gh api graphql -f id='<thread-node-id>' -f query='
+mutation($id:ID!) { resolveReviewThread(input:{threadId:$id}) { thread { isResolved } } }'
+```
+
+**Review summaries and top-level comments are not threads** — there is nothing to
+resolve and no inline reply endpoint. Answer them in a **single** consolidated PR
+comment rather than one comment per finding:
+
+```bash
+gh pr comment <number> --body-file responses.md
+```
+
+That comment should list each such finding, its disposition, and a one-line
+rationale, and end with the questions left for a human (if any). Findings from
+the review generated in Step 3c belong here too — do not reply to your own
+`## Automated review` comment thread; summarize what you did with it.
+
+Keep replies short and factual: what you did or why the finding does not hold.
+No apologies, no restating the finding back at length.
+
+### 9. Report
 
 Print a concise report covering:
 
-- The review source: existing Copilot review, a Copilot review that was watched for, or a review generated by `<tool>` (codex / copilot CLI / Claude subagent)
+- **Reviews found** — each reviewer, human or agent, and what they contributed
+- **The automated review source** — an existing agent review, or one generated by
+  `<tool>` (copilot CLI / codex CLI / Claude `code-review` / Claude subagent)
 - The PR (number, title, url) and the branch checked out
-- A table or list of every comment thread evaluated, with: author, location (`file:line`), classification, and a one-line rationale
+- A table of every finding evaluated, with: author, **provenance (human/agent)**,
+  location (`file:line`), classification, disposition on GitHub (replied /
+  resolved / left open), and a one-line rationale
 - For `fix` items, what was changed (file paths + brief description)
-- For `needs-user-input` items, the specific question the user needs to answer
+- **Needs the human** — a separate, prominent list of every human finding left
+  unresolved, each with the specific question that must be answered. This is the
+  only category the user has to act on; do not bury it in the table.
 - Any test/lint results
-- Suggested next steps (e.g., review the diff, commit, push, reply to reviewers)
+- Suggested next steps

@@ -298,13 +298,20 @@ investigates the first PR with failing checks and attempts a trivial fix.
 
 ### `pr-review-fix`
 
-Check out a pull request (the current branch's PR or a named one) and make sure
-it has a review to act on first: use existing feedback if any exists, wait for a
-pending Copilot review to land, or — only as a last resort — generate one (via
-the codex CLI, the copilot CLI, or a Claude Code subagent, in that order) and
-post it as a PR comment. Then read the review comments, evaluate each for
-validity against the current code, apply the fixes that are warranted, commit and
-push them to the PR branch, and report on what was done.
+Check out a pull request (the current branch's PR or a named one) and work
+through every review on it — human reviewers and review agents alike. If the PR
+has no automated review newer than its latest commit, one is generated **locally**
+(the `copilot` CLI, the codex CLI, or Claude's `code-review` skill, in that order)
+and posted to the PR as a comment; a human review does not remove the need for it.
+Nothing is requested from, or waited on, a GitHub-hosted review agent.
+
+Each finding is then evaluated against the current code, the warranted fixes are
+applied, committed and pushed, and the threads are answered on GitHub: findings
+that were fixed, already handled, or shown to be incorrect get a reply and are
+resolved. Ambiguous findings are resolved too when they came from an agent (with a
+reply saying how they were read) — but a human's comment that cannot be confirmed
+without more information is left open and reported back as something only you can
+settle.
 
 ```
 /zed:pr-review-fix

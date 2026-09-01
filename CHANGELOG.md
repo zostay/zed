@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **`pr-review-fix` now sources its automated review locally and acts on human
+  reviews as first-class input.**
+
+  The skill previously assumed a hosted review agent would review each PR by
+  itself: it watched a PR's timeline for an in-flight hosted review and could sit
+  waiting up to fifteen minutes for one to land, and generating a review locally
+  was framed as a last resort. That assumption fails for anyone whose hosted
+  review agent is turned off — the common case once a metered plan starts running
+  out — and the wait is pure dead time when nothing is ever coming.
+
+  - The timeline watch is **gone**. The skill never requests a hosted review and
+    never blocks on one; an already-posted hosted review is still used if present.
+  - The **`copilot` CLI is the primary generator**, run non-interactively in the
+    checkout, with the codex CLI next and Claude's `code-review` skill as the
+    fallback. Generating a review is no longer conditional on there being no
+    other feedback.
+  - An automated review is required **in addition to** any human review, not
+    instead of it — humans and review agents miss different things. It is treated
+    as stale, and regenerated, when it predates the branch's newest commit.
+  - Human reviews are evaluated and fixed on exactly the same terms as agent
+    reviews. Previously the skill was built around agent feedback and treated a
+    human's comments as an afterthought.
+  - A generated review is **posted to the PR** whichever tool produced it,
+    including the `code-review` fallback, and its findings are triaged and fixed
+    by the skill rather than handed back to the operator as a list to sort out.
+
+### Added
+
+- **`pr-review-fix` closes the loop on GitHub instead of leaving every thread
+  open.** It replies to review threads and resolves them, with the disposition
+  depending on who wrote the comment:
+
+  - Findings that were fixed, already handled, or shown to be incorrect get a
+    reply and are resolved, human or agent.
+  - An **ambiguous agent finding is resolved anyway**, with a reply recording what
+    was unclear and how it was read — nobody is waiting on that answer.
+  - An **ambiguous human finding is left open** and reported back under a separate
+    "needs the human" heading, because the reviewer is the only one who can settle
+    it. That list is the operator's actual worklist after a run.
+  - Review summaries and top-level comments, which are not threads and cannot be
+    resolved, are answered in a single consolidated PR comment rather than one
+    reply each.
+  - Author provenance is determined from the GraphQL `__typename` plus login
+    heuristics, since a review agent's login differs between the timeline and the
+    review it posts.
+
 ## 0.14.0 — 2026-08-28
 
 ### Added
